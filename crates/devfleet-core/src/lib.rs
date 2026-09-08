@@ -14,6 +14,7 @@ pub mod bindings;
 pub mod execution;
 pub mod ios;
 pub mod logs;
+pub mod metro;
 pub mod plan;
 pub mod ports;
 
@@ -27,6 +28,7 @@ pub use execution::{
 };
 pub use ios::{DeviceSelection, IosDevice, IosError, select_owned_device};
 pub use logs::{LogError, LogStore};
+pub use metro::{MetroAdapter, MetroAdapterError, metro_adapter, render_metro_config};
 pub use plan::{
     DependencyEdge, DependencyKind, EffectivePlan, PlanOptions, PlannedResource, compile_document,
     compile_manifest,

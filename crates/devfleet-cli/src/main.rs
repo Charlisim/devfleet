@@ -4,7 +4,7 @@ use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
     DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
     InitializationTask, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
-    PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
+    MetroUpRequest, PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -41,6 +41,7 @@ enum Command {
     Events(EventsArgs),
     Logs(LogsArgs),
     Compose(ComposeArgs),
+    Metro(MetroArgs),
     Initialize(InitializeArgs),
     Bindings(BindingsArgs),
     Ios(IosArgs),
@@ -108,6 +109,30 @@ struct ComposeArgs {
 #[derive(Subcommand)]
 enum ComposeCommand {
     Up(ComposeUpArgs),
+}
+
+#[derive(ClapArgs)]
+struct MetroArgs {
+    #[command(subcommand)]
+    command: MetroCommand,
+}
+
+#[derive(Subcommand)]
+enum MetroCommand {
+    Up {
+        #[arg(long)]
+        trust: bool,
+        #[arg(long)]
+        worktree: PathBuf,
+        #[arg(long, default_value = "metro")]
+        profile: String,
+        #[arg(long)]
+        instance: Option<String>,
+        #[arg(long)]
+        port: u16,
+        #[arg(long, default_value_t = 1)]
+        max_workers: u16,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -415,6 +440,24 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                     },
                 }))
             }
+        },
+        Command::Metro(metro) => match metro.command {
+            MetroCommand::Up {
+                trust,
+                worktree,
+                profile,
+                instance,
+                port,
+                max_workers,
+            } => Ok(DaemonRequest::MetroUp(MetroUpRequest {
+                worktree: worktree.canonicalize()?.display().to_string(),
+                profile,
+                instance,
+                trusted: trust,
+                port,
+                max_workers,
+                binding_integration: devfleet_protocol::BindingIntegration::BundleConfig,
+            })),
         },
         Command::Initialize(initialization) => match initialization.command {
             InitializeCommand::Run {

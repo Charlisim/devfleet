@@ -2,7 +2,8 @@
 
 use devfleet_core::{
     BindingIntegration as CoreBindingIntegration, BindingPhase as CoreBindingPhase, Invalidation,
-    PlanOptions, compile_manifest, discover_git_worktree, resolve_bindings,
+    PlanOptions, compile_manifest, discover_git_worktree, metro_adapter, render_metro_config,
+    resolve_bindings,
 };
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
@@ -12,10 +13,11 @@ use devfleet_protocol::{
     InitializationRunRequest, InitializationTask, InitializationTaskKind,
     InitializationTaskSnapshot, InitializationTaskStatus, IosSimulatorAcquireRequest,
     IosSimulatorAction, IosSimulatorActionRequest, IosSimulatorLifecycle, IosSimulatorSnapshot,
-    JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, OperationAccepted,
-    OperationSnapshot, PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot,
-    ProcessSnapshot, ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse,
-    SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, read_json_line, write_json_line,
+    JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
+    MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
+    PluginReconcileRequest, PluginSnapshot, ProcessSnapshot, ReadinessState, RpcFailure,
+    SupervisorRequest, SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy,
+    TrustedTaskPlugin, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
@@ -153,6 +155,7 @@ impl Daemon {
             DaemonRequest::Plan(request) => self.plan(request),
             DaemonRequest::Up(request) => self.up(request),
             DaemonRequest::ComposeUp(request) => self.compose_up(request),
+            DaemonRequest::MetroUp(request) => self.metro_up(request),
             DaemonRequest::InitializationRun(request) => self.run_initialization(&request),
             DaemonRequest::BindingApply(request) => self.apply_bindings(request),
             DaemonRequest::IosSimulatorAcquire(request) => self.ios_simulator_acquire(&request),
@@ -473,6 +476,111 @@ impl Daemon {
             operation_id,
             environment_id: environment.id,
         }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn metro_up(&mut self, request: MetroUpRequest) -> Result<DaemonResponse, DaemonError> {
+        if !request.trusted
+            || request.profile.is_empty()
+            || request.port == 0
+            || request.max_workers == 0
+        {
+            return Err(if request.trusted {
+                DaemonError::InvalidConfig("Metro requires profile, port, and worker budget".into())
+            } else {
+                DaemonError::TrustRequired
+            });
+        }
+        let worktree = Path::new(&request.worktree)
+            .canonicalize()
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let cache_key = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{}|{}|{}",
+                worktree.display(),
+                request.profile,
+                request.instance.as_deref().unwrap_or_default()
+            ))
+        );
+        let directory = self.config.state_dir.join("metro").join(&cache_key);
+        prepare_private_dir(&directory)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let adapter = metro_adapter(
+            worktree.clone(),
+            directory.join("cache"),
+            request.port,
+            request.max_workers,
+            cache_key[..16].into(),
+            core_integration(request.binding_integration),
+        )
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let expected_identity = adapter.environment_identity.clone();
+        prepare_private_dir(&adapter.cache_directory)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let configuration_path = adapter.cache_directory.join("metro.config.cjs");
+        write_private_atomically(
+            &configuration_path,
+            render_metro_config(&adapter).as_bytes(),
+        )?;
+        let plugin = self.trusted_plugin("official.metro", "metro.reconcile")?;
+        let spawn: devfleet_protocol::HostSpawnRequest =
+            serde_json::from_value(Self::plugin_action(
+                &plugin,
+                "metro.reconcile",
+                serde_json::to_value(MetroReconcileRequest {
+                    protocol: PROTOCOL_VERSION,
+                    operation_id: Uuid::now_v7(),
+                    environment_id: Uuid::nil(),
+                    worktree: worktree.display().to_string(),
+                    port: request.port,
+                    cache_directory: adapter.cache_directory.display().to_string(),
+                    configuration_path: configuration_path.display().to_string(),
+                    max_workers: request.max_workers,
+                })
+                .map_err(|error| DaemonError::Operation(error.to_string()))?,
+            )?)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let response = self.up(devfleet_protocol::EnvironmentUpRequest {
+            worktree: worktree.display().to_string(),
+            profile: request.profile,
+            instance: request.instance,
+            trusted: true,
+            process: devfleet_protocol::ProcessSpec {
+                argv: spawn.argv,
+                cwd: spawn.cwd,
+                environment: spawn.environment,
+            },
+        })?;
+        let DaemonResponse::Accepted(accepted) = response else {
+            return Err(DaemonError::Operation(
+                "Metro startup returned an unexpected response".into(),
+            ));
+        };
+        if !wait_for_metro_identity(request.port, &expected_identity) {
+            let _ = self.stop(accepted.environment_id);
+            return Err(DaemonError::Operation(
+                "Metro did not expose the selected endpoint identity before its deadline".into(),
+            ));
+        }
+        let endpoint = StoredEndpoint {
+            name: "metro".into(),
+            service: "metro".into(),
+            internal_url: format!("http://127.0.0.1:{}", request.port),
+            host_url: format!("http://127.0.0.1:{}", request.port),
+            device_url: format!("http://127.0.0.1:{}", request.port),
+            readiness_path: "/devfleet-identity".into(),
+            healthy: true,
+        };
+        self.state
+            .set_endpoints(accepted.environment_id, &[endpoint])?;
+        self.emit_event(
+            accepted.environment_id,
+            1,
+            Some(accepted.operation_id),
+            "metro_ready",
+        )?;
+        self.status(accepted.environment_id)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1595,6 +1703,31 @@ fn endpoint_is_healthy(endpoint: &StoredEndpoint) -> bool {
         .and_then(|status| std::str::from_utf8(status).ok())
         .and_then(|status| status.parse::<u16>().ok())
         .is_some_and(|status| (200..400).contains(&status))
+}
+
+fn wait_for_metro_identity(port: u16, expected_identity: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let expected = format!("\"environment\":\"{expected_identity}\"");
+    while Instant::now() < deadline {
+        if let Ok(mut stream) = TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(200),
+        ) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = stream.write_all(
+                b"GET /devfleet-identity HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            );
+            let mut response = String::new();
+            if stream.read_to_string(&mut response).is_ok()
+                && response.starts_with("HTTP/1.1 200")
+                && response.contains(&expected)
+            {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 fn canonical_plan_path(path: &str, worktree: &Path) -> Result<PathBuf, DaemonError> {

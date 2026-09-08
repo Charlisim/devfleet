@@ -12,6 +12,7 @@ members = [
     "plugins/process",
     "plugins/compose",
     "plugins/ios",
+    "plugins/metro",
 ]
 exclude = ["validation/ios-isolation"]
 resolver = "3"

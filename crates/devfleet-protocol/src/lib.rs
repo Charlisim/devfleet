@@ -283,6 +283,7 @@ pub enum DaemonRequest {
     Plan(EnvironmentPlanRequest),
     Up(EnvironmentUpRequest),
     ComposeUp(ComposeUpRequest),
+    MetroUp(MetroUpRequest),
     InitializationRun(InitializationRunRequest),
     BindingApply(BindingApplyRequest),
     IosSimulatorAcquire(IosSimulatorAcquireRequest),
@@ -507,6 +508,30 @@ pub struct ComposeReconcileRequest {
     pub environment: BTreeMap<String, String>,
     pub endpoints: Vec<ComposeEndpoint>,
     pub authorizations: ComposeAuthorizations,
+}
+
+/// A fully resolved, environment-private Metro adapter invocation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetroReconcileRequest {
+    pub protocol: ProtocolVersion,
+    pub operation_id: Uuid,
+    pub environment_id: Uuid,
+    pub worktree: String,
+    pub port: u16,
+    pub cache_directory: String,
+    pub configuration_path: String,
+    pub max_workers: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetroUpRequest {
+    pub worktree: String,
+    pub profile: String,
+    pub instance: Option<String>,
+    pub trusted: bool,
+    pub port: u16,
+    pub max_workers: u16,
+    pub binding_integration: BindingIntegration,
 }
 
 /// One versioned SDK call delivered inside a bounded JSON-RPC frame.

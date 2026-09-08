@@ -420,6 +420,26 @@ impl StateStore {
         Ok(())
     }
 
+    /// Replaces the resolved endpoint observations for an owned environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the endpoint snapshot.
+    pub fn set_endpoints(
+        &mut self,
+        environment_id: Uuid,
+        endpoints: &[StoredEndpoint],
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE environments SET endpoints_json = ?2 WHERE id = ?1",
+            params![
+                environment_id.to_string(),
+                serde_json::to_string(endpoints)?
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Marks the process stopped while retaining its environment and operation data.
     ///
     /// # Errors
