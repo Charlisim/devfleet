@@ -2,9 +2,9 @@
 
 use anyhow::Context as _;
 use devfleet_protocol::{
-    HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginReconcileRequest,
-    ProcessSnapshot, ReadinessState, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
-    read_json_line, write_json_line,
+    HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginAction, PluginCall,
+    PluginReconcileRequest, ProcessSnapshot, ReadinessState, SupervisorRequest, SupervisorResponse,
+    SupervisorStartRequest, read_json_line, write_json_line,
 };
 use nix::{
     errno::Errno,
@@ -82,11 +82,16 @@ fn request_spawn(
     let request = JsonRpcRequest {
         jsonrpc: "2.0".into(),
         id: initial.operation_id,
-        method: "reconcile".into(),
-        params: serde_json::to_value(PluginReconcileRequest {
+        method: "plugin.call".into(),
+        params: serde_json::to_value(PluginCall {
             protocol: PROTOCOL_VERSION,
             operation_id: initial.operation_id,
-            process: initial.process.clone(),
+            plugin_state_version: 1,
+            action: PluginAction::Reconcile(PluginReconcileRequest {
+                protocol: PROTOCOL_VERSION,
+                operation_id: initial.operation_id,
+                process: initial.process.clone(),
+            }),
         })?,
     };
     let mut plugin_process = Command::new(plugin)
