@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -158,6 +158,18 @@ pub struct StoredBinding {
     pub invalidation: String,
     pub public_values_json: String,
     pub private_path: String,
+}
+
+/// State for a simulator that `DevFleet` created for exactly one environment.
+/// `udid` remains absent only while a creation result is being reconciled.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredIosDevice {
+    pub environment_id: Uuid,
+    pub udid: Option<String>,
+    pub runtime: String,
+    pub device_type: String,
+    pub expected_name: String,
+    pub lifecycle: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -576,6 +588,72 @@ impl StateStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Writes an intent before `simctl create`; callers may never associate an
+    /// existing UDID with a new environment through this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the reservation.
+    pub fn record_ios_reservation(&mut self, device: &StoredIosDevice) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO ios_devices (
+                environment_id, udid, runtime, device_type, expected_name, lifecycle
+             ) VALUES (?1, NULL, ?2, ?3, ?4, 'reserved')
+             ON CONFLICT(environment_id) DO NOTHING",
+            params![
+                device.environment_id.to_string(),
+                device.runtime,
+                device.device_type,
+                device.expected_name,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persists the exact `simctl create` result. The unique UDID prevents
+    /// double ownership across environments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot bind the result.
+    pub fn bind_ios_udid(&mut self, environment_id: Uuid, udid: &str) -> Result<bool, StateError> {
+        Ok(self.connection.execute(
+            "UPDATE ios_devices SET udid = ?2, lifecycle = 'reserved'
+             WHERE environment_id = ?1 AND udid IS NULL",
+            params![environment_id.to_string(), udid],
+        )? == 1)
+    }
+
+    /// Reads retained iOS ownership without inspecting or adopting host devices.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read ownership state.
+    pub fn ios_device(&self, environment_id: Uuid) -> Result<Option<StoredIosDevice>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT environment_id, udid, runtime, device_type, expected_name, lifecycle
+             FROM ios_devices WHERE environment_id = ?1",
+        )?;
+        let mut rows = statement.query(params![environment_id.to_string()])?;
+        Ok(rows.next()?.map(stored_ios_device).transpose()?)
+    }
+
+    /// Stores the observed outcome of a UDID-scoped simulator command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the lifecycle.
+    pub fn set_ios_lifecycle(
+        &mut self,
+        environment_id: Uuid,
+        lifecycle: &str,
+    ) -> Result<bool, StateError> {
+        Ok(self.connection.execute(
+            "UPDATE ios_devices SET lifecycle = ?2 WHERE environment_id = ?1",
+            params![environment_id.to_string(), lifecycle],
+        )? == 1)
     }
 
     /// Retains an uncertain process record without adopting or terminating it by PID alone.
@@ -1301,6 +1379,21 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 13 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS ios_devices (
+                    environment_id TEXT PRIMARY KEY REFERENCES environments(id),
+                    udid TEXT UNIQUE,
+                    runtime TEXT NOT NULL,
+                    device_type TEXT NOT NULL,
+                    expected_name TEXT NOT NULL,
+                    lifecycle TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 13;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 }
@@ -1315,6 +1408,18 @@ fn stored_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBinding> {
         invalidation: row.get(4)?,
         public_values_json: row.get(5)?,
         private_path: row.get(6)?,
+    })
+}
+
+fn stored_ios_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIosDevice> {
+    Ok(StoredIosDevice {
+        environment_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        udid: row.get(1)?,
+        runtime: row.get(2)?,
+        device_type: row.get(3)?,
+        expected_name: row.get(4)?,
+        lifecycle: row.get(5)?,
     })
 }
 
@@ -1617,6 +1722,43 @@ mod tests {
             StoredReadiness::ProcessStopped
         );
         assert_eq!(observed.endpoints[0].host_url, "http://127.0.0.1:20001");
+    }
+
+    #[test]
+    fn reserves_one_simulator_udid_for_one_environment_only() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let first = environment();
+        let second = StoredEnvironment {
+            id: Uuid::now_v7(),
+            key: "second".into(),
+            ..environment()
+        };
+        store
+            .record_start_intent(&first, Uuid::now_v7())
+            .expect("first environment persists");
+        store
+            .record_start_intent(&second, Uuid::now_v7())
+            .expect("second environment persists");
+        for environment in [&first, &second] {
+            store
+                .record_ios_reservation(&StoredIosDevice {
+                    environment_id: environment.id,
+                    udid: None,
+                    runtime: "runtime-18".into(),
+                    device_type: "phone-16".into(),
+                    expected_name: format!("DevFleet-{}", environment.id),
+                    lifecycle: "reserved".into(),
+                })
+                .expect("reservation persists");
+        }
+        let udid = "0186D916-7A5C-4E31-8590-C2F502FA2288";
+        assert!(store.bind_ios_udid(first.id, udid).expect("first binds"));
+        assert!(store.bind_ios_udid(second.id, udid).is_err());
+        let retained = store
+            .ios_device(first.id)
+            .expect("device reads")
+            .expect("device exists");
+        assert_eq!(retained.udid.as_deref(), Some(udid));
     }
 
     #[test]

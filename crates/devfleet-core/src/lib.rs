@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub mod bindings;
 pub mod execution;
+pub mod ios;
 pub mod logs;
 pub mod plan;
 pub mod ports;
@@ -24,6 +25,7 @@ pub use execution::{
     ExecutionResult, GraphProvider, NodeOwnership, NodeResult, OperationCoordinator,
     OperationDisposition,
 };
+pub use ios::{DeviceSelection, IosDevice, IosError, select_owned_device};
 pub use logs::{LogError, LogStore};
 pub use plan::{
     DependencyEdge, DependencyKind, EffectivePlan, PlanOptions, PlannedResource, compile_document,

@@ -10,16 +10,17 @@ use devfleet_protocol::{
     ComposeReconcileRequest, ComposeUpRequest, DaemonRequest, DaemonResponse, EndpointSnapshot,
     EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot,
     InitializationRunRequest, InitializationTask, InitializationTaskKind,
-    InitializationTaskSnapshot, InitializationTaskStatus, JsonRpcRequest, JsonRpcResponse,
-    LifecycleState, LogSnapshot, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION,
-    PluginAction, PluginReconcileRequest, PluginSnapshot, ProcessSnapshot, ReadinessState,
-    RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy,
-    read_json_line, write_json_line,
+    InitializationTaskSnapshot, InitializationTaskStatus, IosSimulatorAcquireRequest,
+    IosSimulatorAction, IosSimulatorActionRequest, IosSimulatorLifecycle, IosSimulatorSnapshot,
+    JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, OperationAccepted,
+    OperationSnapshot, PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot,
+    ProcessSnapshot, ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse,
+    SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
-    StoredInitializationTask, StoredLifecycle, StoredOperation, StoredProcess, StoredReadiness,
-    VerifiedGitContext,
+    StoredInitializationTask, StoredIosDevice, StoredLifecycle, StoredOperation, StoredProcess,
+    StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -98,6 +99,19 @@ struct Daemon {
     state: StateStore,
 }
 
+#[derive(serde::Deserialize)]
+struct IosDiscovery {
+    devices: Vec<IosDiscoveredDevice>,
+}
+
+#[derive(serde::Deserialize)]
+struct IosDiscoveredDevice {
+    udid: String,
+    name: String,
+    available: bool,
+    state: String,
+}
+
 impl Daemon {
     fn handle_connection(
         &mut self,
@@ -141,6 +155,8 @@ impl Daemon {
             DaemonRequest::ComposeUp(request) => self.compose_up(request),
             DaemonRequest::InitializationRun(request) => self.run_initialization(&request),
             DaemonRequest::BindingApply(request) => self.apply_bindings(request),
+            DaemonRequest::IosSimulatorAcquire(request) => self.ios_simulator_acquire(&request),
+            DaemonRequest::IosSimulatorAction(request) => self.ios_simulator_action(&request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -431,6 +447,7 @@ impl Daemon {
             log_directory: log_directory.display().to_string(),
             log_max_bytes: MAX_RESOURCE_LOG_BYTES,
             redactions,
+            task_plugins: self.trusted_task_plugins()?,
         };
         if let Err(error) = self.start_supervisor(&control_socket, &process_plugin, &start) {
             self.state.mark_failed(environment.id)?;
@@ -575,6 +592,7 @@ impl Daemon {
             log_directory: log_directory.display().to_string(),
             log_max_bytes: MAX_RESOURCE_LOG_BYTES,
             redactions,
+            task_plugins: self.trusted_task_plugins()?,
         };
         if let Err(error) = self.start_supervisor(&control_socket, &compose_plugin, &start) {
             self.state.mark_failed(environment.id)?;
@@ -699,7 +717,7 @@ impl Daemon {
                     )?;
                     return Err(DaemonError::Operation(format!("{}: {diagnostic}", task.id)));
                 }
-                SupervisorResponse::Process(_) => {
+                SupervisorResponse::Process(_) | SupervisorResponse::TaskOutput { .. } => {
                     return Err(DaemonError::Operation(
                         "supervisor returned a process response for an initialization task".into(),
                     ));
@@ -715,6 +733,265 @@ impl Daemon {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn ios_simulator_acquire(
+        &mut self,
+        request: &IosSimulatorAcquireRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment
+            .process
+            .clone()
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        if !matches!(
+            environment.lifecycle,
+            StoredLifecycle::Running | StoredLifecycle::Starting
+        ) {
+            return Err(DaemonError::OwnershipUncertain);
+        }
+        let plugin = self.trusted_plugin("official.ios", "device.discover")?;
+        let mut device = match self.state.ios_device(environment.id)? {
+            Some(device) if device.udid.is_some() => {
+                if device.runtime != request.runtime || device.device_type != request.device_type {
+                    return Err(DaemonError::InvalidConfig(
+                        "the environment already owns a simulator with a different pinned runtime or device type"
+                            .into(),
+                    ));
+                }
+                device
+            }
+            Some(device) => {
+                let discovery = Self::ios_discovery(&plugin)?;
+                let partials = discovery
+                    .devices
+                    .iter()
+                    .filter(|candidate| candidate.name == device.expected_name)
+                    .count();
+                self.state.set_ios_lifecycle(environment.id, "uncertain")?;
+                return Err(DaemonError::OwnershipUncertainPartial(partials));
+            }
+            None => {
+                let reservation = StoredIosDevice {
+                    environment_id: environment.id,
+                    udid: None,
+                    runtime: request.runtime.clone(),
+                    device_type: request.device_type.clone(),
+                    expected_name: format!("DevFleet-{}", environment.id),
+                    lifecycle: "reserved".into(),
+                };
+                self.state.record_ios_reservation(&reservation)?;
+                let output = Self::run_ios_task(
+                    &process,
+                    "device.create",
+                    serde_json::json!({
+                        "runtime": request.runtime,
+                        "device_type": request.device_type,
+                        "name": reservation.expected_name,
+                    }),
+                )?;
+                let udid = Uuid::parse_str(output.trim())
+                    .map_err(|_| {
+                        DaemonError::DeviceUnavailable("simctl create returned no UDID".into())
+                    })?
+                    .to_string();
+                if !self.state.bind_ios_udid(environment.id, &udid)? {
+                    self.state.set_ios_lifecycle(environment.id, "uncertain")?;
+                    return Err(DaemonError::OwnershipUncertain);
+                }
+                self.emit_event(
+                    environment.id,
+                    environment.generation,
+                    None,
+                    "ios_device_reserved",
+                )?;
+                self.state
+                    .ios_device(environment.id)?
+                    .ok_or(DaemonError::OwnershipUncertain)?
+            }
+        };
+        let udid = device.udid.clone().ok_or(DaemonError::OwnershipUncertain)?;
+        let discovery = Self::ios_discovery(&plugin)?;
+        let present = discovery
+            .devices
+            .iter()
+            .find(|candidate| candidate.udid.eq_ignore_ascii_case(&udid))
+            .filter(|candidate| candidate.available)
+            .ok_or_else(|| DaemonError::DeviceUnavailable(udid.clone()))?;
+        if present.state != "Booted" {
+            Self::run_ios_task(
+                &process,
+                "device.boot",
+                serde_json::json!({"udid": udid, "step": "start"}),
+            )?;
+        }
+        Self::run_ios_task(
+            &process,
+            "device.boot",
+            serde_json::json!({"udid": udid, "step": "wait"}),
+        )?;
+        self.state.set_ios_lifecycle(environment.id, "booted")?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            "ios_device_booted",
+        )?;
+        device.lifecycle = "booted".into();
+        Ok(DaemonResponse::IosSimulator(ios_snapshot(device)?))
+    }
+
+    fn ios_simulator_action(
+        &mut self,
+        request: &IosSimulatorActionRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment
+            .process
+            .clone()
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        let device =
+            self.state
+                .ios_device(environment.id)?
+                .ok_or(DaemonError::DeviceUnavailable(
+                    "environment has no owned simulator".into(),
+                ))?;
+        let udid = device.udid.clone().ok_or(DaemonError::OwnershipUncertain)?;
+        let (capability, lifecycle) = match request.action {
+            IosSimulatorAction::Open => ("device.open", "booted"),
+            IosSimulatorAction::Stop => ("device.stop", "stopped"),
+        };
+        self.trusted_plugin("official.ios", capability)?;
+        Self::run_ios_task(&process, capability, serde_json::json!({"udid": udid}))?;
+        self.state.set_ios_lifecycle(environment.id, lifecycle)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            match request.action {
+                IosSimulatorAction::Open => "ios_device_opened",
+                IosSimulatorAction::Stop => "ios_device_stopped",
+            },
+        )?;
+        let device = self
+            .state
+            .ios_device(environment.id)?
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        Ok(DaemonResponse::IosSimulator(ios_snapshot(device)?))
+    }
+
+    fn ios_discovery(plugin: &Path) -> Result<IosDiscovery, DaemonError> {
+        let value = Self::plugin_action(plugin, "device.discover", serde_json::json!({}))?;
+        serde_json::from_value(value).map_err(|_| {
+            DaemonError::DeviceUnavailable("iOS discovery returned malformed data".into())
+        })
+    }
+
+    fn run_ios_task(
+        process: &StoredProcess,
+        capability: &str,
+        input: serde_json::Value,
+    ) -> Result<String, DaemonError> {
+        let response = request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::RunPluginTask {
+                operation_id: Uuid::now_v7(),
+                plugin_id: "official.ios".into(),
+                action: PluginAction::Action {
+                    name: capability.into(),
+                    input,
+                },
+            },
+        )
+        .map_err(|error| match error {
+            DaemonError::Operation(message)
+                if message.contains("requested plugin capability is not authorized") =>
+            {
+                DaemonError::CapabilityUnsupported(capability.into())
+            }
+            error => error,
+        })?;
+        match response {
+            SupervisorResponse::TaskOutput { stdout } => Ok(stdout),
+            SupervisorResponse::TaskFailed => {
+                Err(DaemonError::DeviceUnavailable(capability.into()))
+            }
+            SupervisorResponse::TaskCompleted | SupervisorResponse::Process(_) => Err(
+                DaemonError::Operation("supervisor returned an invalid iOS task response".into()),
+            ),
+        }
+    }
+
+    fn plugin_action(
+        plugin: &Path,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, DaemonError> {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Uuid::now_v7(),
+            method: "plugin.call".into(),
+            params: serde_json::to_value(devfleet_protocol::PluginCall {
+                protocol: PROTOCOL_VERSION,
+                plugin_state_version: 1,
+                operation_id: Uuid::now_v7(),
+                action: PluginAction::Action {
+                    name: name.into(),
+                    input,
+                },
+            })
+            .map_err(|error| DaemonError::Operation(error.to_string()))?,
+        };
+        let mut command = Command::new(plugin);
+        command
+            .arg("--serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = command
+            .spawn()
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| DaemonError::Operation("plugin stdin unavailable".into()))?;
+        stdin
+            .write_all(&write_json_line(&request).map_err(|error| protocol_error(&error))?)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        drop(stdin);
+        let output = child
+            .wait_with_output()
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        if !output.status.success() || output.stdout.len() > devfleet_protocol::MAX_FRAME_BYTES {
+            return Err(DaemonError::CapabilityUnsupported(name.into()));
+        }
+        let response =
+            read_json_line::<JsonRpcResponse>(&mut BufReader::new(output.stdout.as_slice()))
+                .map_err(|error| protocol_error(&error))?;
+        if response.id != request.id {
+            return Err(DaemonError::Operation(
+                "plugin response identity does not match request".into(),
+            ));
+        }
+        if let Some(error) = response.error {
+            if let Some((_, message)) = error.message.split_once("DEVICE_UNAVAILABLE: ") {
+                return Err(DaemonError::DeviceUnavailable(message.into()));
+            }
+            if let Some((_, message)) = error.message.split_once("CAPABILITY_UNSUPPORTED: ") {
+                return Err(DaemonError::CapabilityUnsupported(message.into()));
+            }
+            return Err(DaemonError::Operation(error.message));
+        }
+        response
+            .result
+            .ok_or_else(|| DaemonError::Operation("plugin returned no result".into()))
+    }
+
     fn status(&self, environment_id: Uuid) -> Result<DaemonResponse, DaemonError> {
         let environment = self
             .state
@@ -722,10 +999,12 @@ impl Daemon {
             .ok_or(DaemonError::NotFound)?;
         let tasks = self.state.initialization_tasks(environment_id)?;
         let bindings = self.state.bindings(environment_id)?;
+        let ios = self.state.ios_device(environment_id)?;
         Ok(DaemonResponse::Environment(snapshot(
             environment,
             tasks,
             bindings,
+            ios,
         )))
     }
 
@@ -737,7 +1016,8 @@ impl Daemon {
             .map(|environment| {
                 let tasks = self.state.initialization_tasks(environment.id)?;
                 let bindings = self.state.bindings(environment.id)?;
-                Ok::<_, DaemonError>(snapshot(environment, tasks, bindings))
+                let ios = self.state.ios_device(environment.id)?;
+                Ok::<_, DaemonError>(snapshot(environment, tasks, bindings, ios))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DaemonResponse::Environments(environments))
@@ -950,6 +1230,30 @@ impl Daemon {
         self.trusted_plugin("official.process", "process.reconcile")
     }
 
+    fn trusted_task_plugins(&self) -> Result<Vec<TrustedTaskPlugin>, DaemonError> {
+        self.state
+            .plugins()?
+            .into_iter()
+            .filter(|plugin| plugin.trusted && plugin.id == "official.ios")
+            .map(|plugin| {
+                self.verify_plugin_lock(&plugin)?;
+                let inspected = inspect_plugin(Path::new(&plugin.path))?;
+                if !same_plugin_metadata(&plugin, &inspected) {
+                    return Err(DaemonError::InvalidConfig(
+                        "installed official.ios descriptor or checksum no longer matches its lockfile"
+                            .into(),
+                    ));
+                }
+                Ok(TrustedTaskPlugin {
+                    id: plugin.id,
+                    path: plugin.path,
+                    checksum: plugin.checksum,
+                    capabilities: plugin.capabilities,
+                })
+            })
+            .collect()
+    }
+
     fn trusted_plugin(&self, id: &str, capability: &str) -> Result<PathBuf, DaemonError> {
         let plugin = self
             .state
@@ -1017,6 +1321,14 @@ enum DaemonError {
     NotFound,
     #[error("resource ownership cannot be proven")]
     OwnershipUncertain,
+    #[error(
+        "partial simulator creation was inspected ({0} matching device labels); no device was adopted"
+    )]
+    OwnershipUncertainPartial(usize),
+    #[error("DEVICE_UNAVAILABLE: {0}")]
+    DeviceUnavailable(String),
+    #[error("CAPABILITY_UNSUPPORTED: {0}")]
+    CapabilityUnsupported(String),
     #[error("operation failed: {0}")]
     Operation(String),
     #[error(transparent)]
@@ -1031,7 +1343,11 @@ impl From<DaemonError> for RpcFailure {
             }
             DaemonError::InvalidConfig(_) => ErrorCode::ConfigInvalid,
             DaemonError::NotFound => ErrorCode::ResourceNotFound,
-            DaemonError::OwnershipUncertain => ErrorCode::OwnershipUncertain,
+            DaemonError::OwnershipUncertain | DaemonError::OwnershipUncertainPartial(_) => {
+                ErrorCode::OwnershipUncertain
+            }
+            DaemonError::DeviceUnavailable(_) => ErrorCode::DeviceUnavailable,
+            DaemonError::CapabilityUnsupported(_) => ErrorCode::CapabilityUnsupported,
             DaemonError::State(devfleet_state::StateError::CursorExpired) => {
                 ErrorCode::CursorExpired
             }
@@ -1413,6 +1729,7 @@ fn snapshot(
     environment: StoredEnvironment,
     tasks: Vec<StoredInitializationTask>,
     bindings: Vec<StoredBinding>,
+    ios: Option<StoredIosDevice>,
 ) -> EnvironmentSnapshot {
     let lifecycle = match environment.lifecycle {
         StoredLifecycle::Starting => LifecycleState::Starting,
@@ -1468,7 +1785,26 @@ fn snapshot(
             .map(initialization_task_snapshot)
             .collect(),
         bindings: bindings.into_iter().map(binding_snapshot).collect(),
+        ios_simulator: ios.and_then(|device| ios_snapshot(device).ok()),
     }
+}
+
+fn ios_snapshot(device: StoredIosDevice) -> Result<IosSimulatorSnapshot, DaemonError> {
+    let udid = device.udid.ok_or(DaemonError::OwnershipUncertain)?;
+    let lifecycle = match device.lifecycle.as_str() {
+        "reserved" => IosSimulatorLifecycle::Reserved,
+        "booted" => IosSimulatorLifecycle::Booted,
+        "stopped" => IosSimulatorLifecycle::Stopped,
+        "uncertain" => IosSimulatorLifecycle::Uncertain,
+        _ => return Err(DaemonError::OwnershipUncertain),
+    };
+    Ok(IosSimulatorSnapshot {
+        environment_id: device.environment_id,
+        udid,
+        runtime: device.runtime,
+        device_type: device.device_type,
+        lifecycle,
+    })
 }
 
 fn reconcile_supervisors(state: &mut StateStore) -> Result<(), anyhow::Error> {
@@ -1842,11 +2178,11 @@ fn request_supervisor(
 fn supervisor_process(response: SupervisorResponse) -> Result<ProcessSnapshot, DaemonError> {
     match response {
         SupervisorResponse::Process(process) => Ok(process),
-        SupervisorResponse::TaskCompleted | SupervisorResponse::TaskFailed => {
-            Err(DaemonError::Operation(
-                "supervisor returned a task response for process control".into(),
-            ))
-        }
+        SupervisorResponse::TaskCompleted
+        | SupervisorResponse::TaskFailed
+        | SupervisorResponse::TaskOutput { .. } => Err(DaemonError::Operation(
+            "supervisor returned a task response for process control".into(),
+        )),
     }
 }
 

@@ -245,6 +245,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "devfleet-plugin-ios"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "devfleet-plugin-sdk",
+ "devfleet-protocol",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "devfleet-plugin-process"
 version = "0.1.0"
 dependencies = [
@@ -302,6 +317,7 @@ dependencies = [
  "devfleet-testkit",
  "nix",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 

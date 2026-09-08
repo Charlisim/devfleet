@@ -3,7 +3,8 @@ use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
     DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
-    InitializationTask, PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
+    InitializationTask, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
+    PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -42,6 +43,7 @@ enum Command {
     Compose(ComposeArgs),
     Initialize(InitializeArgs),
     Bindings(BindingsArgs),
+    Ios(IosArgs),
     Plugin(PluginArgs),
 }
 
@@ -55,6 +57,29 @@ enum BindingsCommand {
     Apply {
         #[arg(long)]
         file: PathBuf,
+    },
+}
+
+#[derive(ClapArgs)]
+struct IosArgs {
+    #[command(subcommand)]
+    command: IosCommand,
+}
+
+#[derive(Subcommand)]
+enum IosCommand {
+    Acquire {
+        environment_id: Uuid,
+        #[arg(long)]
+        runtime: String,
+        #[arg(long = "device-type")]
+        device_type: String,
+    },
+    Open {
+        environment_id: Uuid,
+    },
+    Stop {
+        environment_id: Uuid,
     },
 }
 
@@ -409,6 +434,31 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 )?))
             }
         },
+        Command::Ios(ios) => match ios.command {
+            IosCommand::Acquire {
+                environment_id,
+                runtime,
+                device_type,
+            } => Ok(DaemonRequest::IosSimulatorAcquire(
+                IosSimulatorAcquireRequest {
+                    environment_id,
+                    runtime,
+                    device_type,
+                },
+            )),
+            IosCommand::Open { environment_id } => Ok(DaemonRequest::IosSimulatorAction(
+                IosSimulatorActionRequest {
+                    environment_id,
+                    action: IosSimulatorAction::Open,
+                },
+            )),
+            IosCommand::Stop { environment_id } => Ok(DaemonRequest::IosSimulatorAction(
+                IosSimulatorActionRequest {
+                    environment_id,
+                    action: IosSimulatorAction::Stop,
+                },
+            )),
+        },
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
         Command::Stop { environment_id } => Ok(DaemonRequest::Stop { environment_id }),
@@ -563,6 +613,12 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                     binding.phase, binding.invalidation, binding.fingerprint
                 );
             }
+            if let Some(simulator) = &environment.ios_simulator {
+                println!(
+                    "ios {} {} {:?}",
+                    simulator.udid, simulator.runtime, simulator.lifecycle
+                );
+            }
         }
         DaemonResponse::Environments(environments) => {
             for environment in environments {
@@ -628,6 +684,10 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                 );
             }
         }
+        DaemonResponse::IosSimulator(simulator) => println!(
+            "{} {} {:?}",
+            simulator.udid, simulator.runtime, simulator.lifecycle
+        ),
     }
     Ok(())
 }

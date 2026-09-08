@@ -95,6 +95,8 @@ pub enum ErrorCode {
     OperationCancelled,
     CursorExpired,
     OwnershipUncertain,
+    DeviceUnavailable,
+    CapabilityUnsupported,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -178,6 +180,46 @@ pub struct BindingSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IosSimulatorAcquireRequest {
+    pub environment_id: Uuid,
+    /// Installed `CoreSimulator` runtime identifier, pinned by the caller.
+    pub runtime: String,
+    /// Installed `CoreSimulator` device type identifier, pinned by the caller.
+    pub device_type: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IosSimulatorActionRequest {
+    pub environment_id: Uuid,
+    pub action: IosSimulatorAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IosSimulatorAction {
+    Open,
+    Stop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IosSimulatorSnapshot {
+    pub environment_id: Uuid,
+    pub udid: String,
+    pub runtime: String,
+    pub device_type: String,
+    pub lifecycle: IosSimulatorLifecycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IosSimulatorLifecycle {
+    Reserved,
+    Booted,
+    Stopped,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InitializationTask {
     pub id: String,
     pub kind: InitializationTaskKind,
@@ -243,6 +285,8 @@ pub enum DaemonRequest {
     ComposeUp(ComposeUpRequest),
     InitializationRun(InitializationRunRequest),
     BindingApply(BindingApplyRequest),
+    IosSimulatorAcquire(IosSimulatorAcquireRequest),
+    IosSimulatorAction(IosSimulatorActionRequest),
     Status {
         environment_id: Uuid,
     },
@@ -282,6 +326,7 @@ pub enum DaemonRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum DaemonResponse {
     Plan(EnvironmentPlanSnapshot),
     Accepted(OperationAccepted),
@@ -294,6 +339,7 @@ pub enum DaemonResponse {
     Plugins(Vec<PluginSnapshot>),
     InitializationTasks(Vec<InitializationTaskSnapshot>),
     Bindings(Vec<BindingSnapshot>),
+    IosSimulator(IosSimulatorSnapshot),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -383,6 +429,7 @@ pub struct EnvironmentSnapshot {
     pub initialization_ready: bool,
     pub initialization_tasks: Vec<InitializationTaskSnapshot>,
     pub bindings: Vec<BindingSnapshot>,
+    pub ios_simulator: Option<IosSimulatorSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -533,6 +580,16 @@ pub struct SupervisorStartRequest {
     pub log_max_bytes: u64,
     /// Explicit values that should be redacted before a line reaches disk.
     pub redactions: Vec<String>,
+    /// Immutable, checksum-pinned task providers allowed for this supervisor.
+    pub task_plugins: Vec<TrustedTaskPlugin>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrustedTaskPlugin {
+    pub id: String,
+    pub path: String,
+    pub checksum: String,
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -544,6 +601,11 @@ pub enum SupervisorRequest {
         operation_id: Uuid,
         process: ProcessSpec,
     },
+    RunPluginTask {
+        operation_id: Uuid,
+        plugin_id: String,
+        action: PluginAction,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -552,6 +614,7 @@ pub enum SupervisorResponse {
     Process(ProcessSnapshot),
     TaskCompleted,
     TaskFailed,
+    TaskOutput { stdout: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

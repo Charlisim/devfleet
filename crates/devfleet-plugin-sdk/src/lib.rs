@@ -158,9 +158,9 @@ fn dispatch<P: Provider>(provider: &P, call: PluginCall) -> Result<Value, Plugin
     if !descriptor
         .capabilities
         .iter()
-        .any(|item| item == capability)
+        .any(|item| item == &capability)
     {
-        return Err(PluginError::UndeclaredCapability(capability.into()));
+        return Err(PluginError::UndeclaredCapability(capability));
     }
     match call.action {
         PluginAction::Initialize => provider.initialize(),
@@ -176,18 +176,18 @@ fn dispatch<P: Provider>(provider: &P, call: PluginCall) -> Result<Value, Plugin
     }
 }
 
-fn capability(action: &PluginAction) -> &'static str {
+fn capability(action: &PluginAction) -> String {
     match action {
-        PluginAction::Initialize => "lifecycle.initialize",
-        PluginAction::Validate { .. } => "lifecycle.validate",
-        PluginAction::Plan { .. } => "lifecycle.plan",
-        PluginAction::Inspect => "lifecycle.inspect",
-        PluginAction::Reconcile(_) => "process.reconcile",
-        PluginAction::ComposeReconcile(_) => "compose.reconcile",
-        PluginAction::Stop => "lifecycle.stop",
-        PluginAction::Destroy => "lifecycle.destroy",
-        PluginAction::Action { .. } => "lifecycle.action",
-        PluginAction::Cancel => "lifecycle.cancel",
+        PluginAction::Initialize => "lifecycle.initialize".into(),
+        PluginAction::Validate { .. } => "lifecycle.validate".into(),
+        PluginAction::Plan { .. } => "lifecycle.plan".into(),
+        PluginAction::Inspect => "lifecycle.inspect".into(),
+        PluginAction::Reconcile(_) => "process.reconcile".into(),
+        PluginAction::ComposeReconcile(_) => "compose.reconcile".into(),
+        PluginAction::Stop => "lifecycle.stop".into(),
+        PluginAction::Destroy => "lifecycle.destroy".into(),
+        PluginAction::Action { name, .. } => name.clone(),
+        PluginAction::Cancel => "lifecycle.cancel".into(),
     }
 }
 
@@ -272,6 +272,34 @@ mod tests {
                 plugin_state_version: 1,
                 operation_id: Uuid::now_v7(),
                 action: PluginAction::Inspect,
+            })
+            .expect("serializable request"),
+        };
+        let response = handle_request(&provider, request);
+        assert_eq!(
+            response.error.expect("typed rejection").code,
+            ErrorCode::ConfigInvalid
+        );
+    }
+
+    #[test]
+    fn action_capabilities_are_checked_by_the_exact_declared_name() {
+        let provider = FixtureProvider {
+            capabilities: vec!["device.boot".into()],
+            protocol: PROTOCOL_VERSION,
+        };
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Uuid::now_v7(),
+            method: SDK_METHOD.into(),
+            params: serde_json::to_value(PluginCall {
+                protocol: PROTOCOL_VERSION,
+                plugin_state_version: 1,
+                operation_id: Uuid::now_v7(),
+                action: PluginAction::Action {
+                    name: "device.open".into(),
+                    input: json!({}),
+                },
             })
             .expect("serializable request"),
         };

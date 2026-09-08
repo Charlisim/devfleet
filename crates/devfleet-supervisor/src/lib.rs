@@ -5,13 +5,14 @@ use devfleet_logging::LogStore;
 use devfleet_protocol::{
     HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginAction, PluginCall,
     PluginReconcileRequest, ProcessSnapshot, ProcessSpec, ReadinessState, SupervisorRequest,
-    SupervisorResponse, SupervisorStartRequest, read_json_line, write_json_line,
+    SupervisorResponse, SupervisorStartRequest, TrustedTaskPlugin, read_json_line, write_json_line,
 };
 use nix::{
     errno::Errno,
     sys::signal::{Signal, kill},
     unistd::{Pid, getpeereid, getuid},
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, BufReader, Read, Write},
@@ -43,6 +44,7 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
     }
     let initial = read_json_line::<SupervisorStartRequest>(&mut BufReader::new(io::stdin().lock()))
         .context("read supervisor start request")?;
+    let task_plugins = initial.task_plugins.clone();
     let spawn_request = request_spawn(process_plugin, initial.operation_id, initial.action.clone())
         .context("request process provider spawn")?;
     let mut child = spawn(&spawn_request).context("spawn provider process")?;
@@ -73,7 +75,13 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
         observe_child(&mut child, &mut snapshot)?;
         match listener.accept() {
             Ok((stream, _)) => {
-                if handle_control(stream, &mut child, &mut snapshot, process_plugin)? {
+                if handle_control(
+                    stream,
+                    &mut child,
+                    &mut snapshot,
+                    process_plugin,
+                    &task_plugins,
+                )? {
                     logs.finish();
                     return Ok(());
                 }
@@ -242,6 +250,7 @@ fn handle_control(
     child: &mut Child,
     snapshot: &mut ProcessSnapshot,
     process_plugin: &Path,
+    task_plugins: &[TrustedTaskPlugin],
 ) -> anyhow::Result<bool> {
     assert_same_user(&stream)?;
     let request = read_json_line::<JsonRpcRequest>(&mut BufReader::new(stream.try_clone()?))?;
@@ -259,11 +268,61 @@ fn handle_control(
             operation_id,
             process,
         } => run_task(process_plugin, operation_id, process)?,
+        SupervisorRequest::RunPluginTask {
+            operation_id,
+            plugin_id,
+            action,
+        } => run_plugin_task(task_plugins, operation_id, &plugin_id, action)?,
     };
     let rpc = JsonRpcResponse::success(request.id, &response);
     stream.write_all(&write_json_line(&rpc)?)?;
     stream.flush()?;
     Ok(exit_after_response)
+}
+
+fn run_plugin_task(
+    plugins: &[TrustedTaskPlugin],
+    operation_id: Uuid,
+    plugin_id: &str,
+    action: PluginAction,
+) -> anyhow::Result<SupervisorResponse> {
+    let PluginAction::Action {
+        name: capability, ..
+    } = &action
+    else {
+        anyhow::bail!("supervised plugin tasks only accept capability actions");
+    };
+    let plugin = plugins
+        .iter()
+        .find(|candidate| candidate.id == plugin_id)
+        .filter(|candidate| candidate.capabilities.iter().any(|item| item == capability))
+        .ok_or_else(|| anyhow::anyhow!("requested plugin capability is not authorized"))?;
+    let path = Path::new(&plugin.path);
+    let bytes = fs::read(path).context("read authorized plugin")?;
+    if format!("{:x}", Sha256::digest(bytes)) != plugin.checksum {
+        anyhow::bail!("authorized plugin checksum changed after supervisor start");
+    }
+    let request = request_spawn(path, operation_id, action)?;
+    let (program, arguments) = request
+        .argv
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("provider returned an empty argv"))?;
+    let output = Command::new(program)
+        .args(arguments)
+        .current_dir(&request.cwd)
+        .env_clear()
+        .envs(&request.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .with_context(|| format!("run supervised plugin task in {}", request.cwd))?;
+    if !output.status.success() || output.stdout.len() > devfleet_protocol::MAX_FRAME_BYTES {
+        return Ok(SupervisorResponse::TaskFailed);
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| anyhow::anyhow!("supervised task output is not UTF-8"))?;
+    Ok(SupervisorResponse::TaskOutput { stdout })
 }
 
 fn run_task(
