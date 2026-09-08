@@ -1053,23 +1053,21 @@ impl Daemon {
             return self.status(environment.id);
         }
         let automatically_assigned = request.port == 0;
-        let port = if automatically_assigned {
-            *self
-                .reserve_automatic_ports(
-                    &key,
-                    &git_identity.project_fingerprint,
-                    1,
-                    BTreeSet::from(["metro".into()]),
-                )?
-                .get("metro")
-                .ok_or_else(|| DaemonError::InvalidConfig("Metro port assignment missing".into()))?
+        let (port, mut port_reservation) = if automatically_assigned {
+            let automatic_names = BTreeSet::from(["metro".into()]);
+            let (assigned, reservation) = self.reserve_available_automatic_ports(
+                &key,
+                &git_identity.project_fingerprint,
+                1,
+                &automatic_names,
+            )?;
+            let port = *assigned.get("metro").ok_or_else(|| {
+                DaemonError::InvalidConfig("Metro port assignment missing".into())
+            })?;
+            (port, Some(reservation))
         } else {
-            request.port
+            (request.port, None)
         };
-        let mut port_reservation = automatically_assigned
-            .then(|| ReservedPorts::bind(BTreeMap::from([("metro".into(), port)])))
-            .transpose()
-            .map_err(|error| port_conflict(&error))?;
         let cache_key = format!(
             "{:x}",
             Sha256::digest(format!(
@@ -1154,6 +1152,10 @@ impl Daemon {
         if let Err(error) = handoff {
             if let Some(DaemonResponse::Accepted(accepted)) = &accepted_response {
                 let _ = self.stop(accepted.environment_id);
+                let _ = self
+                    .state
+                    .quarantine_port_lease(&key)
+                    .map_err(DaemonError::State)?;
             }
             return Err(port_conflict(&error));
         }
@@ -1305,15 +1307,16 @@ impl Daemon {
             .filter(|endpoint| endpoint.host_port == 0)
             .map(|endpoint| endpoint.name.clone())
             .collect::<BTreeSet<_>>();
-        let assigned_ports = if automatic_ports.is_empty() {
-            BTreeMap::new()
+        let (assigned_ports, mut port_reservation) = if automatic_ports.is_empty() {
+            (BTreeMap::new(), None)
         } else {
-            self.reserve_automatic_ports(
+            let (assigned, reservation) = self.reserve_available_automatic_ports(
                 &environment.key,
                 &environment.project_fingerprint,
                 environment.generation,
-                automatic_ports,
-            )?
+                &automatic_ports,
+            )?;
+            (assigned, Some(reservation))
         };
         for endpoint in &mut request.endpoints {
             if endpoint.host_port == 0 {
@@ -1327,10 +1330,6 @@ impl Daemon {
         }
         inject_compose_endpoint_port_environment(&mut request.environment, &request.endpoints)?;
         environment.endpoints = stored_compose_endpoints(&request.endpoints);
-        let mut port_reservation = (!assigned_ports.is_empty())
-            .then(|| ReservedPorts::bind(assigned_ports.clone()))
-            .transpose()
-            .map_err(|error| port_conflict(&error))?;
         let operation_id = Uuid::now_v7();
         let compose_resource = StoredComposeResource {
             environment_id: environment.id,
@@ -1409,6 +1408,7 @@ impl Daemon {
         }
         if let Err(error) = handoff {
             self.state.mark_failed(environment.id)?;
+            let _ = self.state.quarantine_port_lease(&environment.key)?;
             return Err(port_conflict(&error));
         }
         let response = request_supervisor(&control_socket, SupervisorRequest::Inspect)?;
@@ -5107,40 +5107,21 @@ impl Daemon {
         project_fingerprint: &str,
         generation: u64,
         names: BTreeSet<String>,
+        replan: bool,
     ) -> Result<BTreeMap<String, u16>, DaemonError> {
-        if names.len() > usize::from(DEFAULT_BLOCK_SIZE) {
-            return Err(DaemonError::InvalidConfig(format!(
-                "at most {DEFAULT_BLOCK_SIZE} automatic endpoints can share one environment"
-            )));
+        let request =
+            automatic_port_lease_request(environment_key, project_fingerprint, generation, &names)?;
+        let lease = if replan {
+            self.state.replan_port_lease(&request)
+        } else {
+            self.state.reserve_port_lease(&request)
         }
-        let offsets = names
-            .iter()
-            .enumerate()
-            .map(|(offset, name)| {
-                u16::try_from(offset)
-                    .map(|offset| (name.clone(), offset))
-                    .map_err(|_| {
-                        DaemonError::InvalidConfig("automatic port offset overflow".into())
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let lease = self
-            .state
-            .reserve_port_lease(&PortLeaseRequest {
-                environment_key: environment_key.into(),
-                project_fingerprint: project_fingerprint.into(),
-                generation,
-                range_start: DEFAULT_PORT_RANGE.start,
-                range_end: DEFAULT_PORT_RANGE.end,
-                block_size: DEFAULT_BLOCK_SIZE,
-                offsets,
-            })
-            .map_err(|error| match error {
-                devfleet_state::StateError::PortRangeExhausted => {
-                    DaemonError::PortConflict(error.to_string())
-                }
-                error => DaemonError::State(error),
-            })?;
+        .map_err(|error| match error {
+            devfleet_state::StateError::PortRangeExhausted => {
+                DaemonError::PortConflict(error.to_string())
+            }
+            error => DaemonError::State(error),
+        })?;
         let assigned = PortBlock {
             start: lease.block_start,
             size: lease.block_size,
@@ -5160,6 +5141,63 @@ impl Daemon {
             })
             .collect()
     }
+
+    fn reserve_available_automatic_ports(
+        &mut self,
+        environment_key: &str,
+        project_fingerprint: &str,
+        generation: u64,
+        names: &BTreeSet<String>,
+    ) -> Result<(BTreeMap<String, u16>, ReservedPorts), DaemonError> {
+        for attempt in 0..3 {
+            let assigned = self.reserve_automatic_ports(
+                environment_key,
+                project_fingerprint,
+                generation,
+                names.clone(),
+                attempt != 0,
+            )?;
+            match ReservedPorts::bind(assigned.clone()) {
+                Ok(reservation) => return Ok((assigned, reservation)),
+                Err(error) if attempt == 2 => return Err(port_conflict(&error)),
+                Err(_) => {}
+            }
+        }
+        Err(DaemonError::PortConflict(
+            "automatic port reservation exhausted its retry budget".into(),
+        ))
+    }
+}
+
+fn automatic_port_lease_request(
+    environment_key: &str,
+    project_fingerprint: &str,
+    generation: u64,
+    names: &BTreeSet<String>,
+) -> Result<PortLeaseRequest, DaemonError> {
+    if names.len() > usize::from(DEFAULT_BLOCK_SIZE) {
+        return Err(DaemonError::InvalidConfig(format!(
+            "at most {DEFAULT_BLOCK_SIZE} automatic endpoints can share one environment"
+        )));
+    }
+    let offsets = names
+        .iter()
+        .enumerate()
+        .map(|(offset, name)| {
+            u16::try_from(offset)
+                .map(|offset| (name.clone(), offset))
+                .map_err(|_| DaemonError::InvalidConfig("automatic port offset overflow".into()))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    Ok(PortLeaseRequest {
+        environment_key: environment_key.into(),
+        project_fingerprint: project_fingerprint.into(),
+        generation,
+        range_start: DEFAULT_PORT_RANGE.start,
+        range_end: DEFAULT_PORT_RANGE.end,
+        block_size: DEFAULT_BLOCK_SIZE,
+        offsets,
+    })
 }
 
 fn unix_now_ms() -> Result<u64, DaemonError> {
@@ -5954,6 +5992,7 @@ mod tests {
                 "project",
                 1,
                 BTreeSet::from(["api".into(), "metro".into()]),
+                false,
             )
             .expect("first reservation");
         assert_eq!(first["api"], 20_000);
@@ -5970,6 +6009,7 @@ mod tests {
                 "project",
                 1,
                 BTreeSet::from(["api".into(), "metro".into()]),
+                false,
             )
             .expect("retained reservation");
         assert_eq!(retained, first);
@@ -5979,6 +6019,7 @@ mod tests {
                 "project",
                 1,
                 BTreeSet::from(["api".into()]),
+                false,
             )
             .expect("second reservation");
         assert_eq!(second["api"], 20_064);

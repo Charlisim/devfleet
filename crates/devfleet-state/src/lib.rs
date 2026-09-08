@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 20;
+pub const CURRENT_SCHEMA_VERSION: i64 = 21;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -1596,8 +1596,11 @@ impl StateStore {
         let lease = match existing {
             Ok(lease) => lease,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let mut occupied =
-                    transaction.prepare("SELECT block_start, block_size FROM port_leases")?;
+                let mut occupied = transaction.prepare(
+                    "SELECT block_start, block_size FROM port_leases
+                     UNION ALL
+                     SELECT block_start, block_size FROM quarantined_port_leases",
+                )?;
                 let occupied = occupied
                     .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
                     .collect::<Result<Vec<_>, _>>()?
@@ -1630,6 +1633,91 @@ impl StateStore {
         };
         transaction.commit()?;
         Ok(lease)
+    }
+
+    /// Quarantines an unavailable active block and allocates a fresh block without
+    /// treating the conflicting listener as free.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid requests, exhausted ranges, or failed storage.
+    pub fn replan_port_lease(
+        &mut self,
+        request: &PortLeaseRequest,
+    ) -> Result<StoredPortLease, StateError> {
+        validate_port_request(request)?;
+        let transaction = self.connection.transaction()?;
+        let existing = transaction.query_row(
+            "SELECT project_fingerprint, generation, range_start, range_end, block_start, block_size, offsets_json, state
+             FROM port_leases WHERE environment_key = ?1",
+            params![request.environment_key],
+            stored_port_lease_from_row(&request.environment_key),
+        );
+        let existing = match existing {
+            Ok(existing) => existing,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                drop(transaction);
+                return self.reserve_port_lease(request);
+            }
+            Err(error) => return Err(StateError::Sqlite(error)),
+        };
+        transaction.execute(
+            "INSERT INTO quarantined_port_leases (environment_key, project_fingerprint, generation,
+                                                   range_start, range_end, block_start, block_size, offsets_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                existing.environment_key,
+                existing.project_fingerprint,
+                i64::try_from(existing.generation).map_err(|_| StateError::NumericOutOfRange)?,
+                i64::from(existing.range_start),
+                i64::from(existing.range_end),
+                i64::from(existing.block_start),
+                i64::from(existing.block_size),
+                serde_json::to_string(&existing.offsets)?,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM port_leases WHERE environment_key = ?1",
+            params![request.environment_key],
+        )?;
+        let mut statement = transaction.prepare(
+            "SELECT block_start, block_size FROM port_leases
+             UNION ALL
+             SELECT block_start, block_size FROM quarantined_port_leases",
+        )?;
+        let occupied = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let block_start =
+            candidate_block_start(request, &occupied).ok_or(StateError::PortRangeExhausted)?;
+        transaction.execute(
+            "INSERT INTO port_leases (environment_key, project_fingerprint, generation, range_start, range_end,
+                                      block_start, block_size, offsets_json, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reserved')",
+            params![
+                request.environment_key,
+                request.project_fingerprint,
+                i64::try_from(request.generation).map_err(|_| StateError::NumericOutOfRange)?,
+                i64::from(request.range_start),
+                i64::from(request.range_end),
+                i64::from(block_start),
+                i64::from(request.block_size),
+                serde_json::to_string(&request.offsets)?,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(StoredPortLease {
+            environment_key: request.environment_key.clone(),
+            project_fingerprint: request.project_fingerprint.clone(),
+            generation: request.generation,
+            range_start: request.range_start,
+            range_end: request.range_end,
+            block_start,
+            block_size: request.block_size,
+            offsets: request.offsets.clone(),
+            state: PortLeaseState::Reserved,
+        })
     }
 
     /// Retains slot preference after stop rather than treating a timer as proof it is free.
@@ -1997,6 +2085,24 @@ impl StateStore {
                     device_type TEXT
                  );
                  PRAGMA user_version = 20;
+                 COMMIT;",
+            )?;
+        }
+        if version < 21 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS quarantined_port_leases (
+                    conflict_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    environment_key TEXT NOT NULL,
+                    project_fingerprint TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    range_start INTEGER NOT NULL,
+                    range_end INTEGER NOT NULL,
+                    block_start INTEGER NOT NULL UNIQUE,
+                    block_size INTEGER NOT NULL,
+                    offsets_json TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 21;
                  COMMIT;",
             )?;
         }
@@ -2892,6 +2998,38 @@ mod tests {
             store.reserve_port_lease(&request("three")),
             Err(StateError::PortRangeExhausted)
         ));
+    }
+
+    #[test]
+    fn replans_a_conflicted_block_without_freeing_its_quarantine() {
+        let mut store = StateStore::open_in_memory().expect("state opens");
+        let request = PortLeaseRequest {
+            environment_key: "project|worktree|compose|".into(),
+            project_fingerprint: "project".into(),
+            generation: 1,
+            range_start: 20_000,
+            range_end: 20_191,
+            block_size: 64,
+            offsets: BTreeMap::from([("api".into(), 0)]),
+        };
+        let first = store.reserve_port_lease(&request).expect("first lease");
+        let replanned = store.replan_port_lease(&request).expect("replanned lease");
+        assert_eq!(first.block_start, 20_000);
+        assert_eq!(replanned.block_start, 20_064);
+        let quarantined: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM quarantined_port_leases", [], |row| {
+                row.get(0)
+            })
+            .expect("quarantine reads");
+        assert_eq!(quarantined, 1);
+        let other = store
+            .reserve_port_lease(&PortLeaseRequest {
+                environment_key: "project|other|compose|".into(),
+                ..request
+            })
+            .expect("other lease");
+        assert_eq!(other.block_start, 20_128);
     }
 
     #[test]
