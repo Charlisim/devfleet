@@ -30,7 +30,20 @@ enum Command {
     Status { environment_id: Uuid },
     List,
     Stop { environment_id: Uuid },
+    Operation(OperationArgs),
     Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct OperationArgs {
+    #[command(subcommand)]
+    command: OperationCommand,
+}
+
+#[derive(Subcommand)]
+enum OperationCommand {
+    Get { operation_id: Uuid },
+    Cancel { operation_id: Uuid },
 }
 
 #[derive(ClapArgs)]
@@ -153,6 +166,14 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
         Command::Stop { environment_id } => Ok(DaemonRequest::Stop { environment_id }),
+        Command::Operation(operation) => match operation.command {
+            OperationCommand::Get { operation_id } => {
+                Ok(DaemonRequest::OperationGet { operation_id })
+            }
+            OperationCommand::Cancel { operation_id } => {
+                Ok(DaemonRequest::OperationCancel { operation_id })
+            }
+        },
         Command::Plugin(plugin) => match plugin.command {
             PluginCommand::List => Ok(DaemonRequest::PluginList),
             PluginCommand::Install { path } => Ok(DaemonRequest::PluginInstall {
@@ -242,6 +263,13 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                 );
             }
         }
+        DaemonResponse::Operation(operation) => println!(
+            "{} {:?} phase={} resource={}",
+            operation.operation_id,
+            operation.status,
+            operation.phase,
+            operation.resource_id.as_deref().unwrap_or("environment")
+        ),
         DaemonResponse::Plugin(plugin) => println!(
             "{} {} {} trusted={}",
             plugin.id, plugin.version, plugin.checksum, plugin.trusted

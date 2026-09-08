@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -186,6 +186,28 @@ pub struct PortLeaseRequest {
     pub offsets: BTreeMap<String, u16>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredOperation {
+    pub id: Uuid,
+    pub environment_id: Uuid,
+    pub kind: String,
+    pub status: OperationStatus,
+    pub deadline_unix_ms: Option<u128>,
+    pub cancellation_requested: bool,
+    pub phase: String,
+    pub resource_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Accepted,
+    CancellationRequested,
+    Cancelled,
+    Completed,
+    Failed,
+}
+
 pub struct StateStore {
     connection: Connection,
 }
@@ -357,6 +379,73 @@ impl StateStore {
         self.connection.execute(
             "UPDATE environments SET lifecycle = 'failed' WHERE id = ?1",
             params![environment_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Adds deadline and resource metadata to an accepted operation before its first effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the context.
+    pub fn set_operation_context(
+        &mut self,
+        id: Uuid,
+        deadline_unix_ms: u128,
+        resource_id: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE operations SET deadline_unix_ms = ?1, phase = 'reconcile', resource_id = ?2 WHERE id = ?3",
+            params![deadline_unix_ms.to_string(), resource_id, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Reads an operation without treating a timeout as proof no provider effect occurred.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read or decode the operation.
+    pub fn operation(&self, id: Uuid) -> Result<Option<StoredOperation>, StateError> {
+        let row = self.connection.query_row(
+            "SELECT id, environment_id, kind, status, deadline_unix_ms, cancellation_requested, phase, resource_id
+             FROM operations WHERE id = ?1", params![id.to_string()], stored_operation_from_row,
+        );
+        match row {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(StateError::Sqlite(error)),
+        }
+    }
+
+    /// Marks cancellation durably before callers notify a provider or supervisor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot record the cancellation request.
+    pub fn request_operation_cancel(
+        &mut self,
+        id: Uuid,
+    ) -> Result<Option<StoredOperation>, StateError> {
+        let changed = self.connection.execute(
+            "UPDATE operations SET cancellation_requested = 1, status = 'cancellation_requested', phase = 'cancelling'
+             WHERE id = ?1 AND status IN ('accepted', 'cancellation_requested')", params![id.to_string()],
+        )?;
+        if changed == 0 {
+            return self.operation(id);
+        }
+        self.operation(id)
+    }
+
+    /// Records the final cancellation outcome after owned children have been reaped or quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the final cancellation state.
+    pub fn mark_operation_cancelled(&mut self, id: Uuid, phase: &str) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE operations SET status = 'cancelled', phase = ?1 WHERE id = ?2",
+            params![phase, id.to_string()],
         )?;
         Ok(())
     }
@@ -850,8 +939,51 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 8 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 ALTER TABLE operations ADD COLUMN deadline_unix_ms TEXT;
+                 ALTER TABLE operations ADD COLUMN cancellation_requested INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE operations ADD COLUMN phase TEXT NOT NULL DEFAULT 'accepted';
+                 ALTER TABLE operations ADD COLUMN resource_id TEXT;
+                 PRAGMA user_version = 8;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
+}
+
+fn stored_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOperation> {
+    let status: String = row.get(3)?;
+    let status = match status.as_str() {
+        "accepted" => OperationStatus::Accepted,
+        "cancellation_requested" => OperationStatus::CancellationRequested,
+        "cancelled" => OperationStatus::Cancelled,
+        "completed" => OperationStatus::Completed,
+        "failed" => OperationStatus::Failed,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let deadline = row
+        .get::<_, Option<String>>(4)?
+        .map(|value| {
+            value
+                .parse::<u128>()
+                .map_err(|_| rusqlite::Error::InvalidQuery)
+        })
+        .transpose()?;
+    Ok(StoredOperation {
+        id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        environment_id: Uuid::parse_str(&row.get::<_, String>(1)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        kind: row.get(2)?,
+        status,
+        deadline_unix_ms: deadline,
+        cancellation_requested: row.get(5)?,
+        phase: row.get(6)?,
+        resource_id: row.get(7)?,
+    })
 }
 
 fn validate_port_request(request: &PortLeaseRequest) -> Result<(), StateError> {
@@ -1013,9 +1145,30 @@ mod tests {
     fn persists_intent_process_identity_and_stop_state() {
         let mut store = StateStore::open_in_memory().expect("state store opens");
         let environment = environment();
+        let operation_id = Uuid::now_v7();
         store
-            .record_start_intent(&environment, Uuid::now_v7())
+            .record_start_intent(&environment, operation_id)
             .expect("intent persists");
+        store
+            .set_operation_context(operation_id, 100, "process")
+            .expect("context persists");
+        let cancellation = store
+            .request_operation_cancel(operation_id)
+            .expect("cancellation persists")
+            .expect("operation exists");
+        assert_eq!(cancellation.status, OperationStatus::CancellationRequested);
+        assert!(cancellation.cancellation_requested);
+        store
+            .mark_operation_cancelled(operation_id, "reaped")
+            .expect("cancelled persists");
+        assert_eq!(
+            store
+                .operation(operation_id)
+                .expect("operation reads")
+                .expect("operation exists")
+                .status,
+            OperationStatus::Cancelled
+        );
         let process = StoredProcess {
             pid: 42,
             process_group: 42,

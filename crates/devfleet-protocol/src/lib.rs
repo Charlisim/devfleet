@@ -134,6 +134,8 @@ pub enum DaemonRequest {
     Status { environment_id: Uuid },
     List,
     Stop { environment_id: Uuid },
+    OperationGet { operation_id: Uuid },
+    OperationCancel { operation_id: Uuid },
     PluginList,
     PluginInstall { path: String },
     PluginTrust { id: String },
@@ -146,8 +148,30 @@ pub enum DaemonResponse {
     Accepted(OperationAccepted),
     Environment(EnvironmentSnapshot),
     Environments(Vec<EnvironmentSnapshot>),
+    Operation(OperationSnapshot),
     Plugin(PluginSnapshot),
     Plugins(Vec<PluginSnapshot>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationSnapshot {
+    pub operation_id: Uuid,
+    pub environment_id: Uuid,
+    pub status: OperationStatus,
+    pub deadline_unix_ms: Option<u128>,
+    pub phase: String,
+    pub resource_id: Option<String>,
+    pub retryable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Accepted,
+    CancellationRequested,
+    Cancelled,
+    Completed,
+    Failed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

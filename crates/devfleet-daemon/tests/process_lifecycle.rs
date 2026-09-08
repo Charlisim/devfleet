@@ -219,6 +219,68 @@ fn immediately_exited_process_is_retained_as_failed() {
 }
 
 #[test]
+fn cancellation_persists_before_reaping_the_owned_process() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::Up(EnvironmentUpRequest {
+            worktree: temporary.path().display().to_string(),
+            profile: "process".into(),
+            instance: None,
+            trusted: true,
+            process: ProcessSpec {
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::new(),
+            },
+        }),
+    )
+    .expect("start accepted");
+    let DaemonResponse::Accepted(accepted) = response else {
+        panic!("expected accepted operation");
+    };
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::OperationGet {
+            operation_id: accepted.operation_id,
+        },
+    )
+    .expect("operation reads");
+    let DaemonResponse::Operation(operation) = response else {
+        panic!("expected operation");
+    };
+    assert!(operation.deadline_unix_ms.is_some());
+    assert_eq!(operation.resource_id.as_deref(), Some("process"));
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::OperationCancel {
+            operation_id: accepted.operation_id,
+        },
+    )
+    .expect("cancel accepted");
+    let DaemonResponse::Operation(operation) = response else {
+        panic!("expected operation");
+    };
+    assert_eq!(
+        operation.status,
+        devfleet_protocol::OperationStatus::Cancelled
+    );
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: accepted.environment_id,
+        },
+    )
+    .expect("status reads");
+    let DaemonResponse::Environment(environment) = response else {
+        panic!("expected environment");
+    };
+    assert_eq!(environment.lifecycle, LifecycleState::Stopped);
+}
+
+#[test]
 fn plan_is_side_effect_free_and_invalid_manifests_cannot_spawn_a_process() {
     let temporary = TempDir::new().expect("temporary directory");
     initialize_git_repository(temporary.path());

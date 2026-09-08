@@ -3,13 +3,13 @@
 use devfleet_core::{PlanOptions, compile_manifest, discover_git_worktree};
 use devfleet_protocol::{
     DaemonRequest, DaemonResponse, EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode,
-    JsonRpcRequest, JsonRpcResponse, LifecycleState, OperationAccepted, PROTOCOL_VERSION,
-    PluginSnapshot, ProcessSnapshot, ReadinessState, RpcFailure, SupervisorRequest,
-    SupervisorResponse, SupervisorStartRequest, read_json_line, write_json_line,
+    JsonRpcRequest, JsonRpcResponse, LifecycleState, OperationAccepted, OperationSnapshot,
+    PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot, ReadinessState, RpcFailure,
+    SupervisorRequest, SupervisorResponse, SupervisorStartRequest, read_json_line, write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredEnvironment, StoredLifecycle, StoredProcess, StoredReadiness,
-    VerifiedGitContext,
+    StateStore, StoredEnvironment, StoredLifecycle, StoredOperation, StoredProcess,
+    StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -128,6 +128,8 @@ impl Daemon {
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
+            DaemonRequest::OperationGet { operation_id } => self.operation_get(operation_id),
+            DaemonRequest::OperationCancel { operation_id } => self.operation_cancel(operation_id),
             DaemonRequest::PluginList => self.plugin_list(),
             DaemonRequest::PluginInstall { path } => self.plugin_install(Path::new(&path)),
             DaemonRequest::PluginTrust { id } => self.plugin_trust(&id),
@@ -279,6 +281,15 @@ impl Daemon {
         };
         let operation_id = Uuid::now_v7();
         self.state.record_start_intent(&environment, operation_id)?;
+        self.state.set_operation_context(
+            operation_id,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| DaemonError::Operation(error.to_string()))?
+                .as_millis()
+                + 60_000,
+            "process",
+        )?;
         let control_socket = supervisor_socket_path(environment.id)?;
         let start = SupervisorStartRequest {
             environment_id: environment.id,
@@ -341,6 +352,39 @@ impl Daemon {
         }
         self.state.mark_stopped(environment_id)?;
         self.status(environment_id)
+    }
+
+    fn operation_get(&self, operation_id: Uuid) -> Result<DaemonResponse, DaemonError> {
+        let operation = self
+            .state
+            .operation(operation_id)?
+            .ok_or(DaemonError::NotFound)?;
+        Ok(DaemonResponse::Operation(operation_snapshot(operation)))
+    }
+
+    fn operation_cancel(&mut self, operation_id: Uuid) -> Result<DaemonResponse, DaemonError> {
+        let operation = self
+            .state
+            .request_operation_cancel(operation_id)?
+            .ok_or(DaemonError::NotFound)?;
+        if let Some(environment) = self.state.environment(operation.environment_id)?
+            && let Some(process) = environment.process
+        {
+            let response = request_supervisor(
+                Path::new(&process.supervisor_socket),
+                SupervisorRequest::Stop,
+            )?;
+            let SupervisorResponse::Process(process) = response;
+            if process.readiness != ReadinessState::ProcessStopped {
+                return Err(DaemonError::Operation(
+                    "supervisor did not reap cancelled process".into(),
+                ));
+            }
+            self.state.mark_stopped(operation.environment_id)?;
+        }
+        self.state
+            .mark_operation_cancelled(operation_id, "reaped")?;
+        self.operation_get(operation_id)
     }
 
     fn start_supervisor(
@@ -710,6 +754,32 @@ fn stored_process(process: &ProcessSnapshot) -> StoredProcess {
             ReadinessState::ProcessAlive => StoredReadiness::ProcessAlive,
             ReadinessState::ProcessStopped => StoredReadiness::ProcessStopped,
         },
+    }
+}
+
+fn operation_snapshot(operation: StoredOperation) -> OperationSnapshot {
+    OperationSnapshot {
+        operation_id: operation.id,
+        environment_id: operation.environment_id,
+        status: match operation.status {
+            devfleet_state::OperationStatus::Accepted => {
+                devfleet_protocol::OperationStatus::Accepted
+            }
+            devfleet_state::OperationStatus::CancellationRequested => {
+                devfleet_protocol::OperationStatus::CancellationRequested
+            }
+            devfleet_state::OperationStatus::Cancelled => {
+                devfleet_protocol::OperationStatus::Cancelled
+            }
+            devfleet_state::OperationStatus::Completed => {
+                devfleet_protocol::OperationStatus::Completed
+            }
+            devfleet_state::OperationStatus::Failed => devfleet_protocol::OperationStatus::Failed,
+        },
+        deadline_unix_ms: operation.deadline_unix_ms,
+        phase: operation.phase,
+        resource_id: operation.resource_id,
+        retryable: false,
     }
 }
 
