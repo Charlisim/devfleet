@@ -100,6 +100,7 @@ pub enum ErrorCode {
     DeviceUnavailable,
     CapabilityUnsupported,
     ResourceBudgetExceeded,
+    PortConflict,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

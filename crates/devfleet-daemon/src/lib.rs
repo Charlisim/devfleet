@@ -1069,7 +1069,7 @@ impl Daemon {
         let mut port_reservation = automatically_assigned
             .then(|| ReservedPorts::bind(BTreeMap::from([("metro".into(), port)])))
             .transpose()
-            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+            .map_err(|error| port_conflict(&error))?;
         let cache_key = format!(
             "{:x}",
             Sha256::digest(format!(
@@ -1155,7 +1155,7 @@ impl Daemon {
             if let Some(DaemonResponse::Accepted(accepted)) = &accepted_response {
                 let _ = self.stop(accepted.environment_id);
             }
-            return Err(DaemonError::Operation(error.to_string()));
+            return Err(port_conflict(&error));
         }
         let response = accepted_response.ok_or_else(|| {
             DaemonError::Operation("Metro startup returned no operation response".into())
@@ -1330,7 +1330,7 @@ impl Daemon {
         let mut port_reservation = (!assigned_ports.is_empty())
             .then(|| ReservedPorts::bind(assigned_ports.clone()))
             .transpose()
-            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+            .map_err(|error| port_conflict(&error))?;
         let operation_id = Uuid::now_v7();
         let compose_resource = StoredComposeResource {
             environment_id: environment.id,
@@ -1409,7 +1409,7 @@ impl Daemon {
         }
         if let Err(error) = handoff {
             self.state.mark_failed(environment.id)?;
-            return Err(DaemonError::Operation(error.to_string()));
+            return Err(port_conflict(&error));
         }
         let response = request_supervisor(&control_socket, SupervisorRequest::Inspect)?;
         let process = supervisor_process(response)?;
@@ -4048,6 +4048,8 @@ enum DaemonError {
     DeviceUnavailable(String),
     #[error("CAPABILITY_UNSUPPORTED: {0}")]
     CapabilityUnsupported(String),
+    #[error("PORT_CONFLICT: {0}")]
+    PortConflict(String),
     #[error("operation failed: {0}")]
     Operation(String),
     #[error(transparent)]
@@ -4058,6 +4060,7 @@ enum DaemonError {
 
 impl From<DaemonError> for RpcFailure {
     fn from(error: DaemonError) -> Self {
+        let retryable = matches!(&error, DaemonError::PortConflict(_));
         let code = match error {
             DaemonError::TrustRequired | DaemonError::PluginTrustRequired => {
                 ErrorCode::PermissionDenied
@@ -4071,6 +4074,7 @@ impl From<DaemonError> for RpcFailure {
             DaemonError::Scheduler(SchedulerError::ResourceBudgetExceeded { .. }) => {
                 ErrorCode::ResourceBudgetExceeded
             }
+            DaemonError::PortConflict(_) => ErrorCode::PortConflict,
             DaemonError::InvalidConfig(_) | DaemonError::Scheduler(_) => ErrorCode::ConfigInvalid,
             DaemonError::State(devfleet_state::StateError::CursorExpired) => {
                 ErrorCode::CursorExpired
@@ -4080,7 +4084,7 @@ impl From<DaemonError> for RpcFailure {
         Self {
             code,
             message: error.to_string(),
-            retryable: false,
+            retryable,
         }
     }
 }
@@ -5120,15 +5124,23 @@ impl Daemon {
                     })
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let lease = self.state.reserve_port_lease(&PortLeaseRequest {
-            environment_key: environment_key.into(),
-            project_fingerprint: project_fingerprint.into(),
-            generation,
-            range_start: DEFAULT_PORT_RANGE.start,
-            range_end: DEFAULT_PORT_RANGE.end,
-            block_size: DEFAULT_BLOCK_SIZE,
-            offsets,
-        })?;
+        let lease = self
+            .state
+            .reserve_port_lease(&PortLeaseRequest {
+                environment_key: environment_key.into(),
+                project_fingerprint: project_fingerprint.into(),
+                generation,
+                range_start: DEFAULT_PORT_RANGE.start,
+                range_end: DEFAULT_PORT_RANGE.end,
+                block_size: DEFAULT_BLOCK_SIZE,
+                offsets,
+            })
+            .map_err(|error| match error {
+                devfleet_state::StateError::PortRangeExhausted => {
+                    DaemonError::PortConflict(error.to_string())
+                }
+                error => DaemonError::State(error),
+            })?;
         let assigned = PortBlock {
             start: lease.block_start,
             size: lease.block_size,
@@ -5616,6 +5628,10 @@ fn protocol_error(error: &devfleet_protocol::ProtocolError) -> DaemonError {
     DaemonError::Operation(error.to_string())
 }
 
+fn port_conflict(error: &devfleet_core::PortError) -> DaemonError {
+    DaemonError::PortConflict(error.to_string())
+}
+
 fn proposed_manifest() -> String {
     r#"schema_version = 1
 
@@ -5993,6 +6009,13 @@ mod tests {
         assert_eq!(environment["DEVFLEET_WEB_API_PORT"], "20001");
         environment.insert("DEVFLEET_API_PORT".into(), "20002".into());
         assert!(inject_compose_endpoint_port_environment(&mut environment, &endpoints).is_err());
+    }
+
+    #[test]
+    fn port_conflicts_are_typed_and_retryable() {
+        let failure = RpcFailure::from(DaemonError::PortConflict("endpoint replaced".into()));
+        assert_eq!(failure.code, ErrorCode::PortConflict);
+        assert!(failure.retryable);
     }
 
     fn destroy_environment(worktree: &Path) -> StoredEnvironment {
