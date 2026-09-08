@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 17;
+pub const CURRENT_SCHEMA_VERSION: i64 = 18;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -191,6 +191,14 @@ pub struct StoredIosApp {
     pub derived_data: String,
     pub native_fingerprint: String,
     pub launched: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredIdentityVerification {
+    pub environment_id: Uuid,
+    pub generation: u64,
+    pub mode: String,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -499,6 +507,10 @@ impl StateStore {
                 "UPDATE ios_apps SET launched = 0 WHERE environment_id IN (SELECT id FROM environments WHERE worktree_id = ?1)",
                 params![worktree_id],
             )?;
+            transaction.execute(
+                "UPDATE identity_verifications SET status = 'mismatch' WHERE environment_id IN (SELECT id FROM environments WHERE worktree_id = ?1) AND mode = 'app_handshake'",
+                params![worktree_id],
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -700,6 +712,45 @@ impl StateStore {
             params![app.environment_id.to_string(), app.bundle_id, app.udid, i64::from(app.metro_port), app.derived_data, app.native_fingerprint, app.launched],
         )?;
         Ok(())
+    }
+
+    /// Records the public lifecycle state of a per-launch identity verifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the verification state.
+    pub fn record_identity_verification(
+        &mut self,
+        verification: &StoredIdentityVerification,
+    ) -> Result<(), StateError> {
+        let generation =
+            i64::try_from(verification.generation).map_err(|_| StateError::NumericOutOfRange)?;
+        self.connection.execute(
+            "INSERT INTO identity_verifications (environment_id, generation, mode, status) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(environment_id) DO UPDATE SET generation = excluded.generation, mode = excluded.mode, status = excluded.status",
+            params![verification.environment_id.to_string(), generation, verification.mode, verification.status],
+        )?;
+        Ok(())
+    }
+
+    /// Returns public identity-verification state without any nonce or token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read the verification state.
+    pub fn identity_verification(
+        &self,
+        environment_id: Uuid,
+    ) -> Result<Option<StoredIdentityVerification>, StateError> {
+        let row = self.connection.query_row(
+            "SELECT environment_id, generation, mode, status FROM identity_verifications WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+            stored_identity_verification,
+        );
+        match row {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(StateError::Sqlite(error)),
+        }
     }
 
     /// Persists metadata for a media artifact stored outside SQLite event rows.
@@ -1597,6 +1648,9 @@ impl StateStore {
         if version < 17 {
             self.connection.execute_batch("BEGIN; ALTER TABLE artifacts ADD COLUMN app_running INTEGER NOT NULL DEFAULT 0; ALTER TABLE artifacts ADD COLUMN functional_result TEXT NOT NULL DEFAULT 'unverified'; ALTER TABLE artifacts ADD COLUMN human_review TEXT NOT NULL DEFAULT 'unreviewed'; PRAGMA user_version = 17; COMMIT;")?;
         }
+        if version < 18 {
+            self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS identity_verifications (environment_id TEXT PRIMARY KEY REFERENCES environments(id), generation INTEGER NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL); PRAGMA user_version = 18; COMMIT;")?;
+        }
         Ok(())
     }
 }
@@ -1654,6 +1708,19 @@ fn stored_ios_app(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIosApp> {
         derived_data: row.get(4)?,
         native_fingerprint: row.get(5)?,
         launched: row.get(6)?,
+    })
+}
+
+fn stored_identity_verification(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredIdentityVerification> {
+    Ok(StoredIdentityVerification {
+        environment_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        generation: u64::try_from(row.get::<_, i64>(1)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?,
+        mode: row.get(2)?,
+        status: row.get(3)?,
     })
 }
 
@@ -2077,6 +2144,30 @@ mod tests {
     }
 
     #[test]
+    fn retains_identity_status_without_nonce_or_token() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let environment = environment();
+        store
+            .record_start_intent(&environment, Uuid::now_v7())
+            .expect("environment persists");
+        let verification = StoredIdentityVerification {
+            environment_id: environment.id,
+            generation: environment.generation,
+            mode: "app_handshake".into(),
+            status: "pending".into(),
+        };
+        store
+            .record_identity_verification(&verification)
+            .expect("verification persists");
+        assert_eq!(
+            store
+                .identity_verification(environment.id)
+                .expect("verification reads"),
+            Some(verification)
+        );
+    }
+
+    #[test]
     fn retains_artifact_metadata_without_media_bytes() {
         let mut store = StateStore::open_in_memory().expect("state store opens");
         let environment = environment();
@@ -2137,6 +2228,14 @@ mod tests {
             })
             .expect("app persists");
         store
+            .record_identity_verification(&StoredIdentityVerification {
+                environment_id: second.id,
+                generation: second.generation,
+                mode: "app_handshake".into(),
+                status: "verified".into(),
+            })
+            .expect("verification persists");
+        store
             .set_endpoints(
                 first.id,
                 &[StoredEndpoint {
@@ -2164,6 +2263,14 @@ mod tests {
                 .expect("app reads")
                 .expect("app exists")
                 .launched
+        );
+        assert_eq!(
+            store
+                .identity_verification(second.id)
+                .expect("verification reads")
+                .expect("verification exists")
+                .status,
+            "mismatch"
         );
     }
 

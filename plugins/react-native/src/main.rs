@@ -1,6 +1,8 @@
 use clap::Parser;
 use devfleet_plugin_sdk::{PluginError, Provider, ProviderDescriptor, serve_once};
-use devfleet_protocol::{HostSpawnRequest, PROTOCOL_VERSION, ReactNativeIosRunRequest};
+use devfleet_protocol::{
+    HostSpawnRequest, PROTOCOL_VERSION, ReactNativeIdentityHook, ReactNativeIosRunRequest,
+};
 use semver::Version;
 use serde::Deserialize;
 use serde_json::Value;
@@ -101,6 +103,10 @@ fn ios_run(request: ReactNativeIosRunRequest) -> Result<Value, PluginError> {
         ));
     }
     reject_expo(&worktree)?;
+    let mut environment = trusted_environment();
+    if let Some(hook) = request.identity_hook.as_ref() {
+        environment.extend(identity_hook_environment(&worktree, hook)?);
+    }
     let mut argv = vec![
         node()?,
         cli.display().to_string(),
@@ -119,7 +125,7 @@ fn ios_run(request: ReactNativeIosRunRequest) -> Result<Value, PluginError> {
     serde_json::to_value(HostSpawnRequest {
         argv,
         cwd: worktree.display().to_string(),
-        environment: trusted_environment(),
+        environment,
     })
     .map_err(|error| PluginError::RequestFailed(error.to_string()))
 }
@@ -177,6 +183,87 @@ fn trusted_environment() -> BTreeMap<String, String> {
         "PATH".into(),
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin".into(),
     )])
+}
+
+fn identity_hook_environment(
+    worktree: &Path,
+    hook: &ReactNativeIdentityHook,
+) -> Result<BTreeMap<String, String>, PluginError> {
+    let module = Path::new(&hook.module);
+    if module.is_absolute()
+        || module
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(PluginError::InvalidCall(
+            "identity hook module must be a relative worktree file".into(),
+        ));
+    }
+    let module = worktree.join(module);
+    let metadata = module.symlink_metadata().map_err(|_| {
+        PluginError::RequestFailed("PREPARATION_INVALID: identity hook module is required".into())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(PluginError::RequestFailed(
+            "PREPARATION_INVALID: identity hook module must be a regular file".into(),
+        ));
+    }
+    if !valid_identity_callback(&hook.callback_url)
+        || uuid::Uuid::parse_str(&hook.authorization_token).is_err()
+        || uuid::Uuid::parse_str(&hook.nonce).is_err()
+        || hook.backend_identity_url.is_empty()
+        || hook.expected_backend_identity.is_empty()
+    {
+        return Err(PluginError::InvalidCall(
+            "identity hook requires a private callback and backend identity route".into(),
+        ));
+    }
+    Ok(BTreeMap::from([
+        ("DEVFLEET_IDENTITY_HOOK_MODULE".into(), hook.module.clone()),
+        (
+            "DEVFLEET_IDENTITY_CALLBACK_URL".into(),
+            hook.callback_url.clone(),
+        ),
+        (
+            "DEVFLEET_IDENTITY_TOKEN".into(),
+            hook.authorization_token.clone(),
+        ),
+        ("DEVFLEET_IDENTITY_NONCE".into(), hook.nonce.clone()),
+        (
+            "DEVFLEET_IDENTITY_ENVIRONMENT_ID".into(),
+            hook.environment_id.to_string(),
+        ),
+        (
+            "DEVFLEET_IDENTITY_GENERATION".into(),
+            hook.generation.to_string(),
+        ),
+        (
+            "DEVFLEET_IDENTITY_BUILD_IDENTITY".into(),
+            hook.build_identity.clone(),
+        ),
+        (
+            "DEVFLEET_IDENTITY_BUNDLE_IDENTITY".into(),
+            hook.bundle_identity.clone(),
+        ),
+        (
+            "DEVFLEET_IDENTITY_BACKEND_URL".into(),
+            hook.backend_identity_url.clone(),
+        ),
+        (
+            "DEVFLEET_IDENTITY_BACKEND_IDENTITY".into(),
+            hook.expected_backend_identity.clone(),
+        ),
+    ]))
+}
+
+fn valid_identity_callback(callback_url: &str) -> bool {
+    let Some(authority) = callback_url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|value| value.strip_suffix("/identity"))
+    else {
+        return false;
+    };
+    authority.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 fn canonical_directory(path: &Path, name: &str) -> Result<PathBuf, PluginError> {
@@ -307,6 +394,7 @@ mod tests {
             derived_data: first_build.path().display().to_string(),
             bundle_id: "com.example.app".into(),
             scheme: None,
+            identity_hook: None,
         })
         .expect("first command");
         let second = ios_run(ReactNativeIosRunRequest {
@@ -316,6 +404,7 @@ mod tests {
             derived_data: second_build.path().display().to_string(),
             bundle_id: "com.example.app".into(),
             scheme: None,
+            identity_hook: None,
         })
         .expect("second command");
         let first: HostSpawnRequest = serde_json::from_value(first).expect("first spawn");
@@ -347,6 +436,59 @@ mod tests {
                     .display()
                     .to_string(),
             )
+        );
+    }
+
+    #[test]
+    fn handshake_build_receives_only_the_declared_device_identity_contract() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let derived_data = tempfile::tempdir().expect("derived data");
+        let cli = worktree.path().join("node_modules/react-native");
+        std::fs::create_dir_all(&cli).expect("CLI directory");
+        std::fs::write(cli.join("cli.js"), "// fixture").expect("CLI fixture");
+        let hook = worktree.path().join("hooks/identity.js");
+        std::fs::create_dir_all(hook.parent().expect("hook parent")).expect("hook parent");
+        std::fs::write(&hook, "// development hook").expect("hook fixture");
+        let environment_id = uuid::Uuid::now_v7();
+        let command = ios_run(ReactNativeIosRunRequest {
+            worktree: worktree.path().display().to_string(),
+            udid: "0186D916-7A5C-4E31-8590-C2F502FA2288".into(),
+            metro_port: 21_001,
+            derived_data: derived_data.path().display().to_string(),
+            bundle_id: "com.example.app".into(),
+            scheme: None,
+            identity_hook: Some(ReactNativeIdentityHook {
+                callback_url: "http://127.0.0.1:23111/identity".into(),
+                authorization_token: uuid::Uuid::now_v7().to_string(),
+                nonce: uuid::Uuid::now_v7().to_string(),
+                environment_id,
+                generation: 4,
+                build_identity: "build-a".into(),
+                bundle_identity: "com.example.app".into(),
+                backend_identity_url: "http://127.0.0.1:23001/devfleet-identity".into(),
+                expected_backend_identity: "backend-a".into(),
+                module: "hooks/identity.js".into(),
+            }),
+        })
+        .expect("handshake command");
+        let command: HostSpawnRequest = serde_json::from_value(command).expect("spawn command");
+        assert_eq!(
+            command.environment.get("DEVFLEET_IDENTITY_CALLBACK_URL"),
+            Some(&"http://127.0.0.1:23111/identity".into())
+        );
+        assert_eq!(
+            command.environment.get("DEVFLEET_IDENTITY_ENVIRONMENT_ID"),
+            Some(&environment_id.to_string())
+        );
+        assert_eq!(
+            command.environment.get("DEVFLEET_IDENTITY_HOOK_MODULE"),
+            Some(&"hooks/identity.js".into())
+        );
+        assert_eq!(
+            command
+                .environment
+                .get("DEVFLEET_IDENTITY_BACKEND_IDENTITY"),
+            Some(&"backend-a".into())
         );
     }
 }

@@ -206,6 +206,31 @@ pub struct IosAppRunRequest {
     pub environment_id: Uuid,
     pub bundle_id: String,
     pub scheme: Option<String>,
+    pub verification: VerificationMode,
+    pub backend_identity: Option<String>,
+    pub backend_identity_url: Option<String>,
+    pub identity_hook_module: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationMode {
+    Transport,
+    AppHandshake,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReactNativeIdentityHook {
+    pub callback_url: String,
+    pub authorization_token: String,
+    pub nonce: String,
+    pub environment_id: Uuid,
+    pub generation: u64,
+    pub build_identity: String,
+    pub bundle_identity: String,
+    pub backend_identity_url: String,
+    pub expected_backend_identity: String,
+    pub module: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -222,6 +247,7 @@ pub struct IosAppSnapshot {
 pub struct IdentityVerificationStartRequest {
     pub environment_id: Uuid,
     pub backend_identity: String,
+    pub backend_identity_url: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -261,11 +287,15 @@ pub enum ArtifactKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IdentityVerificationSnapshot {
+    pub lease_id: Uuid,
     pub environment_id: Uuid,
     pub generation: u64,
+    pub mode: VerificationMode,
     pub verification_url: String,
     pub nonce: String,
     pub token: String,
+    pub build_identity: String,
+    pub bundle_identity: String,
     pub status: IdentityVerificationStatus,
     pub diagnostic: Option<String>,
 }
@@ -285,6 +315,7 @@ pub struct SupervisorIdentityVerificationRequest {
     pub build_identity: String,
     pub bundle_identity: String,
     pub backend_identity: String,
+    pub backend_identity_url: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -555,12 +586,26 @@ pub struct EnvironmentSnapshot {
     pub reconciliation_diagnostic: Option<String>,
     pub process: Option<ProcessSnapshot>,
     pub endpoints: Vec<EndpointSnapshot>,
+    pub readiness: EnvironmentReadiness,
     pub initialization_ready: bool,
     pub initialization_tasks: Vec<InitializationTaskSnapshot>,
     pub preparation_tasks: Vec<PreparationTaskSnapshot>,
     pub bindings: Vec<BindingSnapshot>,
     pub ios_simulator: Option<IosSimulatorSnapshot>,
     pub ios_app: Option<IosAppSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct EnvironmentReadiness {
+    pub backend_healthy: bool,
+    pub metro_ready: bool,
+    pub device_booted: bool,
+    pub app_launched: bool,
+    pub identity_verified: bool,
+    pub verification: VerificationMode,
+    pub operational: bool,
+    pub verified_ready: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -672,6 +717,7 @@ pub struct ReactNativeIosRunRequest {
     pub derived_data: String,
     pub bundle_id: String,
     pub scheme: Option<String>,
+    pub identity_hook: Option<ReactNativeIdentityHook>,
 }
 
 /// One versioned SDK call delivered inside a bounded JSON-RPC frame.
@@ -776,6 +822,7 @@ pub enum SupervisorRequest {
         request: SupervisorIdentityVerificationRequest,
     },
     InspectIdentityVerification,
+    CancelIdentityVerification,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

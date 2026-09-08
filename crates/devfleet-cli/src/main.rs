@@ -1,4 +1,4 @@
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
@@ -6,7 +6,7 @@ use devfleet_protocol::{
     IdentityVerificationStartRequest, InitializationRunRequest, InitializationTask,
     IosAppRunRequest, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
     MetroUpRequest, PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest,
-    ProcessSpec, SmokeResponse, SmokeStatus,
+    ProcessSpec, SmokeResponse, SmokeStatus, VerificationMode,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -83,6 +83,8 @@ enum IdentityCommand {
         environment_id: Uuid,
         #[arg(long)]
         backend_identity: String,
+        #[arg(long)]
+        backend_identity_url: String,
     },
     Status {
         environment_id: Uuid,
@@ -105,6 +107,14 @@ enum IosCommand {
         bundle_id: String,
         #[arg(long)]
         scheme: Option<String>,
+        #[arg(long, value_enum, default_value_t = VerificationModeArg::Transport)]
+        verification: VerificationModeArg,
+        #[arg(long)]
+        backend_identity: Option<String>,
+        #[arg(long)]
+        backend_identity_url: Option<String>,
+        #[arg(long)]
+        identity_hook_module: Option<String>,
     },
     Acquire {
         environment_id: Uuid,
@@ -119,6 +129,21 @@ enum IosCommand {
     Stop {
         environment_id: Uuid,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum VerificationModeArg {
+    Transport,
+    AppHandshake,
+}
+
+impl From<VerificationModeArg> for VerificationMode {
+    fn from(value: VerificationModeArg) -> Self {
+        match value {
+            VerificationModeArg::Transport => Self::Transport,
+            VerificationModeArg::AppHandshake => Self::AppHandshake,
+        }
+    }
 }
 
 #[derive(ClapArgs)]
@@ -556,10 +581,18 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 environment_id,
                 bundle_id,
                 scheme,
+                verification,
+                backend_identity,
+                backend_identity_url,
+                identity_hook_module,
             } => Ok(DaemonRequest::IosAppRun(IosAppRunRequest {
                 environment_id,
                 bundle_id,
                 scheme,
+                verification: verification.into(),
+                backend_identity,
+                backend_identity_url,
+                identity_hook_module,
             })),
             IosCommand::Acquire {
                 environment_id,
@@ -589,10 +622,12 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
             IdentityCommand::Start {
                 environment_id,
                 backend_identity,
+                backend_identity_url,
             } => Ok(DaemonRequest::IdentityVerificationStart(
                 IdentityVerificationStartRequest {
                     environment_id,
                     backend_identity,
+                    backend_identity_url,
                 },
             )),
             IdentityCommand::Status { environment_id } => {

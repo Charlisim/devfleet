@@ -10,22 +10,24 @@ use devfleet_protocol::{
     ArtifactKind, ArtifactSnapshot, BindingApplyRequest, BindingIntegration, BindingInvalidation,
     BindingPhase, BindingSnapshot, ComposeReconcileRequest, ComposeUpRequest, DaemonRequest,
     DaemonResponse, DeviceCaptureRequest, EndpointSnapshot, EnvironmentPlanSnapshot,
-    EnvironmentSnapshot, ErrorCode, EventSnapshot, IdentityVerificationSnapshot,
-    IdentityVerificationStartRequest, InitializationRunRequest, InitializationTask,
-    InitializationTaskKind, InitializationTaskSnapshot, InitializationTaskStatus, IosAppRunRequest,
-    IosAppSnapshot, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
-    IosSimulatorLifecycle, IosSimulatorSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState,
-    LogSnapshot, MetroReconcileRequest, MetroUpRequest, OperationAccepted, OperationSnapshot,
-    PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot, PreparationRunRequest,
-    PreparationTaskKind, PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot,
+    EnvironmentReadiness, EnvironmentSnapshot, ErrorCode, EventSnapshot,
+    IdentityVerificationSnapshot, IdentityVerificationStartRequest, InitializationRunRequest,
+    InitializationTask, InitializationTaskKind, InitializationTaskSnapshot,
+    InitializationTaskStatus, IosAppRunRequest, IosAppSnapshot, IosSimulatorAcquireRequest,
+    IosSimulatorAction, IosSimulatorActionRequest, IosSimulatorLifecycle, IosSimulatorSnapshot,
+    JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
+    MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
+    PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
+    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ReactNativeIdentityHook,
     ReadinessState, RpcFailure, SupervisorIdentityVerificationRequest, SupervisorRequest,
-    SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, read_json_line,
-    write_json_line,
+    SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin,
+    VerificationMode, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredArtifact, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
-    StoredInitializationTask, StoredIosApp, StoredIosDevice, StoredLifecycle, StoredOperation,
-    StoredPreparationTask, StoredProcess, StoredReadiness, VerifiedGitContext,
+    StoredIdentityVerification, StoredInitializationTask, StoredIosApp, StoredIosDevice,
+    StoredLifecycle, StoredOperation, StoredPreparationTask, StoredProcess, StoredReadiness,
+    VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -125,6 +127,22 @@ struct CaptureTask {
     artifact_root: PathBuf,
     path: PathBuf,
     timeout_seconds: u64,
+}
+
+struct IdentityLaunchConfig {
+    backend_identity: String,
+    backend_identity_url: String,
+    identity_hook_module: String,
+}
+
+struct SnapshotInputs {
+    tasks: Vec<StoredInitializationTask>,
+    preparation: Vec<StoredPreparationTask>,
+    bindings: Vec<StoredBinding>,
+    ios: Option<StoredIosDevice>,
+    app: Option<StoredIosApp>,
+    identity: Option<StoredIdentityVerification>,
+    metro_ready: bool,
 }
 
 impl Daemon {
@@ -1219,12 +1237,30 @@ impl Daemon {
             request.scheme.as_deref(),
             &native_bindings,
         )?;
+        let identity_config = identity_launch_config(request)?;
+        if request.verification == VerificationMode::Transport {
+            let _ = Self::cancel_launch_identity_verification(&process, true);
+        }
+        let identity = identity_config
+            .as_ref()
+            .map(|config| {
+                self.start_identity_verification(
+                    &environment,
+                    &process,
+                    &native_fingerprint,
+                    &request.bundle_id,
+                    &config.backend_identity,
+                    &config.backend_identity_url,
+                )
+            })
+            .transpose()?;
         if let Some(existing) = self.state.ios_app(environment.id)?
             && existing.bundle_id == request.bundle_id
             && existing.udid == udid
             && existing.metro_port == metro_port
             && existing.native_fingerprint == native_fingerprint
             && Path::new(&existing.derived_data).is_dir()
+            && request.verification == VerificationMode::Transport
         {
             Self::run_ios_task(
                 &process,
@@ -1235,6 +1271,7 @@ impl Daemon {
                 launched: true,
                 ..existing
             })?;
+            self.record_transport_verification(environment.id, environment.generation)?;
             self.emit_event(
                 environment.id,
                 environment.generation,
@@ -1268,24 +1305,39 @@ impl Daemon {
                         "derived_data": derived_data,
                         "bundle_id": request.bundle_id,
                         "scheme": request.scheme,
+                        "identity_hook": identity
+                            .as_ref()
+                            .zip(identity_config.as_ref())
+                            .map(|(snapshot, config)| react_native_identity_hook(snapshot, config)),
                     }),
                 },
                 timeout_seconds: Some(1_800),
             },
-        )
-        .map_err(|error| map_react_native_capability(error, "app.run_ios"))?;
+        );
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
+                let _ = self.mark_identity_unverified(identity.as_ref());
+                return Err(map_react_native_capability(error, "app.run_ios"));
+            }
+        };
         match response {
             SupervisorResponse::TaskOutput { stdout, stderr } => {
                 self.append_preparation_log(environment.id, "ios-app", &stdout, &stderr)?;
             }
             SupervisorResponse::TaskFailed { stdout, stderr } => {
                 self.append_preparation_log(environment.id, "ios-app", &stdout, &stderr)?;
+                let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
+                let _ = self.mark_identity_unverified(identity.as_ref());
                 return Err(DaemonError::Operation(
                     "iOS app build, install, or launch failed; inspect preparation-ios-app logs"
                         .into(),
                 ));
             }
             SupervisorResponse::TaskTimedOut => {
+                let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
+                let _ = self.mark_identity_unverified(identity.as_ref());
                 return Err(DaemonError::Operation(
                     "iOS app build deadline exceeded; inspect before retrying".into(),
                 ));
@@ -1293,6 +1345,8 @@ impl Daemon {
             SupervisorResponse::TaskCompleted
             | SupervisorResponse::Process(_)
             | SupervisorResponse::IdentityVerification(_) => {
+                let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
+                let _ = self.mark_identity_unverified(identity.as_ref());
                 return Err(DaemonError::Operation(
                     "supervisor returned an invalid iOS app response".into(),
                 ));
@@ -1307,7 +1361,14 @@ impl Daemon {
             native_fingerprint,
             launched: true,
         };
-        self.state.record_ios_app(&app)?;
+        if let Err(error) = self.state.record_ios_app(&app) {
+            let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
+            let _ = self.mark_identity_unverified(identity.as_ref());
+            return Err(error.into());
+        }
+        if request.verification == VerificationMode::Transport {
+            self.record_transport_verification(environment.id, environment.generation)?;
+        }
         self.emit_event(
             environment.id,
             environment.generation,
@@ -1317,20 +1378,122 @@ impl Daemon {
         Ok(DaemonResponse::IosApp(ios_app_snapshot(app)))
     }
 
+    fn start_identity_verification(
+        &mut self,
+        environment: &StoredEnvironment,
+        process: &StoredProcess,
+        build_identity: &str,
+        bundle_identity: &str,
+        backend_identity: &str,
+        backend_identity_url: &str,
+    ) -> Result<IdentityVerificationSnapshot, DaemonError> {
+        let snapshot = identity_verification_response(request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::StartIdentityVerification {
+                request: SupervisorIdentityVerificationRequest {
+                    environment_id: environment.id,
+                    generation: environment.generation,
+                    build_identity: build_identity.into(),
+                    bundle_identity: bundle_identity.into(),
+                    backend_identity: backend_identity.into(),
+                    backend_identity_url: backend_identity_url.into(),
+                },
+            },
+        )?)?;
+        self.record_identity_snapshot(&snapshot)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            "identity_verification_pending",
+        )?;
+        Ok(snapshot)
+    }
+
+    fn cancel_launch_identity_verification(
+        process: &StoredProcess,
+        pending: bool,
+    ) -> Result<(), DaemonError> {
+        if !pending {
+            return Ok(());
+        }
+        match request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::CancelIdentityVerification,
+        )? {
+            SupervisorResponse::TaskCompleted => Ok(()),
+            _ => Err(DaemonError::Operation(
+                "supervisor returned an invalid identity cancellation response".into(),
+            )),
+        }
+    }
+
+    fn record_transport_verification(
+        &mut self,
+        environment_id: Uuid,
+        generation: u64,
+    ) -> Result<(), DaemonError> {
+        self.state
+            .record_identity_verification(&StoredIdentityVerification {
+                environment_id,
+                generation,
+                mode: "transport".into(),
+                status: "transport".into(),
+            })?;
+        Ok(())
+    }
+
+    fn record_identity_snapshot(
+        &mut self,
+        snapshot: &IdentityVerificationSnapshot,
+    ) -> Result<(), DaemonError> {
+        self.state
+            .record_identity_verification(&StoredIdentityVerification {
+                environment_id: snapshot.environment_id,
+                generation: snapshot.generation,
+                mode: identity_mode_name(snapshot.mode).into(),
+                status: identity_status_name(snapshot.status).into(),
+            })?;
+        Ok(())
+    }
+
+    fn mark_identity_unverified(
+        &mut self,
+        snapshot: Option<&IdentityVerificationSnapshot>,
+    ) -> Result<(), DaemonError> {
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
+        self.state
+            .record_identity_verification(&StoredIdentityVerification {
+                environment_id: snapshot.environment_id,
+                generation: snapshot.generation,
+                mode: identity_mode_name(snapshot.mode).into(),
+                status: "unverified".into(),
+            })?;
+        Ok(())
+    }
+
     fn identity_verification_start(
         &mut self,
         request: &IdentityVerificationStartRequest,
     ) -> Result<DaemonResponse, DaemonError> {
-        if request.backend_identity.is_empty() {
+        if request.backend_identity.is_empty()
+            || !(request.backend_identity_url.starts_with("http://")
+                || request.backend_identity_url.starts_with("https://"))
+        {
             return Err(DaemonError::InvalidConfig(
-                "identity verification requires a backend identity".into(),
+                "identity verification requires a backend identity and route".into(),
             ));
         }
         let environment = self
             .state
             .environment(request.environment_id)?
             .ok_or(DaemonError::NotFound)?;
-        let process = environment.process.ok_or(DaemonError::OwnershipUncertain)?;
+        let process = environment
+            .process
+            .as_ref()
+            .ok_or(DaemonError::OwnershipUncertain)?;
         let app = self
             .state
             .ios_app(environment.id)?
@@ -1338,24 +1501,13 @@ impl Daemon {
             .ok_or_else(|| {
                 DaemonError::Operation("identity verification requires a launched app".into())
             })?;
-        let response = request_supervisor(
-            Path::new(&process.supervisor_socket),
-            SupervisorRequest::StartIdentityVerification {
-                request: SupervisorIdentityVerificationRequest {
-                    environment_id: environment.id,
-                    generation: environment.generation,
-                    build_identity: app.native_fingerprint,
-                    bundle_identity: app.bundle_id,
-                    backend_identity: request.backend_identity.clone(),
-                },
-            },
-        )?;
-        let snapshot = identity_verification_response(response)?;
-        self.emit_event(
-            environment.id,
-            environment.generation,
-            None,
-            "identity_verification_pending",
+        let snapshot = self.start_identity_verification(
+            &environment,
+            process,
+            &app.native_fingerprint,
+            &app.bundle_id,
+            &request.backend_identity,
+            &request.backend_identity_url,
         )?;
         Ok(DaemonResponse::IdentityVerification(snapshot))
     }
@@ -1364,6 +1516,15 @@ impl Daemon {
         &mut self,
         environment_id: Uuid,
     ) -> Result<DaemonResponse, DaemonError> {
+        if self
+            .state
+            .identity_verification(environment_id)?
+            .is_some_and(|verification| verification.mode == "transport")
+        {
+            return Err(DaemonError::CapabilityUnsupported(
+                "identity-verified readiness requires an app-handshake profile".into(),
+            ));
+        }
         let environment = self
             .state
             .environment(environment_id)?
@@ -1373,6 +1534,7 @@ impl Daemon {
             Path::new(&process.supervisor_socket),
             SupervisorRequest::InspectIdentityVerification,
         )?)?;
+        self.record_identity_snapshot(&snapshot)?;
         if snapshot.status != devfleet_protocol::IdentityVerificationStatus::Pending {
             self.emit_event(
                 environment.id,
@@ -1687,20 +1849,25 @@ impl Daemon {
         let bindings = self.state.bindings(environment_id)?;
         let ios = self.state.ios_device(environment_id)?;
         let app = self.state.ios_app(environment_id)?;
+        let identity = self.state.identity_verification(environment_id)?;
+        let metro_ready = self.metro_ready(environment.worktree_id)?;
         Ok(DaemonResponse::Environment(snapshot(
             environment,
-            tasks,
-            preparation,
-            bindings,
-            ios,
-            app,
+            SnapshotInputs {
+                tasks,
+                preparation,
+                bindings,
+                ios,
+                app,
+                identity,
+                metro_ready,
+            },
         )))
     }
 
     fn list(&self) -> Result<DaemonResponse, DaemonError> {
-        let environments = self
-            .state
-            .environments()?
+        let environments = self.state.environments()?;
+        let snapshots = environments
             .into_iter()
             .map(|environment| {
                 let tasks = self.state.initialization_tasks(environment.id)?;
@@ -1708,17 +1875,37 @@ impl Daemon {
                 let bindings = self.state.bindings(environment.id)?;
                 let ios = self.state.ios_device(environment.id)?;
                 let app = self.state.ios_app(environment.id)?;
+                let identity = self.state.identity_verification(environment.id)?;
+                let metro_ready = self.metro_ready(environment.worktree_id)?;
                 Ok::<_, DaemonError>(snapshot(
                     environment,
-                    tasks,
-                    preparation,
-                    bindings,
-                    ios,
-                    app,
+                    SnapshotInputs {
+                        tasks,
+                        preparation,
+                        bindings,
+                        ios,
+                        app,
+                        identity,
+                        metro_ready,
+                    },
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(DaemonResponse::Environments(environments))
+        Ok(DaemonResponse::Environments(snapshots))
+    }
+
+    fn metro_ready(&self, worktree_id: Uuid) -> Result<bool, DaemonError> {
+        Ok(self.state.environments()?.into_iter().any(|candidate| {
+            candidate.worktree_id == worktree_id
+                && matches!(
+                    candidate.lifecycle,
+                    StoredLifecycle::Starting | StoredLifecycle::Running
+                )
+                && candidate
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.name == "metro" && endpoint_is_healthy(endpoint))
+        }))
     }
 
     fn stop(&mut self, environment_id: Uuid) -> Result<DaemonResponse, DaemonError> {
@@ -2754,14 +2941,16 @@ fn ios_app_snapshot(app: StoredIosApp) -> IosAppSnapshot {
     }
 }
 
-fn snapshot(
-    environment: StoredEnvironment,
-    tasks: Vec<StoredInitializationTask>,
-    preparation: Vec<StoredPreparationTask>,
-    bindings: Vec<StoredBinding>,
-    ios: Option<StoredIosDevice>,
-    app: Option<StoredIosApp>,
-) -> EnvironmentSnapshot {
+fn snapshot(environment: StoredEnvironment, inputs: SnapshotInputs) -> EnvironmentSnapshot {
+    let SnapshotInputs {
+        tasks,
+        preparation,
+        bindings,
+        ios,
+        app,
+        identity,
+        metro_ready,
+    } = inputs;
     let lifecycle = match environment.lifecycle {
         StoredLifecycle::Starting => LifecycleState::Starting,
         StoredLifecycle::Running => LifecycleState::Running,
@@ -2774,6 +2963,38 @@ fn snapshot(
         lifecycle,
         LifecycleState::Starting | LifecycleState::Running
     );
+    let endpoints = environment
+        .endpoints
+        .into_iter()
+        .map(|endpoint| {
+            let healthy = probe_health && endpoint_is_healthy(&endpoint);
+            EndpointSnapshot {
+                name: endpoint.name,
+                service: endpoint.service,
+                internal_url: endpoint.internal_url,
+                host_url: endpoint.host_url,
+                device_url: endpoint.device_url,
+                readiness_path: endpoint.readiness_path,
+                healthy,
+            }
+        })
+        .collect::<Vec<_>>();
+    let backend_healthy = endpoints
+        .iter()
+        .any(|endpoint| endpoint.name != "metro" && endpoint.healthy);
+    let device_booted = ios
+        .as_ref()
+        .is_some_and(|device| device.lifecycle == "booted");
+    let app_launched = app.as_ref().is_some_and(|app| app.launched);
+    let verification = identity
+        .as_ref()
+        .map_or(devfleet_protocol::VerificationMode::Transport, |identity| {
+            verification_mode(&identity.mode)
+        });
+    let identity_verified = identity.as_ref().is_some_and(|identity| {
+        identity.generation == environment.generation && identity.status == "verified"
+    });
+    let operational = backend_healthy && metro_ready && device_booted && app_launched;
     EnvironmentSnapshot {
         environment_id: environment.id,
         project_id: environment.project_id,
@@ -2794,22 +3015,17 @@ fn snapshot(
                 StoredReadiness::ProcessStopped => ReadinessState::ProcessStopped,
             },
         }),
-        endpoints: environment
-            .endpoints
-            .into_iter()
-            .map(|endpoint| {
-                let healthy = probe_health && endpoint_is_healthy(&endpoint);
-                EndpointSnapshot {
-                    name: endpoint.name,
-                    service: endpoint.service,
-                    internal_url: endpoint.internal_url,
-                    host_url: endpoint.host_url,
-                    device_url: endpoint.device_url,
-                    readiness_path: endpoint.readiness_path,
-                    healthy,
-                }
-            })
-            .collect(),
+        endpoints,
+        readiness: EnvironmentReadiness {
+            backend_healthy,
+            metro_ready,
+            device_booted,
+            app_launched,
+            identity_verified,
+            verification,
+            operational,
+            verified_ready: operational && identity_verified,
+        },
         initialization_ready: tasks.iter().all(|task| task.status == "completed"),
         initialization_tasks: tasks
             .into_iter()
@@ -2822,6 +3038,13 @@ fn snapshot(
         bindings: bindings.into_iter().map(binding_snapshot).collect(),
         ios_simulator: ios.and_then(|device| ios_snapshot(device).ok()),
         ios_app: app.map(ios_app_snapshot),
+    }
+}
+
+fn verification_mode(value: &str) -> devfleet_protocol::VerificationMode {
+    match value {
+        "app_handshake" => devfleet_protocol::VerificationMode::AppHandshake,
+        _ => devfleet_protocol::VerificationMode::Transport,
     }
 }
 
@@ -3235,6 +3458,86 @@ fn identity_verification_response(
     }
 }
 
+fn identity_launch_config(
+    request: &IosAppRunRequest,
+) -> Result<Option<IdentityLaunchConfig>, DaemonError> {
+    if request.verification == VerificationMode::Transport {
+        if request.backend_identity.is_some()
+            || request.backend_identity_url.is_some()
+            || request.identity_hook_module.is_some()
+        {
+            return Err(DaemonError::InvalidConfig(
+                "transport verification may not receive app-handshake inputs".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let backend_identity =
+        required_identity_input("backend identity", request.backend_identity.as_ref())?;
+    let backend_identity_url = required_identity_input(
+        "backend identity URL",
+        request.backend_identity_url.as_ref(),
+    )?;
+    let identity_hook_module = required_identity_input(
+        "identity hook module",
+        request.identity_hook_module.as_ref(),
+    )?;
+    if !(backend_identity_url.starts_with("http://")
+        || backend_identity_url.starts_with("https://"))
+    {
+        return Err(DaemonError::InvalidConfig(
+            "backend identity URL must use HTTP(S)".into(),
+        ));
+    }
+    Ok(Some(IdentityLaunchConfig {
+        backend_identity,
+        backend_identity_url,
+        identity_hook_module,
+    }))
+}
+
+fn required_identity_input(name: &str, value: Option<&String>) -> Result<String, DaemonError> {
+    value
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            DaemonError::InvalidConfig(format!("app-handshake verification requires {name}"))
+        })
+}
+
+fn react_native_identity_hook(
+    snapshot: &IdentityVerificationSnapshot,
+    config: &IdentityLaunchConfig,
+) -> ReactNativeIdentityHook {
+    ReactNativeIdentityHook {
+        callback_url: snapshot.verification_url.clone(),
+        authorization_token: snapshot.token.clone(),
+        nonce: snapshot.nonce.clone(),
+        environment_id: snapshot.environment_id,
+        generation: snapshot.generation,
+        build_identity: snapshot.build_identity.clone(),
+        bundle_identity: snapshot.bundle_identity.clone(),
+        backend_identity_url: config.backend_identity_url.clone(),
+        expected_backend_identity: config.backend_identity.clone(),
+        module: config.identity_hook_module.clone(),
+    }
+}
+
+fn identity_mode_name(mode: VerificationMode) -> &'static str {
+    match mode {
+        VerificationMode::Transport => "transport",
+        VerificationMode::AppHandshake => "app_handshake",
+    }
+}
+
+fn identity_status_name(status: devfleet_protocol::IdentityVerificationStatus) -> &'static str {
+    match status {
+        devfleet_protocol::IdentityVerificationStatus::Pending => "pending",
+        devfleet_protocol::IdentityVerificationStatus::Verified => "verified",
+        devfleet_protocol::IdentityVerificationStatus::Mismatch => "mismatch",
+    }
+}
+
 fn assert_same_user(stream: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
     let (uid, _) = getpeereid(stream)?;
     if uid != getuid() {
@@ -3322,6 +3625,31 @@ mod tests {
             first,
             code_fingerprint(temporary.path()).expect("changed fingerprint")
         );
+    }
+
+    #[test]
+    fn handshake_requires_an_explicit_hook_and_backend_identity_route() {
+        let transport = IosAppRunRequest {
+            environment_id: Uuid::now_v7(),
+            bundle_id: "com.example.app".into(),
+            scheme: None,
+            verification: VerificationMode::Transport,
+            backend_identity: None,
+            backend_identity_url: None,
+            identity_hook_module: None,
+        };
+        assert!(
+            identity_launch_config(&transport)
+                .expect("transport config")
+                .is_none()
+        );
+        let missing_hook = IosAppRunRequest {
+            verification: VerificationMode::AppHandshake,
+            backend_identity: Some("backend-a".into()),
+            backend_identity_url: Some("http://127.0.0.1:23001/devfleet-identity".into()),
+            ..transport
+        };
+        assert!(identity_launch_config(&missing_hook).is_err());
     }
 
     #[test]

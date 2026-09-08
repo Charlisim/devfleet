@@ -20,7 +20,11 @@ use std::{
     os::unix::{fs::PermissionsExt, net::UnixListener, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TryRecvError},
+    },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -297,6 +301,10 @@ fn handle_control(
                 .ok_or_else(|| anyhow::anyhow!("identity verification has not started"))?;
             SupervisorResponse::IdentityVerification(verification.inspect())
         }
+        SupervisorRequest::CancelIdentityVerification => {
+            *identity_verification = None;
+            SupervisorResponse::TaskCompleted
+        }
     };
     let rpc = JsonRpcResponse::success(request.id, &response);
     stream.write_all(&write_json_line(&rpc)?)?;
@@ -442,6 +450,7 @@ fn run_task(
 struct IdentityVerification {
     snapshot: devfleet_protocol::IdentityVerificationSnapshot,
     receiver: Receiver<IdentityOutcome>,
+    cancelled: Arc<AtomicBool>,
 }
 
 struct IdentityOutcome {
@@ -456,6 +465,7 @@ struct IdentityReport {
     build_identity: String,
     bundle_identity: String,
     backend_identity: String,
+    backend_identity_url: String,
     nonce: String,
 }
 
@@ -469,19 +479,29 @@ impl IdentityVerification {
         let nonce = Uuid::now_v7().to_string();
         let token = Uuid::now_v7().to_string();
         let snapshot = devfleet_protocol::IdentityVerificationSnapshot {
+            lease_id: Uuid::now_v7(),
             environment_id: request.environment_id,
             generation: request.generation,
+            mode: devfleet_protocol::VerificationMode::AppHandshake,
             verification_url: format!("http://127.0.0.1:{port}/identity"),
             nonce: nonce.clone(),
             token: token.clone(),
+            build_identity: request.build_identity.clone(),
+            bundle_identity: request.bundle_identity.clone(),
             status: devfleet_protocol::IdentityVerificationStatus::Pending,
             diagnostic: None,
         };
         let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let listener_cancelled = Arc::clone(&cancelled);
         thread::spawn(move || {
-            serve_identity_listener(listener, request, nonce, token, sender);
+            serve_identity_listener(listener, request, nonce, token, sender, listener_cancelled);
         });
-        Ok(Self { snapshot, receiver })
+        Ok(Self {
+            snapshot,
+            receiver,
+            cancelled,
+        })
     }
 
     fn inspect(&mut self) -> devfleet_protocol::IdentityVerificationSnapshot {
@@ -504,6 +524,12 @@ impl IdentityVerification {
     }
 }
 
+impl Drop for IdentityVerification {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn serve_identity_listener(
     listener: TcpListener,
@@ -511,9 +537,10 @@ fn serve_identity_listener(
     nonce: String,
     token: String,
     sender: mpsc::Sender<IdentityOutcome>,
+    cancelled: Arc<AtomicBool>,
 ) {
     let deadline = SystemTime::now() + Duration::from_secs(600);
-    while SystemTime::now() < deadline {
+    while SystemTime::now() < deadline && !cancelled.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Some(outcome) = identity_report(stream, &expected, &nonce, &token) {
@@ -527,10 +554,12 @@ fn serve_identity_listener(
             Err(_) => return,
         }
     }
-    let _ = sender.send(IdentityOutcome {
-        status: devfleet_protocol::IdentityVerificationStatus::Mismatch,
-        diagnostic: Some("identity report deadline exceeded".into()),
-    });
+    if !cancelled.load(Ordering::Acquire) {
+        let _ = sender.send(IdentityOutcome {
+            status: devfleet_protocol::IdentityVerificationStatus::Mismatch,
+            diagnostic: Some("identity report deadline exceeded".into()),
+        });
+    }
 }
 
 fn identity_report(
@@ -557,6 +586,7 @@ fn identity_report(
         && report.build_identity == expected.build_identity
         && report.bundle_identity == expected.bundle_identity
         && report.backend_identity == expected.backend_identity
+        && report.backend_identity_url == expected.backend_identity_url
         && report.nonce == nonce;
     let outcome = if matches {
         IdentityOutcome {
@@ -648,6 +678,7 @@ mod tests {
             build_identity: "build-a".into(),
             bundle_identity: "com.example.app".into(),
             backend_identity: "backend-a".into(),
+            backend_identity_url: "http://127.0.0.1:23001/devfleet-identity".into(),
         };
         let expected_for_thread = expected.clone();
         let (sender, receiver) = mpsc::channel();
@@ -668,6 +699,7 @@ mod tests {
             "build_identity": expected.build_identity,
             "bundle_identity": expected.bundle_identity,
             "backend_identity": expected.backend_identity,
+            "backend_identity_url": expected.backend_identity_url,
             "nonce": "nonce-a",
         })
         .to_string();
@@ -689,5 +721,98 @@ mod tests {
             outcome.status,
             devfleet_protocol::IdentityVerificationStatus::Verified
         );
+    }
+
+    #[test]
+    fn identity_listeners_reject_cross_wiring_and_verify_two_launches() {
+        let first = identity_request("build-a", "com.example.first", "backend-a");
+        let second = identity_request("build-b", "com.example.second", "backend-b");
+        let mut crossed = IdentityVerification::start(first.clone()).expect("cross listener");
+        send_identity_report(&crossed.snapshot, &second);
+        assert_eq!(
+            wait_for_identity(&mut crossed).status,
+            devfleet_protocol::IdentityVerificationStatus::Mismatch
+        );
+
+        let mut first_listener =
+            IdentityVerification::start(first.clone()).expect("first listener");
+        let mut second_listener =
+            IdentityVerification::start(second.clone()).expect("second listener");
+        send_identity_report(&first_listener.snapshot, &first);
+        send_identity_report(&second_listener.snapshot, &second);
+        assert_eq!(
+            wait_for_identity(&mut first_listener).status,
+            devfleet_protocol::IdentityVerificationStatus::Verified
+        );
+        assert_eq!(
+            wait_for_identity(&mut second_listener).status,
+            devfleet_protocol::IdentityVerificationStatus::Verified
+        );
+    }
+
+    fn identity_request(
+        build_identity: &str,
+        bundle_identity: &str,
+        backend_identity: &str,
+    ) -> devfleet_protocol::SupervisorIdentityVerificationRequest {
+        devfleet_protocol::SupervisorIdentityVerificationRequest {
+            environment_id: Uuid::now_v7(),
+            generation: 3,
+            build_identity: build_identity.into(),
+            bundle_identity: bundle_identity.into(),
+            backend_identity: backend_identity.into(),
+            backend_identity_url: "http://127.0.0.1:23001/devfleet-identity".into(),
+        }
+    }
+
+    fn send_identity_report(
+        snapshot: &devfleet_protocol::IdentityVerificationSnapshot,
+        request: &devfleet_protocol::SupervisorIdentityVerificationRequest,
+    ) {
+        let port = snapshot
+            .verification_url
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|value| value.strip_suffix("/identity"))
+            .expect("loopback URL")
+            .parse::<u16>()
+            .expect("port");
+        let body = serde_json::json!({
+            "environment_id": request.environment_id,
+            "generation": request.generation,
+            "build_identity": request.build_identity,
+            "bundle_identity": request.bundle_identity,
+            "backend_identity": request.backend_identity,
+            "backend_identity_url": request.backend_identity_url,
+            "nonce": snapshot.nonce,
+        })
+        .to_string();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("listener connects");
+        stream
+            .write_all(
+                format!(
+                    "POST /identity HTTP/1.1\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\n\r\n{body}",
+                    snapshot.token,
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("report writes");
+    }
+
+    fn wait_for_identity(
+        verification: &mut IdentityVerification,
+    ) -> devfleet_protocol::IdentityVerificationSnapshot {
+        let deadline = SystemTime::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = verification.inspect();
+            if snapshot.status != devfleet_protocol::IdentityVerificationStatus::Pending {
+                return snapshot;
+            }
+            assert!(
+                SystemTime::now() < deadline,
+                "identity report was not observed"
+            );
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 }
