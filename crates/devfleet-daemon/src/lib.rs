@@ -1183,11 +1183,47 @@ impl Daemon {
             .join("DerivedData");
         prepare_private_dir(&derived_data)
             .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let native_bindings = self
+            .state
+            .bindings(environment.id)?
+            .into_iter()
+            .filter(|binding| binding.phase == "native_build")
+            .map(|binding| binding.fingerprint)
+            .collect::<Vec<_>>();
         let native_fingerprint = native_build_fingerprint(
             Path::new(&environment.worktree),
             metro_port,
             request.scheme.as_deref(),
+            &native_bindings,
         )?;
+        if let Some(existing) = self.state.ios_app(environment.id)?
+            && existing.bundle_id == request.bundle_id
+            && existing.udid == udid
+            && existing.metro_port == metro_port
+            && existing.native_fingerprint == native_fingerprint
+            && Path::new(&existing.derived_data).is_dir()
+        {
+            Self::run_ios_task(
+                &process,
+                "app.launch",
+                serde_json::json!({"udid": udid, "bundle_id": request.bundle_id}),
+            )?;
+            self.state.record_ios_app(&StoredIosApp {
+                launched: true,
+                ..existing
+            })?;
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                None,
+                "app_relaunched",
+            )?;
+            let app = self
+                .state
+                .ios_app(environment.id)?
+                .ok_or(DaemonError::OwnershipUncertain)?;
+            return Ok(DaemonResponse::IosApp(ios_app_snapshot(app)));
+        }
         let operation_id = Uuid::now_v7();
         self.emit_event(
             environment.id,
@@ -2221,6 +2257,7 @@ fn native_build_fingerprint(
     worktree: &Path,
     metro_port: u16,
     scheme: Option<&str>,
+    native_bindings: &[String],
 ) -> Result<String, DaemonError> {
     let mut files = Vec::new();
     collect_native_inputs(&worktree.join("ios"), worktree, &mut files)?;
@@ -2235,6 +2272,10 @@ fn native_build_fingerprint(
     digest.update(metro_port.to_string().as_bytes());
     digest.update(b"scheme=");
     digest.update(scheme.unwrap_or_default().as_bytes());
+    for binding in native_bindings {
+        digest.update(b"binding=");
+        digest.update(binding.as_bytes());
+    }
     for path in files {
         let relative = path.strip_prefix(worktree).map_err(|_| {
             DaemonError::InvalidConfig("native input escaped its selected worktree".into())
@@ -2839,6 +2880,29 @@ mod tests {
             pods,
             preparation_fingerprint(temporary.path(), PreparationTaskKind::Pods)
                 .expect("unrelated input does not affect Pods")
+        );
+    }
+
+    #[test]
+    fn native_build_fingerprint_ignores_js_and_rejects_stale_native_outputs() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let ios = temporary.path().join("ios");
+        fs::create_dir_all(&ios).expect("iOS directory");
+        fs::write(ios.join("AppDelegate.mm"), "native-a").expect("native input");
+        fs::write(temporary.path().join("package-lock.json"), "lock-a").expect("lockfile");
+        let first = native_build_fingerprint(temporary.path(), 21_001, None, &["config-a".into()])
+            .expect("first fingerprint");
+        fs::write(temporary.path().join("index.js"), "javascript-only").expect("JS input");
+        assert_eq!(
+            first,
+            native_build_fingerprint(temporary.path(), 21_001, None, &["config-a".into()])
+                .expect("JS does not rebuild native")
+        );
+        fs::write(ios.join("AppDelegate.mm"), "native-b").expect("dirty native input");
+        assert_ne!(
+            first,
+            native_build_fingerprint(temporary.path(), 21_001, None, &["config-a".into()])
+                .expect("native change rebuilds")
         );
     }
 

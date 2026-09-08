@@ -38,6 +38,7 @@ impl Provider for IosProvider {
                 "device.boot".into(),
                 "device.open".into(),
                 "device.stop".into(),
+                "app.launch".into(),
             ],
             plugin_state_version: 1,
         }
@@ -105,6 +106,19 @@ impl Provider for IosProvider {
                     request.udid,
                 ])
             }
+            "app.launch" => {
+                let request: LaunchRequest = serde_json::from_value(input)
+                    .map_err(|_| PluginError::InvalidCall("invalid app.launch input".into()))?;
+                validate_udid(&request.udid).map_err(|error| plugin_error(&error))?;
+                validate_bundle_id(&request.bundle_id).map_err(|error| plugin_error(&error))?;
+                spawn(vec![
+                    XCRUN.into(),
+                    "simctl".into(),
+                    "launch".into(),
+                    request.udid,
+                    request.bundle_id,
+                ])
+            }
             _ => Err(PluginError::UnsupportedMethod(name)),
         }
     }
@@ -135,6 +149,12 @@ struct UdidRequest {
 struct BootRequest {
     udid: String,
     step: BootStep,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LaunchRequest {
+    udid: String,
+    bundle_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -182,6 +202,8 @@ enum IosError {
     DeviceTypeUnavailable(String),
     #[error("DEVICE_UNAVAILABLE: malformed simulator UDID")]
     InvalidUdid,
+    #[error("DEVICE_UNAVAILABLE: malformed bundle identifier")]
+    InvalidBundleId,
     #[error("DEVICE_UNAVAILABLE: simulator discovery returned malformed JSON")]
     InvalidDiscovery,
 }
@@ -316,6 +338,18 @@ fn validate_udid(udid: &str) -> Result<(), IosError> {
         .map_err(|_| IosError::InvalidUdid)
 }
 
+fn validate_bundle_id(bundle_id: &str) -> Result<(), IosError> {
+    (bundle_id.split('.').count() >= 2
+        && bundle_id.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }))
+    .then_some(())
+    .ok_or(IosError::InvalidBundleId)
+}
+
 fn command_environment() -> BTreeMap<String, String> {
     let mut environment = BTreeMap::from([("PATH".into(), PATH.into())]);
     if let Some(home) = std::env::var_os("HOME") {
@@ -395,5 +429,17 @@ mod tests {
         assert!(validate_udid("not-a-device").is_err());
         let result = IosProvider.action("device.open".into(), json!({"udid": "not-a-device"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn app_launch_requires_an_exact_device_and_bundle_identifier() {
+        assert!(
+            IosProvider
+                .action(
+                    "app.launch".into(),
+                    json!({"udid": "0186D916-7A5C-4E31-8590-C2F502FA2288", "bundle_id": "app"})
+                )
+                .is_err()
+        );
     }
 }

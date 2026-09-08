@@ -451,13 +451,34 @@ impl StateStore {
         environment_id: Uuid,
         endpoints: &[StoredEndpoint],
     ) -> Result<(), StateError> {
-        self.connection.execute(
-            "UPDATE environments SET endpoints_json = ?2 WHERE id = ?1",
-            params![
-                environment_id.to_string(),
-                serde_json::to_string(endpoints)?
-            ],
+        let endpoints = serde_json::to_string(endpoints)?;
+        let transaction = self.connection.transaction()?;
+        let existing: String = transaction.query_row(
+            "SELECT endpoints_json FROM environments WHERE id = ?1",
+            params![environment_id.to_string()],
+            |row| row.get(0),
         )?;
+        let changed = existing != endpoints;
+        transaction.execute(
+            "UPDATE environments SET endpoints_json = ?2 WHERE id = ?1",
+            params![environment_id.to_string(), &endpoints],
+        )?;
+        if changed {
+            let worktree_id: String = transaction.query_row(
+                "SELECT worktree_id FROM environments WHERE id = ?1",
+                params![environment_id.to_string()],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "UPDATE environments SET generation = generation + 1 WHERE worktree_id = ?1",
+                params![worktree_id],
+            )?;
+            transaction.execute(
+                "UPDATE ios_apps SET launched = 0 WHERE environment_id IN (SELECT id FROM environments WHERE worktree_id = ?1)",
+                params![worktree_id],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1966,6 +1987,63 @@ mod tests {
         assert_eq!(app.bundle_id, "com.example.app");
         assert_eq!(app.metro_port, 21_001);
         assert!(app.launched);
+    }
+
+    #[test]
+    fn endpoint_change_invalidates_apps_in_the_same_worktree() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let first = environment();
+        let second = StoredEnvironment {
+            id: Uuid::now_v7(),
+            key: "second".into(),
+            ..first.clone()
+        };
+        store
+            .record_start_intent(&first, Uuid::now_v7())
+            .expect("first environment persists");
+        store
+            .record_start_intent(&second, Uuid::now_v7())
+            .expect("second environment persists");
+        store
+            .record_ios_app(&StoredIosApp {
+                environment_id: second.id,
+                bundle_id: "com.example.app".into(),
+                udid: "0186D916-7A5C-4E31-8590-C2F502FA2288".into(),
+                metro_port: 21_001,
+                derived_data: "/private/derived-data".into(),
+                native_fingerprint: "native-a".into(),
+                launched: true,
+            })
+            .expect("app persists");
+        store
+            .set_endpoints(
+                first.id,
+                &[StoredEndpoint {
+                    name: "metro".into(),
+                    service: "metro".into(),
+                    internal_url: "http://127.0.0.1:21001".into(),
+                    host_url: "http://127.0.0.1:21001".into(),
+                    device_url: "http://127.0.0.1:21001".into(),
+                    readiness_path: "/identity".into(),
+                    healthy: true,
+                }],
+            )
+            .expect("endpoint update persists");
+        assert_eq!(
+            store
+                .environment(second.id)
+                .expect("environment reads")
+                .expect("environment exists")
+                .generation,
+            second.generation + 1
+        );
+        assert!(
+            !store
+                .ios_app(second.id)
+                .expect("app reads")
+                .expect("app exists")
+                .launched
+        );
     }
 
     #[test]
