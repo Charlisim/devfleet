@@ -7,5 +7,8 @@ module.exports = mergeConfig(getDefaultConfig(__dirname), {
   watchFolders: [],
   maxWorkers: 1,
   cacheStores: [new FileStore({root: path.join(__dirname, '.metro-cache')})],
-  resolver: {disableHierarchicalLookup: true},
+  resolver: {
+    disableHierarchicalLookup: true,
+    nodeModulesPaths: [path.join(__dirname, 'node_modules')],
+  },
 });
