@@ -1,7 +1,8 @@
 use devfleet_cli::request;
 use devfleet_protocol::{
-    DaemonRequest, DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, LifecycleState,
-    ProcessSpec, ReadinessState,
+    DaemonRequest, DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest,
+    InitializationRunRequest, InitializationTask, InitializationTaskKind, LifecycleState,
+    ProcessSpec, ReadinessState, TaskRerunPolicy,
 };
 use std::{
     collections::BTreeMap,
@@ -27,6 +28,120 @@ impl Drop for DaemonFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn initialization_tasks_are_ordered_persisted_and_scoped_to_one_environment() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let first_root = temporary.path().join("first");
+    let second_root = temporary.path().join("second");
+    fs::create_dir_all(&first_root).expect("first directory");
+    fs::create_dir_all(&second_root).expect("second directory");
+    initialize_git_repository(&first_root);
+    initialize_git_repository(&second_root);
+    let fixture = start_daemon(temporary.path());
+    let first = up_environment(&fixture.socket, &first_root, "first");
+    let second = up_environment(&fixture.socket, &second_root, "second");
+    let migrated = first_root.join("migrated");
+    let seeded = first_root.join("seeded");
+    let tasks = vec![
+        InitializationTask {
+            id: "migration".into(),
+            kind: InitializationTaskKind::Migration,
+            depends_on: Vec::new(),
+            rerun_policy: TaskRerunPolicy::Never,
+            process: ProcessSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!(
+                        "test ! -e {} && printf migrated > {}",
+                        migrated.display(),
+                        migrated.display()
+                    ),
+                ],
+                cwd: first_root.display().to_string(),
+                environment: BTreeMap::new(),
+            },
+        },
+        InitializationTask {
+            id: "seed".into(),
+            kind: InitializationTaskKind::Seed,
+            depends_on: vec!["migration".into()],
+            rerun_policy: TaskRerunPolicy::Never,
+            process: ProcessSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("printf seed > {}", seeded.display()),
+                ],
+                cwd: first_root.display().to_string(),
+                environment: BTreeMap::new(),
+            },
+        },
+    ];
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::InitializationRun(InitializationRunRequest {
+            environment_id: first,
+            tasks: tasks.clone(),
+        }),
+    )
+    .expect("first initialization succeeds");
+    let DaemonResponse::InitializationTasks(completed) = response else {
+        panic!("expected task results");
+    };
+    assert_eq!(completed.len(), 2);
+    assert!(migrated.exists());
+    assert!(seeded.exists());
+    assert!(!second_root.join("migrated").exists());
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::InitializationRun(InitializationRunRequest {
+            environment_id: first,
+            tasks,
+        }),
+    )
+    .expect("idempotent initialization succeeds");
+    let DaemonResponse::InitializationTasks(repeated) = response else {
+        panic!("expected repeated task results");
+    };
+    assert!(repeated.iter().all(|task| task.attempts == 1));
+    let failed = request(
+        &fixture.socket,
+        DaemonRequest::InitializationRun(InitializationRunRequest {
+            environment_id: second,
+            tasks: vec![InitializationTask {
+                id: "migration".into(),
+                kind: InitializationTaskKind::Migration,
+                depends_on: Vec::new(),
+                rerun_policy: TaskRerunPolicy::Never,
+                process: ProcessSpec {
+                    argv: vec!["/usr/bin/false".into()],
+                    cwd: second_root.display().to_string(),
+                    environment: BTreeMap::new(),
+                },
+            }],
+        }),
+    );
+    assert!(failed.is_err());
+    let DaemonResponse::Environment(second_status) = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: second,
+        },
+    )
+    .expect("second status") else {
+        panic!("expected second environment");
+    };
+    assert!(!second_status.initialization_ready);
+    assert_eq!(
+        second_status.initialization_tasks[0].status,
+        devfleet_protocol::InitializationTaskStatus::Failed
+    );
+    stop(&fixture.socket, first);
+    stop(&fixture.socket, second);
 }
 
 #[test]
@@ -464,6 +579,32 @@ invalid = "${{{{ unrecognized.token }}}}"
 
 fn start_daemon(root: &Path) -> DaemonFixture {
     start_daemon_with_plugin_trust(root, true)
+}
+
+fn up_environment(socket: &Path, worktree: &Path, instance: &str) -> uuid::Uuid {
+    let response = request(
+        socket,
+        DaemonRequest::Up(EnvironmentUpRequest {
+            worktree: worktree.display().to_string(),
+            profile: "process".into(),
+            instance: Some(instance.into()),
+            trusted: true,
+            process: ProcessSpec {
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: worktree.display().to_string(),
+                environment: BTreeMap::new(),
+            },
+        }),
+    )
+    .expect("environment starts");
+    let DaemonResponse::Accepted(accepted) = response else {
+        panic!("expected accepted environment");
+    };
+    accepted.environment_id
+}
+
+fn stop(socket: &Path, environment_id: uuid::Uuid) {
+    request(socket, DaemonRequest::Stop { environment_id }).expect("environment stops");
 }
 
 fn start_daemon_with_plugin_trust(root: &Path, trust_plugin: bool) -> DaemonFixture {

@@ -301,6 +301,7 @@ dependencies = [
  "devfleet-testkit",
  "nix",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

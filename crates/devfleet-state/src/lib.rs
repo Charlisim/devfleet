@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -134,6 +134,19 @@ pub struct StoredProcess {
     pub started_at_unix_ms: u128,
     pub supervisor_socket: String,
     pub readiness: StoredReadiness,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredInitializationTask {
+    pub environment_id: Uuid,
+    pub id: String,
+    pub kind: String,
+    pub rerun_policy: String,
+    pub fingerprint: String,
+    pub generation: u64,
+    pub attempts: u64,
+    pub status: String,
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -412,6 +425,97 @@ impl StateStore {
         self.connection.execute(
             "UPDATE environments SET lifecycle = 'failed' WHERE id = ?1",
             params![environment_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Returns retained initialization progress for an environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read retained task state.
+    pub fn initialization_tasks(
+        &self,
+        environment_id: Uuid,
+    ) -> Result<Vec<StoredInitializationTask>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT environment_id, task_id, kind, rerun_policy, fingerprint, generation, attempts, status, diagnostic
+             FROM initialization_tasks WHERE environment_id = ?1 ORDER BY task_id",
+        )?;
+        let mut rows = statement.query(params![environment_id.to_string()])?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next()? {
+            tasks.push(stored_initialization_task(row)?);
+        }
+        Ok(tasks)
+    }
+
+    /// Persists task intent before supervisor execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the task intent.
+    pub fn record_initialization_task_intent(
+        &mut self,
+        task: &StoredInitializationTask,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO initialization_tasks (
+                environment_id, task_id, kind, rerun_policy, fingerprint, generation, attempts, status, diagnostic
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 'running', NULL)
+             ON CONFLICT(environment_id, task_id) DO UPDATE SET
+                kind = excluded.kind,
+                rerun_policy = excluded.rerun_policy,
+                fingerprint = excluded.fingerprint,
+                generation = excluded.generation,
+                attempts = initialization_tasks.attempts + 1,
+                status = 'running',
+                diagnostic = NULL",
+            params![
+                task.environment_id.to_string(),
+                task.id,
+                task.kind,
+                task.rerun_policy,
+                task.fingerprint,
+                i64::try_from(task.generation).map_err(|_| StateError::NumericOutOfRange)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a task as completed without removing its retained record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the completion.
+    pub fn complete_initialization_task(
+        &mut self,
+        environment_id: Uuid,
+        task_id: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE initialization_tasks SET status = 'completed', diagnostic = NULL
+             WHERE environment_id = ?1 AND task_id = ?2",
+            params![environment_id.to_string(), task_id],
+        )?;
+        Ok(())
+    }
+
+    /// Records a task failure without applying compensating data changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the failure.
+    pub fn fail_initialization_task(
+        &mut self,
+        environment_id: Uuid,
+        task_id: &str,
+        diagnostic: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE initialization_tasks SET status = 'failed', diagnostic = ?3
+             WHERE environment_id = ?1 AND task_id = ?2",
+            params![environment_id.to_string(), task_id, diagnostic],
         )?;
         Ok(())
     }
@@ -1103,8 +1207,51 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 11 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS initialization_tasks (
+                    environment_id TEXT NOT NULL REFERENCES environments(id),
+                    task_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    rerun_policy TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    diagnostic TEXT,
+                    PRIMARY KEY (environment_id, task_id)
+                 );
+                 PRAGMA user_version = 11;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
+}
+
+fn stored_initialization_task(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredInitializationTask> {
+    let environment_id =
+        Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let generation: i64 = row.get(5)?;
+    let attempts: i64 = row.get(6)?;
+    Ok(StoredInitializationTask {
+        environment_id,
+        id: row.get(1)?,
+        kind: row.get(2)?,
+        rerun_policy: row.get(3)?,
+        fingerprint: row.get(4)?,
+        generation: generation
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, generation))?,
+        attempts: attempts
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, attempts))?,
+        status: row.get(7)?,
+        diagnostic: row.get(8)?,
+    })
 }
 
 fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {

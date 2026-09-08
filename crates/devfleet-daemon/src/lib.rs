@@ -4,15 +4,17 @@ use devfleet_core::{PlanOptions, compile_manifest, discover_git_worktree};
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
     ComposeReconcileRequest, ComposeUpRequest, DaemonRequest, DaemonResponse, EndpointSnapshot,
-    EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot, JsonRpcRequest,
-    JsonRpcResponse, LifecycleState, LogSnapshot, OperationAccepted, OperationSnapshot,
-    PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot, ProcessSnapshot,
-    ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
+    EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot,
+    InitializationRunRequest, InitializationTask, InitializationTaskKind,
+    InitializationTaskSnapshot, InitializationTaskStatus, JsonRpcRequest, JsonRpcResponse,
+    LifecycleState, LogSnapshot, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION,
+    PluginAction, PluginReconcileRequest, PluginSnapshot, ProcessSnapshot, ReadinessState,
+    RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy,
     read_json_line, write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredEndpoint, StoredEnvironment, StoredEvent, StoredLifecycle, StoredOperation,
-    StoredProcess, StoredReadiness, VerifiedGitContext,
+    StateStore, StoredEndpoint, StoredEnvironment, StoredEvent, StoredInitializationTask,
+    StoredLifecycle, StoredOperation, StoredProcess, StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -132,6 +134,7 @@ impl Daemon {
             DaemonRequest::Plan(request) => self.plan(request),
             DaemonRequest::Up(request) => self.up(request),
             DaemonRequest::ComposeUp(request) => self.compose_up(request),
+            DaemonRequest::InitializationRun(request) => self.run_initialization(&request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -351,7 +354,7 @@ impl Daemon {
             return Err(error);
         }
         let response = request_supervisor(&control_socket, SupervisorRequest::Inspect)?;
-        let SupervisorResponse::Process(process) = response;
+        let process = supervisor_process(response)?;
         self.state
             .record_running_process(environment.id, &stored_process(&process))?;
         self.emit_event(
@@ -495,7 +498,7 @@ impl Daemon {
             return Err(error);
         }
         let response = request_supervisor(&control_socket, SupervisorRequest::Inspect)?;
-        let SupervisorResponse::Process(process) = response;
+        let process = supervisor_process(response)?;
         self.state
             .record_running_process(environment.id, &stored_process(&process))?;
         self.emit_event(
@@ -516,12 +519,126 @@ impl Daemon {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn run_initialization(
+        &mut self,
+        request: &InitializationRunRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        validate_initialization_tasks(&request.tasks)?;
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment
+            .process
+            .clone()
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        if !matches!(
+            environment.lifecycle,
+            StoredLifecycle::Running | StoredLifecycle::Starting
+        ) {
+            return Err(DaemonError::Operation(
+                "initialization requires a running owned environment".into(),
+            ));
+        }
+        let ordered = ordered_initialization_tasks(&request.tasks)?;
+        let prior = self
+            .state
+            .initialization_tasks(environment.id)?
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect::<BTreeMap<_, _>>();
+        for task in ordered {
+            let fingerprint = task_fingerprint(task)?;
+            if let Some(stored) = prior.get(&task.id) {
+                if stored.status == "running" && stored.fingerprint == fingerprint {
+                    return Err(DaemonError::Operation(format!(
+                        "initialization task '{}' has an uncertain prior outcome; inspect it before an explicit rerun",
+                        task.id
+                    )));
+                }
+                if task_is_complete_for_policy(stored, task, environment.generation, &fingerprint) {
+                    self.emit_event(
+                        environment.id,
+                        environment.generation,
+                        None,
+                        "initialization_task_skipped",
+                    )?;
+                    continue;
+                }
+            }
+            let operation_id = Uuid::now_v7();
+            let stored = StoredInitializationTask {
+                environment_id: environment.id,
+                id: task.id.clone(),
+                kind: task_kind_name(task.kind).into(),
+                rerun_policy: rerun_policy_name(task.rerun_policy).into(),
+                fingerprint,
+                generation: environment.generation,
+                attempts: 0,
+                status: "running".into(),
+                diagnostic: None,
+            };
+            self.state.record_initialization_task_intent(&stored)?;
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                Some(operation_id),
+                "initialization_task_running",
+            )?;
+            let response = request_supervisor(
+                Path::new(&process.supervisor_socket),
+                SupervisorRequest::RunTask {
+                    operation_id,
+                    process: task.process.clone(),
+                },
+            )?;
+            match response {
+                SupervisorResponse::TaskCompleted => {
+                    self.state
+                        .complete_initialization_task(environment.id, &task.id)?;
+                    self.emit_event(
+                        environment.id,
+                        environment.generation,
+                        Some(operation_id),
+                        "initialization_task_completed",
+                    )?;
+                }
+                SupervisorResponse::TaskFailed => {
+                    let diagnostic = "task process exited unsuccessfully";
+                    self.state
+                        .fail_initialization_task(environment.id, &task.id, diagnostic)?;
+                    self.emit_event(
+                        environment.id,
+                        environment.generation,
+                        Some(operation_id),
+                        "initialization_task_failed",
+                    )?;
+                    return Err(DaemonError::Operation(format!("{}: {diagnostic}", task.id)));
+                }
+                SupervisorResponse::Process(_) => {
+                    return Err(DaemonError::Operation(
+                        "supervisor returned a process response for an initialization task".into(),
+                    ));
+                }
+            }
+        }
+        Ok(DaemonResponse::InitializationTasks(
+            self.state
+                .initialization_tasks(environment.id)?
+                .into_iter()
+                .map(initialization_task_snapshot)
+                .collect(),
+        ))
+    }
+
     fn status(&self, environment_id: Uuid) -> Result<DaemonResponse, DaemonError> {
         let environment = self
             .state
             .environment(environment_id)?
             .ok_or(DaemonError::NotFound)?;
-        Ok(DaemonResponse::Environment(snapshot(environment)))
+        let tasks = self.state.initialization_tasks(environment_id)?;
+        Ok(DaemonResponse::Environment(snapshot(environment, tasks)))
     }
 
     fn list(&self) -> Result<DaemonResponse, DaemonError> {
@@ -529,8 +646,12 @@ impl Daemon {
             .state
             .environments()?
             .into_iter()
-            .map(snapshot)
-            .collect();
+            .map(|environment| {
+                self.state
+                    .initialization_tasks(environment.id)
+                    .map(|tasks| snapshot(environment, tasks))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(DaemonResponse::Environments(environments))
     }
 
@@ -544,7 +665,7 @@ impl Daemon {
             Path::new(&process.supervisor_socket),
             SupervisorRequest::Stop,
         )?;
-        let SupervisorResponse::Process(observed) = response;
+        let observed = supervisor_process(response)?;
         if observed.readiness != ReadinessState::ProcessStopped {
             return Err(DaemonError::Operation(
                 "supervisor did not reap process".into(),
@@ -576,7 +697,7 @@ impl Daemon {
                 Path::new(&process.supervisor_socket),
                 SupervisorRequest::Stop,
             )?;
-            let SupervisorResponse::Process(process) = response;
+            let process = supervisor_process(response)?;
             if process.readiness != ReadinessState::ProcessStopped {
                 return Err(DaemonError::Operation(
                     "supervisor did not reap cancelled process".into(),
@@ -1084,7 +1205,126 @@ fn canonical_plan_path(path: &str, worktree: &Path) -> Result<PathBuf, DaemonErr
     Ok(path)
 }
 
-fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
+fn validate_initialization_tasks(tasks: &[InitializationTask]) -> Result<(), DaemonError> {
+    let ids = tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if ids.len() != tasks.len()
+        || tasks.iter().any(|task| {
+            task.id.is_empty()
+                || task.process.argv.is_empty()
+                || task.process.cwd.is_empty()
+                || task
+                    .depends_on
+                    .iter()
+                    .any(|dependency| dependency == &task.id || !ids.contains(dependency.as_str()))
+        })
+    {
+        return Err(DaemonError::InvalidConfig(
+            "initialization tasks need unique ids, executable processes, and declared non-self dependencies".into(),
+        ));
+    }
+    let _ = ordered_initialization_tasks(tasks)?;
+    Ok(())
+}
+
+fn ordered_initialization_tasks(
+    tasks: &[InitializationTask],
+) -> Result<Vec<&InitializationTask>, DaemonError> {
+    let mut remaining = tasks
+        .iter()
+        .map(|task| (task.id.clone(), task))
+        .collect::<BTreeMap<_, _>>();
+    let mut completed = BTreeSet::new();
+    let mut ordered = Vec::new();
+    while !remaining.is_empty() {
+        let next = remaining
+            .iter()
+            .find(|(_, task)| {
+                task.depends_on
+                    .iter()
+                    .all(|dependency| completed.contains(dependency))
+            })
+            .map(|(id, _)| (*id).clone());
+        let Some(id) = next else {
+            return Err(DaemonError::InvalidConfig(
+                "initialization task dependencies contain a cycle".into(),
+            ));
+        };
+        let task = remaining.remove(&id).expect("task selected from remaining");
+        completed.insert(id);
+        ordered.push(task);
+    }
+    Ok(ordered)
+}
+
+fn task_fingerprint(task: &InitializationTask) -> Result<String, DaemonError> {
+    let bytes =
+        serde_json::to_vec(task).map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn task_is_complete_for_policy(
+    stored: &StoredInitializationTask,
+    task: &InitializationTask,
+    generation: u64,
+    fingerprint: &str,
+) -> bool {
+    stored.status == "completed"
+        && stored.fingerprint == fingerprint
+        && match task.rerun_policy {
+            TaskRerunPolicy::Never => true,
+            TaskRerunPolicy::Always => false,
+            TaskRerunPolicy::OnEnvironmentGeneration => stored.generation == generation,
+        }
+}
+
+fn task_kind_name(kind: InitializationTaskKind) -> &'static str {
+    match kind {
+        InitializationTaskKind::Migration => "migration",
+        InitializationTaskKind::Seed => "seed",
+    }
+}
+
+fn rerun_policy_name(policy: TaskRerunPolicy) -> &'static str {
+    match policy {
+        TaskRerunPolicy::Never => "never",
+        TaskRerunPolicy::Always => "always",
+        TaskRerunPolicy::OnEnvironmentGeneration => "on_environment_generation",
+    }
+}
+
+fn initialization_task_snapshot(task: StoredInitializationTask) -> InitializationTaskSnapshot {
+    let kind = match task.kind.as_str() {
+        "migration" => InitializationTaskKind::Migration,
+        _ => InitializationTaskKind::Seed,
+    };
+    let rerun_policy = match task.rerun_policy.as_str() {
+        "never" => TaskRerunPolicy::Never,
+        "always" => TaskRerunPolicy::Always,
+        _ => TaskRerunPolicy::OnEnvironmentGeneration,
+    };
+    let status = match task.status.as_str() {
+        "completed" => InitializationTaskStatus::Completed,
+        "failed" => InitializationTaskStatus::Failed,
+        _ => InitializationTaskStatus::Uncertain,
+    };
+    InitializationTaskSnapshot {
+        id: task.id,
+        kind,
+        rerun_policy,
+        generation: task.generation,
+        attempts: task.attempts,
+        status,
+        diagnostic: task.diagnostic,
+    }
+}
+
+fn snapshot(
+    environment: StoredEnvironment,
+    tasks: Vec<StoredInitializationTask>,
+) -> EnvironmentSnapshot {
     let lifecycle = match environment.lifecycle {
         StoredLifecycle::Starting => LifecycleState::Starting,
         StoredLifecycle::Running => LifecycleState::Running,
@@ -1132,6 +1372,11 @@ fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
                     healthy,
                 }
             })
+            .collect(),
+        initialization_ready: tasks.iter().all(|task| task.status == "completed"),
+        initialization_tasks: tasks
+            .into_iter()
+            .map(initialization_task_snapshot)
             .collect(),
     }
 }
@@ -1420,6 +1665,17 @@ fn request_supervisor(
         .result
         .ok_or_else(|| DaemonError::Operation("supervisor returned no result".into()))?;
     serde_json::from_value(result).map_err(|error| DaemonError::Operation(error.to_string()))
+}
+
+fn supervisor_process(response: SupervisorResponse) -> Result<ProcessSnapshot, DaemonError> {
+    match response {
+        SupervisorResponse::Process(process) => Ok(process),
+        SupervisorResponse::TaskCompleted | SupervisorResponse::TaskFailed => {
+            Err(DaemonError::Operation(
+                "supervisor returned a task response for process control".into(),
+            ))
+        }
+    }
 }
 
 fn assert_same_user(stream: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {

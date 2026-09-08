@@ -3,9 +3,9 @@
 use anyhow::Context as _;
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
-    HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginCall,
-    ProcessSnapshot, ReadinessState, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
-    read_json_line, write_json_line,
+    HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginAction, PluginCall,
+    PluginReconcileRequest, ProcessSnapshot, ProcessSpec, ReadinessState, SupervisorRequest,
+    SupervisorResponse, SupervisorStartRequest, read_json_line, write_json_line,
 };
 use nix::{
     errno::Errno,
@@ -22,6 +22,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 
 const SIGNAL_WAIT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -42,8 +43,8 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
     }
     let initial = read_json_line::<SupervisorStartRequest>(&mut BufReader::new(io::stdin().lock()))
         .context("read supervisor start request")?;
-    let spawn_request =
-        request_spawn(process_plugin, &initial).context("request process provider spawn")?;
+    let spawn_request = request_spawn(process_plugin, initial.operation_id, initial.action.clone())
+        .context("request process provider spawn")?;
     let mut child = spawn(&spawn_request).context("spawn provider process")?;
     let logs = capture_logs(&mut child, &initial).context("capture provider process logs")?;
     let pid = i32::try_from(child.id()).map_err(|_| anyhow::anyhow!("PID exceeds i32"))?;
@@ -72,7 +73,7 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
         observe_child(&mut child, &mut snapshot)?;
         match listener.accept() {
             Ok((stream, _)) => {
-                if handle_control(stream, &mut child, &mut snapshot)? {
+                if handle_control(stream, &mut child, &mut snapshot, process_plugin)? {
                     logs.finish();
                     return Ok(());
                 }
@@ -93,17 +94,18 @@ impl Drop for SocketCleanup {
 
 fn request_spawn(
     plugin: &Path,
-    initial: &SupervisorStartRequest,
+    operation_id: Uuid,
+    action: PluginAction,
 ) -> anyhow::Result<HostSpawnRequest> {
     let request = JsonRpcRequest {
         jsonrpc: "2.0".into(),
-        id: initial.operation_id,
+        id: operation_id,
         method: "plugin.call".into(),
         params: serde_json::to_value(PluginCall {
             protocol: PROTOCOL_VERSION,
-            operation_id: initial.operation_id,
+            operation_id,
             plugin_state_version: 1,
-            action: initial.action.clone(),
+            action,
         })?,
     };
     let mut command = Command::new(plugin);
@@ -239,6 +241,7 @@ fn handle_control(
     mut stream: std::os::unix::net::UnixStream,
     child: &mut Child,
     snapshot: &mut ProcessSnapshot,
+    process_plugin: &Path,
 ) -> anyhow::Result<bool> {
     assert_same_user(&stream)?;
     let request = read_json_line::<JsonRpcRequest>(&mut BufReader::new(stream.try_clone()?))?;
@@ -252,11 +255,47 @@ fn handle_control(
             snapshot.readiness = ReadinessState::ProcessStopped;
             SupervisorResponse::Process(snapshot.clone())
         }
+        SupervisorRequest::RunTask {
+            operation_id,
+            process,
+        } => run_task(process_plugin, operation_id, process)?,
     };
     let rpc = JsonRpcResponse::success(request.id, &response);
     stream.write_all(&write_json_line(&rpc)?)?;
     stream.flush()?;
     Ok(exit_after_response)
+}
+
+fn run_task(
+    plugin: &Path,
+    operation_id: Uuid,
+    process: ProcessSpec,
+) -> anyhow::Result<SupervisorResponse> {
+    let action = PluginAction::Reconcile(PluginReconcileRequest {
+        protocol: PROTOCOL_VERSION,
+        operation_id,
+        process,
+    });
+    let request = request_spawn(plugin, operation_id, action)?;
+    let (program, arguments) = request
+        .argv
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("official.process returned an empty argv"))?;
+    let status = Command::new(program)
+        .args(arguments)
+        .current_dir(&request.cwd)
+        .env_clear()
+        .envs(&request.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("run initialization task in {}", request.cwd))?;
+    Ok(if status.success() {
+        SupervisorResponse::TaskCompleted
+    } else {
+        SupervisorResponse::TaskFailed
+    })
 }
 
 fn assert_same_user(stream: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {

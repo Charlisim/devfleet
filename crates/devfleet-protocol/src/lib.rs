@@ -125,6 +125,56 @@ pub struct ComposeUpRequest {
     pub authorizations: ComposeAuthorizations,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitializationRunRequest {
+    pub environment_id: Uuid,
+    pub tasks: Vec<InitializationTask>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitializationTask {
+    pub id: String,
+    pub kind: InitializationTaskKind,
+    pub depends_on: Vec<String>,
+    pub rerun_policy: TaskRerunPolicy,
+    pub process: ProcessSpec,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitializationTaskKind {
+    Migration,
+    Seed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRerunPolicy {
+    Never,
+    Always,
+    OnEnvironmentGeneration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InitializationTaskSnapshot {
+    pub id: String,
+    pub kind: InitializationTaskKind,
+    pub rerun_policy: TaskRerunPolicy,
+    pub generation: u64,
+    pub attempts: u64,
+    pub status: InitializationTaskStatus,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitializationTaskStatus {
+    Running,
+    Completed,
+    Failed,
+    Uncertain,
+}
+
 /// Inputs for a side-effect-free declarative plan preview. Secret values are
 /// intentionally absent: callers may only declare a reference as available.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -145,6 +195,7 @@ pub enum DaemonRequest {
     Plan(EnvironmentPlanRequest),
     Up(EnvironmentUpRequest),
     ComposeUp(ComposeUpRequest),
+    InitializationRun(InitializationRunRequest),
     Status {
         environment_id: Uuid,
     },
@@ -194,6 +245,7 @@ pub enum DaemonResponse {
     Logs(LogSnapshot),
     Plugin(PluginSnapshot),
     Plugins(Vec<PluginSnapshot>),
+    InitializationTasks(Vec<InitializationTaskSnapshot>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -279,6 +331,8 @@ pub struct EnvironmentSnapshot {
     pub reconciliation_diagnostic: Option<String>,
     pub process: Option<ProcessSnapshot>,
     pub endpoints: Vec<EndpointSnapshot>,
+    pub initialization_ready: bool,
+    pub initialization_tasks: Vec<InitializationTaskSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -436,12 +490,18 @@ pub struct SupervisorStartRequest {
 pub enum SupervisorRequest {
     Inspect,
     Stop,
+    RunTask {
+        operation_id: Uuid,
+        process: ProcessSpec,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum SupervisorResponse {
     Process(ProcessSnapshot),
+    TaskCompleted,
+    TaskFailed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

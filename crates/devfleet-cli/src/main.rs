@@ -2,8 +2,8 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use devfleet_cli::request;
 use devfleet_protocol::{
     ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest, DaemonResponse,
-    EnvironmentPlanRequest, EnvironmentUpRequest, PROTOCOL_VERSION, ProcessSpec, SmokeResponse,
-    SmokeStatus,
+    EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest, InitializationTask,
+    PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -40,7 +40,24 @@ enum Command {
     Events(EventsArgs),
     Logs(LogsArgs),
     Compose(ComposeArgs),
+    Initialize(InitializeArgs),
     Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct InitializeArgs {
+    #[command(subcommand)]
+    command: InitializeCommand,
+}
+
+#[derive(Subcommand)]
+enum InitializeCommand {
+    Run {
+        environment_id: Uuid,
+        /// JSON file containing an array of declared migration/seed tasks.
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -359,6 +376,15 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 }))
             }
         },
+        Command::Initialize(initialization) => match initialization.command {
+            InitializeCommand::Run {
+                environment_id,
+                file,
+            } => Ok(DaemonRequest::InitializationRun(InitializationRunRequest {
+                environment_id,
+                tasks: serde_json::from_slice::<Vec<InitializationTask>>(&std::fs::read(file)?)?,
+            })),
+        },
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
         Command::Stop { environment_id } => Ok(DaemonRequest::Stop { environment_id }),
@@ -544,6 +570,22 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                 println!(
                     "{} {} {} trusted={}",
                     plugin.id, plugin.version, plugin.checksum, plugin.trusted
+                );
+            }
+        }
+        DaemonResponse::InitializationTasks(tasks) => {
+            for task in tasks {
+                println!(
+                    "{} {:?} {:?} attempts={}{}",
+                    task.id,
+                    task.status,
+                    task.rerun_policy,
+                    task.attempts,
+                    task.diagnostic
+                        .as_deref()
+                        .map_or_else(String::new, |diagnostic| format!(
+                            " diagnostic={diagnostic}"
+                        ))
                 );
             }
         }

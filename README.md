@@ -59,6 +59,22 @@ devfleet --socket /tmp/df-$(id -u)/daemon.sock compose up \
   --endpoint api=api:3000:20001:/health
 ```
 
+## Ordered initialization
+
+Run declared backend migrations and seeds through the environment's trusted
+supervisor. The JSON file is an array of `InitializationTask` values; each task
+has an `id`, `kind` (`migration` or `seed`), `depends_on`, `rerun_policy`
+(`never`, `always`, or `on_environment_generation`), and a `process` with
+literal `argv`, `cwd`, and explicit environment values.
+
+```sh
+devfleet initialize run <environment-id> --file initialization.json
+```
+
+Completed `never` tasks are retained and skipped on retry. A task left running
+when the daemon loses its reply is shown as uncertain and is never retried
+automatically. No inverse migration or data deletion is performed.
+
 Before startup, the provider asks Docker for the effective merged JSON model.
 It requires project-scoped names, loopback-only endpoint publications, and
 private mutable storage. Built services need a project-specific image tag or
