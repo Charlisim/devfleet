@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 13;
+pub const CURRENT_SCHEMA_VERSION: i64 = 14;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -170,6 +170,16 @@ pub struct StoredIosDevice {
     pub device_type: String,
     pub expected_name: String,
     pub lifecycle: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredPreparationTask {
+    pub environment_id: Uuid,
+    pub kind: String,
+    pub fingerprint: String,
+    pub attempts: u64,
+    pub status: String,
+    pub diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -560,6 +570,52 @@ impl StateStore {
              WHERE environment_id = ?1 AND task_id = ?2",
             params![environment_id.to_string(), task_id, diagnostic],
         )?;
+        Ok(())
+    }
+
+    /// Reads retained React Native preparation status for one environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot query preparation status.
+    pub fn preparation_tasks(
+        &self,
+        environment_id: Uuid,
+    ) -> Result<Vec<StoredPreparationTask>, StateError> {
+        let mut statement = self.connection.prepare("SELECT environment_id, kind, fingerprint, attempts, status, diagnostic FROM preparation_tasks WHERE environment_id = ?1 ORDER BY kind")?;
+        let mut rows = statement.query(params![environment_id.to_string()])?;
+        let mut tasks = Vec::new();
+        while let Some(row) = rows.next()? {
+            tasks.push(stored_preparation_task(row)?);
+        }
+        Ok(tasks)
+    }
+
+    /// Persists intent before a mutable dependency or Pods command begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist task intent.
+    pub fn record_preparation_intent(
+        &mut self,
+        task: &StoredPreparationTask,
+    ) -> Result<(), StateError> {
+        self.connection.execute("INSERT INTO preparation_tasks (environment_id, kind, fingerprint, attempts, status, diagnostic) VALUES (?1, ?2, ?3, 1, 'running', NULL) ON CONFLICT(environment_id, kind) DO UPDATE SET fingerprint = excluded.fingerprint, attempts = preparation_tasks.attempts + 1, status = 'running', diagnostic = NULL", params![task.environment_id.to_string(), task.kind, task.fingerprint])?;
+        Ok(())
+    }
+
+    /// Completes or fails an owned preparation task without discarding history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the result.
+    pub fn finish_preparation_task(
+        &mut self,
+        environment_id: Uuid,
+        kind: &str,
+        diagnostic: Option<&str>,
+    ) -> Result<(), StateError> {
+        self.connection.execute("UPDATE preparation_tasks SET status = CASE WHEN ?3 IS NULL THEN 'completed' ELSE 'failed' END, diagnostic = ?3 WHERE environment_id = ?1 AND kind = ?2", params![environment_id.to_string(), kind, diagnostic])?;
         Ok(())
     }
 
@@ -1414,6 +1470,9 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 14 {
+            self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS preparation_tasks (environment_id TEXT NOT NULL REFERENCES environments(id), kind TEXT NOT NULL, fingerprint TEXT NOT NULL, attempts INTEGER NOT NULL, status TEXT NOT NULL, diagnostic TEXT, PRIMARY KEY (environment_id, kind)); PRAGMA user_version = 14; COMMIT;")?;
+        }
         Ok(())
     }
 }
@@ -1440,6 +1499,21 @@ fn stored_ios_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIosDevic
         device_type: row.get(3)?,
         expected_name: row.get(4)?,
         lifecycle: row.get(5)?,
+    })
+}
+
+fn stored_preparation_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPreparationTask> {
+    let attempts: i64 = row.get(3)?;
+    Ok(StoredPreparationTask {
+        environment_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        kind: row.get(1)?,
+        fingerprint: row.get(2)?,
+        attempts: attempts
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, attempts))?,
+        status: row.get(4)?,
+        diagnostic: row.get(5)?,
     })
 }
 
@@ -1779,6 +1853,33 @@ mod tests {
             .expect("device reads")
             .expect("device exists");
         assert_eq!(retained.udid.as_deref(), Some(udid));
+    }
+
+    #[test]
+    fn retains_completed_preparation_by_kind_and_fingerprint() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let environment = environment();
+        store
+            .record_start_intent(&environment, Uuid::now_v7())
+            .expect("environment persists");
+        let task = StoredPreparationTask {
+            environment_id: environment.id,
+            kind: "dependencies".into(),
+            fingerprint: "lockfile-a".into(),
+            attempts: 0,
+            status: "running".into(),
+            diagnostic: None,
+        };
+        store
+            .record_preparation_intent(&task)
+            .expect("intent persists");
+        store
+            .finish_preparation_task(environment.id, "dependencies", None)
+            .expect("completion persists");
+        let retained = store.preparation_tasks(environment.id).expect("tasks read");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].fingerprint, "lockfile-a");
+        assert_eq!(retained[0].status, "completed");
     }
 
     #[test]
