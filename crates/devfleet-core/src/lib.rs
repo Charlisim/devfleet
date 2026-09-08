@@ -34,7 +34,10 @@ pub use plan::{
     DependencyEdge, DependencyKind, EffectivePlan, PlanOptions, PlannedResource, compile_document,
     compile_manifest,
 };
-pub use ports::{EndpointUrls, PortBlock, PortError, PortRange, ReservedPorts, retry_handoff};
+pub use ports::{
+    DEFAULT_BLOCK_SIZE, DEFAULT_PORT_RANGE, EndpointUrls, PortBlock, PortError, PortRange,
+    ReservedPorts, retry_handoff,
+};
 pub use scheduler::{HostScheduler, SchedulerError};
 
 macro_rules! id_type {

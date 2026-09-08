@@ -234,7 +234,8 @@ enum MetroCommand {
         profile: String,
         #[arg(long)]
         instance: Option<String>,
-        #[arg(long)]
+        /// `0` selects `DevFleet`'s reserved automatic port.
+        #[arg(long, default_value_t = 0)]
         port: u16,
         #[arg(long, default_value_t = 1)]
         max_workers: u16,
@@ -1004,14 +1005,11 @@ fn parse_compose_endpoints(values: Vec<String>) -> anyhow::Result<Vec<ComposeEnd
             if name.is_empty()
                 || service.is_empty()
                 || container_port == 0
-                || host_port == 0
                 || !readiness_path.starts_with('/')
                 || !names.insert(name.to_owned())
-                || !host_ports.insert(host_port)
+                || (host_port != 0 && !host_ports.insert(host_port))
             {
-                anyhow::bail!(
-                    "--endpoint names and host ports must be unique with nonzero ports and /PATH"
-                );
+                anyhow::bail!("--endpoint names and explicit host ports must be unique with /PATH");
             }
             Ok(ComposeEndpoint {
                 name: name.into(),
@@ -1465,6 +1463,9 @@ mod tests {
         let endpoints = parse_compose_endpoints(vec!["api=api:3000:20001:/health".into()])
             .expect("endpoint parses");
         assert_eq!(endpoints[0].host_port, 20_001);
+        let automatic = parse_compose_endpoints(vec!["api=api:3000:0:/health".into()])
+            .expect("automatic endpoint parses");
+        assert_eq!(automatic[0].host_port, 0);
         assert!(parse_compose_endpoints(vec!["api=api:3000:20001:health".into()]).is_err());
     }
 

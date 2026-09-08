@@ -1,9 +1,10 @@
 //! Local daemon: private IPC, persistent state, and supervisor composition.
 
 use devfleet_core::{
-    BindingIntegration as CoreBindingIntegration, BindingPhase as CoreBindingPhase, HostScheduler,
-    Invalidation, PlanOptions, SchedulerError, compile_manifest, discover_git_worktree,
-    metro_adapter, render_metro_config, resolve_bindings,
+    BindingIntegration as CoreBindingIntegration, BindingPhase as CoreBindingPhase,
+    DEFAULT_BLOCK_SIZE, DEFAULT_PORT_RANGE, HostScheduler, Invalidation, PlanOptions, PortBlock,
+    ReservedPorts, SchedulerError, compile_manifest, discover_git_worktree, metro_adapter,
+    render_metro_config, resolve_bindings,
 };
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
@@ -29,10 +30,10 @@ use devfleet_protocol::{
     TrustedTaskPlugin, VerificationMode, read_json_line, write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredArtifact, StoredBinding, StoredComposeResource, StoredEndpoint,
-    StoredEnvironment, StoredEvent, StoredIdentityVerification, StoredInitializationTask,
-    StoredIosApp, StoredIosDevice, StoredLifecycle, StoredOperation, StoredPreparationTask,
-    StoredProcess, StoredProjectSetup, StoredReadiness, VerifiedGitContext,
+    PortLeaseRequest, StateStore, StoredArtifact, StoredBinding, StoredComposeResource,
+    StoredEndpoint, StoredEnvironment, StoredEvent, StoredIdentityVerification,
+    StoredInitializationTask, StoredIosApp, StoredIosDevice, StoredLifecycle, StoredOperation,
+    StoredPreparationTask, StoredProcess, StoredProjectSetup, StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::poll::{PollFd, PollFlags, poll};
@@ -1024,13 +1025,9 @@ impl Daemon {
 
     #[allow(clippy::too_many_lines)]
     fn metro_up(&mut self, request: MetroUpRequest) -> Result<DaemonResponse, DaemonError> {
-        if !request.trusted
-            || request.profile.is_empty()
-            || request.port == 0
-            || request.max_workers == 0
-        {
+        if !request.trusted || request.profile.is_empty() || request.max_workers == 0 {
             return Err(if request.trusted {
-                DaemonError::InvalidConfig("Metro requires profile, port, and worker budget".into())
+                DaemonError::InvalidConfig("Metro requires profile and worker budget".into())
             } else {
                 DaemonError::TrustRequired
             });
@@ -1038,6 +1035,41 @@ impl Daemon {
         let worktree = Path::new(&request.worktree)
             .canonicalize()
             .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let git_identity = discover_git_worktree(&worktree)
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let key = environment_key(
+            &git_identity.project_fingerprint,
+            &git_identity.worktree_fingerprint,
+            &request.profile,
+            request.instance.as_deref(),
+        );
+        if let Some(environment) = self.state.environments()?.into_iter().find(|environment| {
+            environment.key == key
+                && matches!(
+                    environment.lifecycle,
+                    StoredLifecycle::Starting | StoredLifecycle::Running
+                )
+        }) {
+            return self.status(environment.id);
+        }
+        let automatically_assigned = request.port == 0;
+        let port = if automatically_assigned {
+            *self
+                .reserve_automatic_ports(
+                    &key,
+                    &git_identity.project_fingerprint,
+                    1,
+                    BTreeSet::from(["metro".into()]),
+                )?
+                .get("metro")
+                .ok_or_else(|| DaemonError::InvalidConfig("Metro port assignment missing".into()))?
+        } else {
+            request.port
+        };
+        let mut port_reservation = automatically_assigned
+            .then(|| ReservedPorts::bind(BTreeMap::from([("metro".into(), port)])))
+            .transpose()
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
         let cache_key = format!(
             "{:x}",
             Sha256::digest(format!(
@@ -1053,7 +1085,7 @@ impl Daemon {
         let adapter = metro_adapter(
             worktree.clone(),
             directory.join("cache"),
-            request.port,
+            port,
             request.max_workers,
             cache_key[..16].into(),
             core_integration(request.binding_integration),
@@ -1077,7 +1109,7 @@ impl Daemon {
                     operation_id: Uuid::now_v7(),
                     environment_id: Uuid::nil(),
                     worktree: worktree.display().to_string(),
-                    port: request.port,
+                    port,
                     cache_directory: adapter.cache_directory.display().to_string(),
                     configuration_path: configuration_path.display().to_string(),
                     max_workers: request.max_workers,
@@ -1085,7 +1117,7 @@ impl Daemon {
                 .map_err(|error| DaemonError::Operation(error.to_string()))?,
             )?)
             .map_err(|error| DaemonError::Operation(error.to_string()))?;
-        let response = self.up(devfleet_protocol::EnvironmentUpRequest {
+        let up_request = devfleet_protocol::EnvironmentUpRequest {
             worktree: worktree.display().to_string(),
             profile: request.profile,
             instance: request.instance,
@@ -1095,6 +1127,38 @@ impl Daemon {
                 cwd: spawn.cwd,
                 environment: spawn.environment,
             },
+        };
+        let mut start_failure = None;
+        let mut accepted_response = None;
+        let handoff = if let Some(reservation) = port_reservation.as_mut() {
+            reservation.handoff(
+                || match self.up(up_request) {
+                    Ok(response) => {
+                        accepted_response = Some(response);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        start_failure = Some(error);
+                        Err(devfleet_core::PortError::PortConflict)
+                    }
+                },
+                |reserved_port| wait_for_metro_identity(reserved_port, &expected_identity),
+            )
+        } else {
+            accepted_response = Some(self.up(up_request)?);
+            Ok(())
+        };
+        if let Some(error) = start_failure {
+            return Err(error);
+        }
+        if let Err(error) = handoff {
+            if let Some(DaemonResponse::Accepted(accepted)) = &accepted_response {
+                let _ = self.stop(accepted.environment_id);
+            }
+            return Err(DaemonError::Operation(error.to_string()));
+        }
+        let response = accepted_response.ok_or_else(|| {
+            DaemonError::Operation("Metro startup returned no operation response".into())
         })?;
         let DaemonResponse::Accepted(accepted) = response else {
             return Err(DaemonError::Operation(
@@ -1118,7 +1182,7 @@ impl Daemon {
             let _ = self.stop(accepted.environment_id);
             return Err(error);
         }
-        if !wait_for_metro_identity(request.port, &expected_identity) {
+        if !automatically_assigned && !wait_for_metro_identity(port, &expected_identity) {
             let _ = self.stop(accepted.environment_id);
             return Err(DaemonError::Operation(
                 "Metro did not expose the selected endpoint identity before its deadline".into(),
@@ -1127,9 +1191,9 @@ impl Daemon {
         let endpoint = StoredEndpoint {
             name: "metro".into(),
             service: "metro".into(),
-            internal_url: format!("http://127.0.0.1:{}", request.port),
-            host_url: format!("http://127.0.0.1:{}", request.port),
-            device_url: format!("http://127.0.0.1:{}", request.port),
+            internal_url: format!("http://127.0.0.1:{port}"),
+            host_url: format!("http://127.0.0.1:{port}"),
+            device_url: format!("http://127.0.0.1:{port}"),
             readiness_path: "/devfleet-identity".into(),
             healthy: true,
         };
@@ -1145,9 +1209,8 @@ impl Daemon {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn compose_up(&mut self, request: ComposeUpRequest) -> Result<DaemonResponse, DaemonError> {
+    fn compose_up(&mut self, mut request: ComposeUpRequest) -> Result<DaemonResponse, DaemonError> {
         validate_compose_up_request(&request)?;
-        let compose_plugin = self.trusted_plugin("official.compose", "compose.reconcile")?;
         let git_identity = discover_git_worktree(Path::new(&request.worktree))
             .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
         let git_context = VerifiedGitContext {
@@ -1182,11 +1245,20 @@ impl Daemon {
         }) {
             self.state
                 .update_worktree_context(environment.id, &git_context)?;
+            let operation = self
+                .state
+                .latest_operation_of_kind(environment.id, "up")?
+                .ok_or_else(|| {
+                    DaemonError::Operation(
+                        "running Compose environment has no retained up operation identity".into(),
+                    )
+                })?;
             return Ok(DaemonResponse::Accepted(OperationAccepted {
-                operation_id: Uuid::nil(),
+                operation_id: operation.id,
                 environment_id: environment.id,
             }));
         }
+        let compose_plugin = self.trusted_plugin("official.compose", "compose.reconcile")?;
         cleanup_stopped_supervisor_socket(matching_environment)?;
         let project_id = environments
             .iter()
@@ -1201,7 +1273,7 @@ impl Daemon {
             &git_identity.project_fingerprint,
             &git_identity.worktree_fingerprint,
         )?;
-        let environment = StoredEnvironment {
+        let mut environment = StoredEnvironment {
             id: matching_environment.map_or_else(Uuid::now_v7, |environment| environment.id),
             key: environment_key(
                 &git_identity.project_fingerprint,
@@ -1227,6 +1299,37 @@ impl Daemon {
             process: None,
             endpoints: stored_compose_endpoints(&request.endpoints),
         };
+        let automatic_ports = request
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.host_port == 0)
+            .map(|endpoint| endpoint.name.clone())
+            .collect::<BTreeSet<_>>();
+        let assigned_ports = if automatic_ports.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.reserve_automatic_ports(
+                &environment.key,
+                &environment.project_fingerprint,
+                environment.generation,
+                automatic_ports,
+            )?
+        };
+        for endpoint in &mut request.endpoints {
+            if endpoint.host_port == 0 {
+                endpoint.host_port = *assigned_ports.get(&endpoint.name).ok_or_else(|| {
+                    DaemonError::InvalidConfig(format!(
+                        "automatic port assignment missing for '{}'",
+                        endpoint.name
+                    ))
+                })?;
+            }
+        }
+        environment.endpoints = stored_compose_endpoints(&request.endpoints);
+        let mut port_reservation = (!assigned_ports.is_empty())
+            .then(|| ReservedPorts::bind(assigned_ports.clone()))
+            .transpose()
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
         let operation_id = Uuid::now_v7();
         let compose_resource = StoredComposeResource {
             environment_id: environment.id,
@@ -1267,7 +1370,7 @@ impl Daemon {
                 project_name: compose_resource.project_name.clone(),
                 files: request.files,
                 environment: request.environment,
-                endpoints: request.endpoints,
+                endpoints: request.endpoints.clone(),
                 authorizations: request.authorizations,
             })),
             log_directory: log_directory.display().to_string(),
@@ -1275,9 +1378,37 @@ impl Daemon {
             redactions,
             task_plugins: self.trusted_task_plugins()?,
         };
-        if let Err(error) = self.start_supervisor(&control_socket, &compose_plugin, &start) {
+        let mut start_failure = None;
+        let handoff = if let Some(reservation) = port_reservation.as_mut() {
+            reservation.handoff(
+                || match self.start_supervisor(&control_socket, &compose_plugin, &start) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        start_failure = Some(error);
+                        Err(devfleet_core::PortError::PortConflict)
+                    }
+                },
+                |port| {
+                    request
+                        .endpoints
+                        .iter()
+                        .find(|endpoint| endpoint.host_port == port)
+                        .is_some_and(|endpoint| {
+                            wait_for_endpoint_ready(port, &endpoint.readiness_path)
+                        })
+                },
+            )
+        } else {
+            self.start_supervisor(&control_socket, &compose_plugin, &start)
+                .map_err(|_| devfleet_core::PortError::PortConflict)
+        };
+        if let Some(error) = start_failure {
             self.state.mark_failed(environment.id)?;
             return Err(error);
+        }
+        if let Err(error) = handoff {
+            self.state.mark_failed(environment.id)?;
+            return Err(DaemonError::Operation(error.to_string()));
         }
         let response = request_supervisor(&control_socket, SupervisorRequest::Inspect)?;
         let process = supervisor_process(response)?;
@@ -2925,6 +3056,7 @@ impl Daemon {
             ));
         }
         self.state.mark_stopped(environment_id)?;
+        let _ = self.state.mark_port_lease_stopped(&environment.key)?;
         remove_supervisor_socket(&process.supervisor_socket)?;
         self.release_scheduled_work(&environment)?;
         self.emit_event(environment_id, environment.generation, None, "stopped")?;
@@ -4198,6 +4330,26 @@ fn endpoint_is_healthy(endpoint: &StoredEndpoint) -> bool {
         .is_some_and(|status| (200..400).contains(&status))
 }
 
+fn wait_for_endpoint_ready(port: u16, readiness_path: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let endpoint = StoredEndpoint {
+        name: "reserved".into(),
+        service: "reserved".into(),
+        internal_url: String::new(),
+        host_url: format!("http://127.0.0.1:{port}"),
+        device_url: String::new(),
+        readiness_path: readiness_path.into(),
+        healthy: false,
+    };
+    while Instant::now() < deadline {
+        if endpoint_is_healthy(&endpoint) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn wait_for_metro_identity(port: u16, expected_identity: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     let expected = format!("\"environment\":\"{expected_identity}\"");
@@ -4902,6 +5054,60 @@ fn environment_key(
     )
 }
 
+impl Daemon {
+    fn reserve_automatic_ports(
+        &mut self,
+        environment_key: &str,
+        project_fingerprint: &str,
+        generation: u64,
+        names: BTreeSet<String>,
+    ) -> Result<BTreeMap<String, u16>, DaemonError> {
+        if names.len() > usize::from(DEFAULT_BLOCK_SIZE) {
+            return Err(DaemonError::InvalidConfig(format!(
+                "at most {DEFAULT_BLOCK_SIZE} automatic endpoints can share one environment"
+            )));
+        }
+        let offsets = names
+            .iter()
+            .enumerate()
+            .map(|(offset, name)| {
+                u16::try_from(offset)
+                    .map(|offset| (name.clone(), offset))
+                    .map_err(|_| {
+                        DaemonError::InvalidConfig("automatic port offset overflow".into())
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let lease = self.state.reserve_port_lease(&PortLeaseRequest {
+            environment_key: environment_key.into(),
+            project_fingerprint: project_fingerprint.into(),
+            generation,
+            range_start: DEFAULT_PORT_RANGE.start,
+            range_end: DEFAULT_PORT_RANGE.end,
+            block_size: DEFAULT_BLOCK_SIZE,
+            offsets,
+        })?;
+        let assigned = PortBlock {
+            start: lease.block_start,
+            size: lease.block_size,
+            offsets: lease.offsets,
+        }
+        .ports(DEFAULT_PORT_RANGE)
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        names
+            .into_iter()
+            .map(|name| {
+                let port = assigned.get(&name).copied().ok_or_else(|| {
+                    DaemonError::InvalidConfig(format!(
+                        "retained automatic port lease has no assignment for '{name}'"
+                    ))
+                })?;
+                Ok((name, port))
+            })
+            .collect()
+    }
+}
+
 fn unix_now_ms() -> Result<u64, DaemonError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5593,6 +5799,133 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn repeated_compose_up_reuses_the_durable_operation_identity() {
+        let temporary = TempDir::new().expect("temporary directory");
+        initialize_git_repository(temporary.path());
+        let compose = temporary.path().join("compose.yaml");
+        fs::write(&compose, "services: {}\n").expect("Compose fixture");
+        let identity = discover_git_worktree(temporary.path()).expect("Git identity");
+        let environment = StoredEnvironment {
+            id: Uuid::now_v7(),
+            key: environment_key(
+                &identity.project_fingerprint,
+                &identity.worktree_fingerprint,
+                "compose",
+                None,
+            ),
+            project_id: Uuid::now_v7(),
+            worktree_id: Uuid::now_v7(),
+            project_fingerprint: identity.project_fingerprint,
+            worktree_fingerprint: identity.worktree_fingerprint,
+            common_git_dir: identity.common_git_dir.display().to_string(),
+            git_dir: identity.git_dir.display().to_string(),
+            worktree: temporary.path().display().to_string(),
+            profile: "compose".into(),
+            instance: None,
+            head: identity.head,
+            branch: identity.branch,
+            detached: identity.detached,
+            generation: 1,
+            lifecycle: StoredLifecycle::Running,
+            reconciliation_diagnostic: None,
+            process: None,
+            endpoints: Vec::new(),
+        };
+        let operation_id = Uuid::now_v7();
+        let mut state = StateStore::open_in_memory().expect("state opens");
+        state
+            .record_start_intent(&environment, operation_id)
+            .expect("accepted Compose persists");
+        let (scoped_exec_completions, _) = mpsc::channel();
+        let mut daemon = Daemon {
+            config: DaemonConfig {
+                state_dir: temporary.path().join("state"),
+                socket: temporary.path().join("daemon.sock"),
+                supervisor: temporary.path().join("supervisor"),
+                process_plugin: temporary.path().join("process-plugin"),
+            },
+            state,
+            scheduler: HostScheduler::default(),
+            scoped_exec_completions,
+        };
+        let response = daemon
+            .compose_up(ComposeUpRequest {
+                worktree: temporary.path().display().to_string(),
+                profile: "compose".into(),
+                instance: None,
+                trusted: true,
+                files: vec![compose.display().to_string()],
+                environment: BTreeMap::new(),
+                endpoints: Vec::new(),
+                authorizations: devfleet_protocol::ComposeAuthorizations {
+                    global_container_names: None,
+                    host_networking: None,
+                    external_resources: None,
+                    global_volume_names: None,
+                    unmanaged_ports: None,
+                    shared_mutable_binds: None,
+                },
+            })
+            .expect("repeated Compose up");
+        let DaemonResponse::Accepted(accepted) = response else {
+            panic!("expected retained accepted operation");
+        };
+        assert_eq!(accepted.environment_id, environment.id);
+        assert_eq!(accepted.operation_id, operation_id);
+    }
+
+    #[test]
+    fn automatic_ports_are_reserved_by_environment_and_reused_after_stop() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let (scoped_exec_completions, _) = mpsc::channel();
+        let mut daemon = Daemon {
+            config: DaemonConfig {
+                state_dir: temporary.path().join("state"),
+                socket: temporary.path().join("daemon.sock"),
+                supervisor: temporary.path().join("supervisor"),
+                process_plugin: temporary.path().join("process-plugin"),
+            },
+            state: StateStore::open_in_memory().expect("state opens"),
+            scheduler: HostScheduler::default(),
+            scoped_exec_completions,
+        };
+        let first = daemon
+            .reserve_automatic_ports(
+                "project|worktree|compose|one",
+                "project",
+                1,
+                BTreeSet::from(["api".into(), "metro".into()]),
+            )
+            .expect("first reservation");
+        assert_eq!(first["api"], 20_000);
+        assert_eq!(first["metro"], 20_001);
+        assert!(
+            daemon
+                .state
+                .mark_port_lease_stopped("project|worktree|compose|one")
+                .expect("retains stopped lease")
+        );
+        let retained = daemon
+            .reserve_automatic_ports(
+                "project|worktree|compose|one",
+                "project",
+                1,
+                BTreeSet::from(["api".into(), "metro".into()]),
+            )
+            .expect("retained reservation");
+        assert_eq!(retained, first);
+        let second = daemon
+            .reserve_automatic_ports(
+                "project|worktree|compose|two",
+                "project",
+                1,
+                BTreeSet::from(["api".into()]),
+            )
+            .expect("second reservation");
+        assert_eq!(second["api"], 20_064);
+    }
+
     fn destroy_environment(worktree: &Path) -> StoredEnvironment {
         StoredEnvironment {
             id: Uuid::now_v7(),
@@ -5614,6 +5947,38 @@ mod tests {
             reconciliation_diagnostic: None,
             process: None,
             endpoints: Vec::new(),
+        }
+    }
+
+    fn initialize_git_repository(path: &Path) {
+        for arguments in [
+            vec!["init"],
+            vec!["config", "user.email", "devfleet-test@example.invalid"],
+            vec!["config", "user.name", "DevFleet Test"],
+        ] {
+            let output = Command::new("git")
+                .args(arguments)
+                .current_dir(path)
+                .output()
+                .expect("Git starts");
+            assert!(
+                output.status.success(),
+                "Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::write(path.join("README.md"), "fixture\n").expect("fixture writes");
+        for arguments in [vec!["add", "README.md"], vec!["commit", "-m", "fixture"]] {
+            let output = Command::new("git")
+                .args(arguments)
+                .current_dir(path)
+                .output()
+                .expect("Git starts");
+            assert!(
+                output.status.success(),
+                "Git failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
@@ -5735,6 +6100,12 @@ mod tests {
         let temporary = TempDir::new().expect("temporary directory");
         let socket = temporary.path().join("supervisor.sock");
         drop(UnixListener::bind(&socket).expect("supervisor socket"));
+        for _ in 0..20 {
+            if std::os::unix::net::UnixStream::connect(&socket).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         clear_stale_supervisor_socket(&socket).expect("stale socket cleanup");
         assert!(!socket.exists());
     }
