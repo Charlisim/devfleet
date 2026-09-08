@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 18;
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -76,6 +76,7 @@ pub enum StoredLifecycle {
     Failed,
     Degraded,
     Orphaned,
+    Destroyed,
 }
 
 impl StoredLifecycle {
@@ -87,6 +88,7 @@ impl StoredLifecycle {
             Self::Failed => "failed",
             Self::Degraded => "degraded",
             Self::Orphaned => "orphaned",
+            Self::Destroyed => "destroyed",
         }
     }
 
@@ -98,6 +100,7 @@ impl StoredLifecycle {
             "failed" => Ok(Self::Failed),
             "degraded" => Ok(Self::Degraded),
             "orphaned" => Ok(Self::Orphaned),
+            "destroyed" => Ok(Self::Destroyed),
             _ => Err(StateError::InvalidLifecycle),
         }
     }
@@ -169,6 +172,16 @@ pub struct StoredIosDevice {
     pub runtime: String,
     pub device_type: String,
     pub expected_name: String,
+    pub lifecycle: String,
+}
+
+/// Compose ownership retained without environment values or volume contents.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredComposeResource {
+    pub environment_id: Uuid,
+    pub project_name: String,
+    pub worktree: String,
+    pub files: Vec<String>,
     pub lifecycle: String,
 }
 
@@ -535,6 +548,30 @@ impl StateStore {
         Ok(())
     }
 
+    /// Marks an environment destroyed without discarding retained state needed
+    /// for audit, recovery, or an explicitly requested later purge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the observed teardown.
+    pub fn mark_destroyed(&mut self, environment_id: Uuid) -> Result<(), StateError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE environments SET lifecycle = 'destroyed' WHERE id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE processes SET readiness = 'process_stopped' WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE ios_apps SET launched = 0 WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Marks a failed start without deleting retained environment state.
     ///
     /// # Errors
@@ -783,6 +820,97 @@ impl StateStore {
             .query_map(params![environment_id.to_string()], stored_artifact)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(artifacts)
+    }
+
+    /// Keeps evidence metadata but records that an explicit purge removed its
+    /// local files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the purge observation.
+    pub fn mark_artifacts_obsolete(&mut self, environment_id: Uuid) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE artifacts SET obsolete = 1, result = 'purged' WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Persists exact Compose resource ownership after a verified reconcile.
+    /// Environment values and volume contents are intentionally absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the resource record.
+    pub fn record_compose_resource(
+        &mut self,
+        resource: &StoredComposeResource,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO compose_resources (environment_id, project_name, worktree, files_json, lifecycle)
+             VALUES (?1, ?2, ?3, ?4, 'active')
+             ON CONFLICT(environment_id) DO UPDATE SET
+                 project_name = excluded.project_name,
+                 worktree = excluded.worktree,
+                 files_json = excluded.files_json,
+                 lifecycle = 'active'",
+            params![
+                resource.environment_id.to_string(),
+                resource.project_name,
+                resource.worktree,
+                serde_json::to_string(&resource.files)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns Compose resources proven to have been created for this environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot decode retained ownership state.
+    pub fn compose_resource(
+        &self,
+        environment_id: Uuid,
+    ) -> Result<Option<StoredComposeResource>, StateError> {
+        let row = self.connection.query_row(
+            "SELECT environment_id, project_name, worktree, files_json, lifecycle
+             FROM compose_resources WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+            stored_compose_resource,
+        );
+        match row {
+            Ok(resource) => Ok(Some(resource)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(StateError::Sqlite(error)),
+        }
+    }
+
+    /// Retains Compose ownership metadata after its project-scoped teardown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the teardown observation.
+    pub fn mark_compose_destroyed(&mut self, environment_id: Uuid) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE compose_resources SET lifecycle = 'destroyed' WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Quarantines a Compose record whose project or file boundaries no longer
+    /// prove that it is safe to destroy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the quarantine.
+    pub fn mark_compose_uncertain(&mut self, environment_id: Uuid) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE compose_resources SET lifecycle = 'uncertain' WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        Ok(())
     }
 
     /// Returns phase-specific bindings without reading private values.
@@ -1651,8 +1779,23 @@ impl StateStore {
         if version < 18 {
             self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS identity_verifications (environment_id TEXT PRIMARY KEY REFERENCES environments(id), generation INTEGER NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL); PRAGMA user_version = 18; COMMIT;")?;
         }
+        if version < 19 {
+            self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS compose_resources (environment_id TEXT PRIMARY KEY REFERENCES environments(id), project_name TEXT NOT NULL UNIQUE, worktree TEXT NOT NULL, files_json TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active'); PRAGMA user_version = 19; COMMIT;")?;
+        }
         Ok(())
     }
+}
+
+fn stored_compose_resource(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredComposeResource> {
+    Ok(StoredComposeResource {
+        environment_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        project_name: row.get(1)?,
+        worktree: row.get(2)?,
+        files: serde_json::from_str(&row.get::<_, String>(3)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        lifecycle: row.get(4)?,
+    })
 }
 
 fn stored_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBinding> {
@@ -2198,6 +2341,44 @@ mod tests {
         assert_eq!(
             store.artifacts(environment.id).expect("artifacts read"),
             vec![artifact]
+        );
+    }
+
+    #[test]
+    fn retains_destroyed_compose_metadata_and_environment_history() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let environment = environment();
+        store
+            .record_start_intent(&environment, Uuid::now_v7())
+            .expect("environment persists");
+        let resource = StoredComposeResource {
+            environment_id: environment.id,
+            project_name: "devfleet-project-environment".into(),
+            worktree: "/private/worktree".into(),
+            files: vec!["/private/worktree/compose.yaml".into()],
+            lifecycle: "active".into(),
+        };
+        store
+            .record_compose_resource(&resource)
+            .expect("Compose ownership persists");
+        store
+            .mark_compose_destroyed(environment.id)
+            .expect("Compose teardown persists");
+        store
+            .mark_destroyed(environment.id)
+            .expect("environment teardown persists");
+        let resource = store
+            .compose_resource(environment.id)
+            .expect("Compose resource reads")
+            .expect("Compose resource retained");
+        assert_eq!(resource.lifecycle, "destroyed");
+        assert_eq!(
+            store
+                .environment(environment.id)
+                .expect("environment reads")
+                .expect("environment retained")
+                .lifecycle,
+            StoredLifecycle::Destroyed
         );
     }
 

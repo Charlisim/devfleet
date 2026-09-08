@@ -39,6 +39,7 @@ impl Provider for IosProvider {
                 "device.boot".into(),
                 "device.open".into(),
                 "device.stop".into(),
+                "device.delete".into(),
                 "app.launch".into(),
                 "device.capture".into(),
                 "device.record".into(),
@@ -106,6 +107,17 @@ impl Provider for IosProvider {
                     XCRUN.into(),
                     "simctl".into(),
                     "shutdown".into(),
+                    request.udid,
+                ])
+            }
+            "device.delete" => {
+                let request: UdidRequest = serde_json::from_value(input)
+                    .map_err(|_| PluginError::InvalidCall("invalid device.delete input".into()))?;
+                validate_udid(&request.udid).map_err(|error| plugin_error(&error))?;
+                spawn(vec![
+                    XCRUN.into(),
+                    "simctl".into(),
+                    "delete".into(),
                     request.udid,
                 ])
             }
@@ -490,6 +502,21 @@ mod tests {
         assert!(validate_udid("not-a-device").is_err());
         let result = IosProvider.action("device.open".into(), json!({"udid": "not-a-device"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn delete_action_targets_only_a_valid_pinned_udid() {
+        let udid = "0186D916-7A5C-4E31-8590-C2F502FA2288";
+        let value = IosProvider
+            .action("device.delete".into(), json!({"udid": udid}))
+            .expect("delete command");
+        let command: HostSpawnRequest = serde_json::from_value(value).expect("delete spawn");
+        assert_eq!(command.argv, vec![XCRUN, "simctl", "delete", udid]);
+        assert!(
+            IosProvider
+                .action("device.delete".into(), json!({"udid": "personal"}))
+                .is_err()
+        );
     }
 
     #[test]

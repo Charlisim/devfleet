@@ -2,11 +2,12 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
-    DaemonResponse, DeviceCaptureRequest, EnvironmentPlanRequest, EnvironmentUpRequest,
-    IdentityVerificationStartRequest, InitializationRunRequest, InitializationTask,
-    IosAppRunRequest, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
-    MetroUpRequest, PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest,
-    ProcessSpec, SmokeResponse, SmokeStatus, VerificationMode,
+    DaemonResponse, DestroyAuthorization, DestroyRequest, DeviceCaptureRequest,
+    EnvironmentPlanRequest, EnvironmentUpRequest, IdentityVerificationStartRequest,
+    InitializationRunRequest, InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest,
+    IosSimulatorAction, IosSimulatorActionRequest, MetroUpRequest,
+    PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec,
+    SmokeResponse, SmokeStatus, VerificationMode,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -39,6 +40,7 @@ enum Command {
     Status { environment_id: Uuid },
     List,
     Stop { environment_id: Uuid },
+    Destroy(DestroyArgs),
     Operation(OperationArgs),
     Events(EventsArgs),
     Logs(LogsArgs),
@@ -332,6 +334,22 @@ struct UpArgs {
     environment: Vec<String>,
     #[arg(last = true, required = true)]
     argv: Vec<String>,
+}
+
+#[derive(ClapArgs)]
+#[allow(clippy::struct_excessive_bools)]
+struct DestroyArgs {
+    environment_id: Uuid,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long, conflicts_with = "non_interactive")]
+    confirm: bool,
+    #[arg(long)]
+    non_interactive: bool,
+    #[arg(long)]
+    purge_data: bool,
+    #[arg(long)]
+    purge_artifacts: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -637,6 +655,26 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
         Command::Stop { environment_id } => Ok(DaemonRequest::Stop { environment_id }),
+        Command::Destroy(destroy) => {
+            let authorization = match (destroy.confirm, destroy.non_interactive) {
+                (true, false) => DestroyAuthorization::Confirmed,
+                (false, true) => DestroyAuthorization::Noninteractive,
+                (false, false) => DestroyAuthorization::None,
+                (true, true) => unreachable!("clap rejects conflicting destroy flags"),
+            };
+            if !destroy.dry_run && authorization == DestroyAuthorization::None {
+                anyhow::bail!(
+                    "destroy requires --confirm or --non-interactive; use --dry-run to preview"
+                );
+            }
+            Ok(DaemonRequest::Destroy(DestroyRequest {
+                environment_id: destroy.environment_id,
+                dry_run: destroy.dry_run,
+                authorization,
+                purge_data: destroy.purge_data,
+                purge_artifacts: destroy.purge_artifacts,
+            }))
+        }
         Command::Operation(operation) => match operation.command {
             OperationCommand::Get { operation_id } => {
                 Ok(DaemonRequest::OperationGet { operation_id })
@@ -899,6 +937,21 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
             "{:?} {} obsolete={}",
             artifact.kind, artifact.path, artifact.obsolete
         ),
+        DaemonResponse::Destroy(destroy) => {
+            println!(
+                "destroy {} dry_run={}",
+                destroy.environment_id, destroy.dry_run
+            );
+            for target in &destroy.targets {
+                println!("{} {} {:?}", target.kind, target.identifier, target.status);
+            }
+            for retained in &destroy.retained {
+                println!("retained {retained}");
+            }
+            for purged in &destroy.purged {
+                println!("purged {purged}");
+            }
+        }
     }
     Ok(())
 }
@@ -911,6 +964,39 @@ mod tests {
     fn rejects_duplicate_or_malformed_environment_entries() {
         assert!(parse_environment(vec!["A=1".into(), "A=2".into()]).is_err());
         assert!(parse_environment(vec!["missing".into()]).is_err());
+    }
+
+    #[test]
+    fn destroy_requires_authorization_except_for_a_preview() {
+        let environment_id = Uuid::now_v7();
+        assert!(
+            request_from(Command::Destroy(DestroyArgs {
+                environment_id,
+                dry_run: false,
+                confirm: false,
+                non_interactive: false,
+                purge_data: false,
+                purge_artifacts: false,
+            }))
+            .is_err()
+        );
+        let request = request_from(Command::Destroy(DestroyArgs {
+            environment_id,
+            dry_run: true,
+            confirm: false,
+            non_interactive: false,
+            purge_data: false,
+            purge_artifacts: false,
+        }))
+        .expect("preview request builds");
+        assert!(matches!(
+            request,
+            DaemonRequest::Destroy(DestroyRequest {
+                dry_run: true,
+                authorization: DestroyAuthorization::None,
+                ..
+            })
+        ));
     }
 
     #[test]

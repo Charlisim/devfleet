@@ -1,9 +1,9 @@
 use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, BindingIntegration, BindingInvalidation, BindingPhase, DaemonRequest,
-    DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
-    InitializationTask, InitializationTaskKind, LifecycleState, ProcessSpec, ReadinessState,
-    TaskRerunPolicy,
+    DaemonResponse, DestroyAuthorization, DestroyRequest, DestroyTargetStatus,
+    EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest, InitializationTask,
+    InitializationTaskKind, LifecycleState, ProcessSpec, ReadinessState, TaskRerunPolicy,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -360,6 +360,131 @@ fn client_reconnects_to_the_same_owned_process_and_stop_preserves_data() {
 
     unrelated.kill().expect("unrelated cleanup");
     unrelated.wait().expect("unrelated reaps");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn destroy_is_explicit_scoped_idempotent_and_rejects_symlinked_artifacts() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let first = up_environment(&fixture.socket, temporary.path(), "destroy-first");
+    let second = up_environment(&fixture.socket, temporary.path(), "destroy-second");
+    let artifacts = fixture.state_dir.join("artifacts").join(first.to_string());
+    fs::create_dir_all(&artifacts).expect("artifact directory");
+    fs::write(artifacts.join("evidence.png"), "fixture").expect("artifact writes");
+
+    let dry_run = request(
+        &fixture.socket,
+        DaemonRequest::Destroy(DestroyRequest {
+            environment_id: first,
+            dry_run: true,
+            authorization: DestroyAuthorization::None,
+            purge_data: false,
+            purge_artifacts: false,
+        }),
+    )
+    .expect("destroy preview");
+    let DaemonResponse::Destroy(dry_run) = dry_run else {
+        panic!("expected destroy preview");
+    };
+    assert!(dry_run
+        .targets
+        .iter()
+        .any(|target| target.kind == "process" && target.status == DestroyTargetStatus::Planned));
+    assert!(
+        request(
+            &fixture.socket,
+            DaemonRequest::Destroy(DestroyRequest {
+                environment_id: first,
+                dry_run: false,
+                authorization: DestroyAuthorization::None,
+                purge_data: false,
+                purge_artifacts: false,
+            }),
+        )
+        .is_err()
+    );
+
+    let destroyed = request(
+        &fixture.socket,
+        DaemonRequest::Destroy(DestroyRequest {
+            environment_id: first,
+            dry_run: false,
+            authorization: DestroyAuthorization::Confirmed,
+            purge_data: true,
+            purge_artifacts: true,
+        }),
+    )
+    .expect("owned environment destroys");
+    let DaemonResponse::Destroy(destroyed) = destroyed else {
+        panic!("expected destroy result");
+    };
+    assert!(
+        destroyed
+            .targets
+            .iter()
+            .any(|target| target.kind == "process"
+                && target.status == DestroyTargetStatus::Destroyed)
+    );
+    assert!(!artifacts.exists());
+    let DaemonResponse::Environment(first_status) = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: first,
+        },
+    )
+    .expect("destroyed status") else {
+        panic!("expected environment status");
+    };
+    assert_eq!(first_status.lifecycle, LifecycleState::Destroyed);
+    let DaemonResponse::Environment(second_status) = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: second,
+        },
+    )
+    .expect("other environment status") else {
+        panic!("expected other environment status");
+    };
+    assert_eq!(second_status.lifecycle, LifecycleState::Running);
+    request(
+        &fixture.socket,
+        DaemonRequest::Destroy(DestroyRequest {
+            environment_id: first,
+            dry_run: false,
+            authorization: DestroyAuthorization::Confirmed,
+            purge_data: true,
+            purge_artifacts: true,
+        }),
+    )
+    .expect("destroy retry is idempotent");
+
+    let malicious = up_environment(&fixture.socket, temporary.path(), "destroy-malicious");
+    let external = temporary.path().join("foreign-evidence");
+    fs::create_dir_all(&external).expect("foreign directory");
+    fs::write(external.join("keep.txt"), "foreign").expect("foreign artifact");
+    let malicious_root = fixture.state_dir.join("artifacts");
+    std::os::unix::fs::symlink(&external, malicious_root.join(malicious.to_string()))
+        .expect("malicious link");
+    assert!(
+        request(
+            &fixture.socket,
+            DaemonRequest::Destroy(DestroyRequest {
+                environment_id: malicious,
+                dry_run: false,
+                authorization: DestroyAuthorization::Confirmed,
+                purge_data: false,
+                purge_artifacts: true,
+            }),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(external.join("keep.txt")).expect("foreign artifact remains"),
+        "foreign"
+    );
+    stop(&fixture.socket, second);
 }
 
 #[test]

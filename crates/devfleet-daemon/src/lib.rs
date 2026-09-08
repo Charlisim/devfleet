@@ -8,9 +8,10 @@ use devfleet_core::{
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
     ArtifactKind, ArtifactSnapshot, BindingApplyRequest, BindingIntegration, BindingInvalidation,
-    BindingPhase, BindingSnapshot, ComposeReconcileRequest, ComposeUpRequest, DaemonRequest,
-    DaemonResponse, DeviceCaptureRequest, EndpointSnapshot, EnvironmentPlanSnapshot,
-    EnvironmentReadiness, EnvironmentSnapshot, ErrorCode, EventSnapshot,
+    BindingPhase, BindingSnapshot, ComposeDestroyRequest, ComposeReconcileRequest,
+    ComposeUpRequest, DaemonRequest, DaemonResponse, DestroyAuthorization, DestroyRequest,
+    DestroySnapshot, DestroyTarget, DestroyTargetStatus, DeviceCaptureRequest, EndpointSnapshot,
+    EnvironmentPlanSnapshot, EnvironmentReadiness, EnvironmentSnapshot, ErrorCode, EventSnapshot,
     IdentityVerificationSnapshot, IdentityVerificationStartRequest, InitializationRunRequest,
     InitializationTask, InitializationTaskKind, InitializationTaskSnapshot,
     InitializationTaskStatus, IosAppRunRequest, IosAppSnapshot, IosSimulatorAcquireRequest,
@@ -24,10 +25,10 @@ use devfleet_protocol::{
     VerificationMode, read_json_line, write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredArtifact, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
-    StoredIdentityVerification, StoredInitializationTask, StoredIosApp, StoredIosDevice,
-    StoredLifecycle, StoredOperation, StoredPreparationTask, StoredProcess, StoredReadiness,
-    VerifiedGitContext,
+    StateStore, StoredArtifact, StoredBinding, StoredComposeResource, StoredEndpoint,
+    StoredEnvironment, StoredEvent, StoredIdentityVerification, StoredInitializationTask,
+    StoredIosApp, StoredIosDevice, StoredLifecycle, StoredOperation, StoredPreparationTask,
+    StoredProcess, StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -115,6 +116,7 @@ struct IosDiscovery {
 struct IosDiscoveredDevice {
     udid: String,
     name: String,
+    runtime: String,
     available: bool,
     state: String,
 }
@@ -200,6 +202,7 @@ impl Daemon {
                 self.identity_verification_status(environment_id)
             }
             DaemonRequest::DeviceCapture(request) => self.device_capture(&request),
+            DaemonRequest::Destroy(request) => self.destroy(&request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -702,6 +705,13 @@ impl Daemon {
             endpoints: stored_compose_endpoints(&request.endpoints),
         };
         let operation_id = Uuid::now_v7();
+        let compose_resource = StoredComposeResource {
+            environment_id: environment.id,
+            project_name: compose_project_name(environment.project_id, environment.id),
+            worktree: request.worktree.clone(),
+            files: request.files.clone(),
+            lifecycle: "active".into(),
+        };
         self.state.record_start_intent(&environment, operation_id)?;
         self.emit_event(
             environment.id,
@@ -731,7 +741,7 @@ impl Daemon {
                 operation_id,
                 environment_id: environment.id,
                 worktree: request.worktree,
-                project_name: compose_project_name(environment.project_id, environment.id),
+                project_name: compose_resource.project_name.clone(),
                 files: request.files,
                 environment: request.environment,
                 endpoints: request.endpoints,
@@ -750,6 +760,7 @@ impl Daemon {
         let process = supervisor_process(response)?;
         self.state
             .record_running_process(environment.id, &stored_process(&process))?;
+        self.state.record_compose_resource(&compose_resource)?;
         self.emit_event(
             environment.id,
             environment.generation,
@@ -1930,6 +1941,313 @@ impl Daemon {
         self.status(environment_id)
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn destroy(&mut self, request: &DestroyRequest) -> Result<DaemonResponse, DaemonError> {
+        if !request.dry_run && request.authorization == DestroyAuthorization::None {
+            return Err(DaemonError::InvalidConfig(
+                "destroy requires explicit confirmation or noninteractive authorization".into(),
+            ));
+        }
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let compose = self.state.compose_resource(environment.id)?;
+        let device = self.state.ios_device(environment.id)?;
+        let active_compose = compose
+            .as_ref()
+            .is_some_and(|resource| resource.lifecycle == "active");
+        if compose
+            .as_ref()
+            .is_some_and(|resource| resource.lifecycle == "uncertain")
+        {
+            return Err(DaemonError::OwnershipUncertain);
+        }
+        let active_device = device
+            .as_ref()
+            .is_some_and(|resource| resource.lifecycle != "destroyed");
+        if device
+            .as_ref()
+            .is_some_and(|resource| resource.lifecycle == "uncertain")
+        {
+            return Err(DaemonError::OwnershipUncertain);
+        }
+        let active_process = environment
+            .process
+            .as_ref()
+            .is_some_and(|process| process.readiness == StoredReadiness::ProcessAlive);
+        let mut targets = Vec::new();
+        if environment.process.is_some() {
+            targets.push(DestroyTarget {
+                kind: "process".into(),
+                identifier: environment.id.to_string(),
+                status: if active_process {
+                    DestroyTargetStatus::Planned
+                } else {
+                    DestroyTargetStatus::Destroyed
+                },
+            });
+        }
+        if let Some(resource) = &compose {
+            targets.push(DestroyTarget {
+                kind: "compose_project".into(),
+                identifier: resource.project_name.clone(),
+                status: if active_compose {
+                    DestroyTargetStatus::Planned
+                } else {
+                    DestroyTargetStatus::Destroyed
+                },
+            });
+        }
+        if let Some(resource) = &device {
+            targets.push(DestroyTarget {
+                kind: "ios_simulator".into(),
+                identifier: resource.udid.clone().unwrap_or_else(|| "unbound".into()),
+                status: if active_device {
+                    DestroyTargetStatus::Planned
+                } else {
+                    DestroyTargetStatus::Destroyed
+                },
+            });
+        }
+        if request.purge_artifacts {
+            targets.push(DestroyTarget {
+                kind: "artifacts".into(),
+                identifier: environment.id.to_string(),
+                status: DestroyTargetStatus::Planned,
+            });
+        }
+        if request.purge_data {
+            targets.push(DestroyTarget {
+                kind: "recoverable_data".into(),
+                identifier: environment.id.to_string(),
+                status: DestroyTargetStatus::Planned,
+            });
+        }
+        let mut retained = Vec::new();
+        if !request.purge_data {
+            retained.push("state metadata, logs, and native build data".into());
+        }
+        if !request.purge_artifacts {
+            retained.push("device evidence artifacts and provenance metadata".into());
+        }
+        if !request.purge_data {
+            retained.push("Compose volumes".into());
+        }
+        retained.push("Compose images".into());
+        if request.dry_run {
+            return Ok(DaemonResponse::Destroy(DestroySnapshot {
+                environment_id: environment.id,
+                dry_run: true,
+                targets,
+                retained,
+                purged: Vec::new(),
+            }));
+        }
+
+        let process = environment.process.clone();
+        if active_compose || active_device {
+            let process = process.as_ref().ok_or(DaemonError::OwnershipUncertain)?;
+            let observed = supervisor_process(request_supervisor(
+                Path::new(&process.supervisor_socket),
+                SupervisorRequest::Inspect,
+            )?)?;
+            if observed.readiness != ReadinessState::ProcessAlive {
+                return Err(DaemonError::OwnershipUncertain);
+            }
+        }
+
+        if let Some(resource) = compose
+            .as_ref()
+            .filter(|resource| resource.lifecycle == "active")
+            && validate_compose_ownership(&environment, resource).is_err()
+        {
+            self.state.mark_compose_uncertain(environment.id)?;
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                None,
+                "ownership_uncertain",
+            )?;
+            return Err(DaemonError::OwnershipUncertain);
+        }
+
+        if active_device {
+            let device = device.as_ref().ok_or(DaemonError::OwnershipUncertain)?;
+            let Some(udid) = device.udid.as_ref() else {
+                self.state.set_ios_lifecycle(environment.id, "uncertain")?;
+                self.emit_event(
+                    environment.id,
+                    environment.generation,
+                    None,
+                    "ownership_uncertain",
+                )?;
+                return Err(DaemonError::OwnershipUncertain);
+            };
+            let plugin = self.trusted_plugin("official.ios", "device.discover")?;
+            let discovery = Self::ios_discovery(&plugin)?;
+            let owned = discovery.devices.iter().any(|candidate| {
+                candidate.udid.eq_ignore_ascii_case(udid)
+                    && candidate.name == device.expected_name
+                    && candidate.runtime == device.runtime
+                    && candidate.available
+            });
+            if !owned {
+                self.state.set_ios_lifecycle(environment.id, "uncertain")?;
+                self.emit_event(
+                    environment.id,
+                    environment.generation,
+                    None,
+                    "ownership_uncertain",
+                )?;
+                return Err(DaemonError::OwnershipUncertain);
+            }
+        }
+
+        let mut purged = Vec::new();
+        if let Some(resource) = compose.filter(|resource| resource.lifecycle == "active") {
+            self.trusted_plugin("official.compose", "compose.destroy")?;
+            let process = process.as_ref().ok_or(DaemonError::OwnershipUncertain)?;
+            Self::run_destroy_task(
+                process,
+                "official.compose",
+                "compose.destroy",
+                serde_json::to_value(ComposeDestroyRequest {
+                    worktree: resource.worktree,
+                    project_name: resource.project_name,
+                    files: resource.files,
+                    purge_data: request.purge_data,
+                })
+                .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?,
+            )?;
+            self.state.mark_compose_destroyed(environment.id)?;
+            mark_destroy_target(
+                &mut targets,
+                "compose_project",
+                DestroyTargetStatus::Destroyed,
+            );
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                None,
+                "compose_destroyed",
+            )?;
+            if request.purge_data {
+                purged.push("Compose volumes".into());
+            }
+        }
+
+        if let Some(device) = device.filter(|resource| resource.lifecycle != "destroyed") {
+            let udid = device.udid.ok_or(DaemonError::OwnershipUncertain)?;
+            let process = process.as_ref().ok_or(DaemonError::OwnershipUncertain)?;
+            let result = Self::run_destroy_task(
+                process,
+                "official.ios",
+                "device.stop",
+                serde_json::json!({"udid": udid}),
+            )
+            .and_then(|()| {
+                Self::run_destroy_task(
+                    process,
+                    "official.ios",
+                    "device.delete",
+                    serde_json::json!({"udid": udid}),
+                )
+            });
+            if let Err(error) = result {
+                self.state.set_ios_lifecycle(environment.id, "uncertain")?;
+                return Err(error);
+            }
+            self.state.set_ios_lifecycle(environment.id, "destroyed")?;
+            mark_destroy_target(
+                &mut targets,
+                "ios_simulator",
+                DestroyTargetStatus::Destroyed,
+            );
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                None,
+                "ios_device_destroyed",
+            )?;
+        }
+
+        if active_process {
+            let process = process.as_ref().ok_or(DaemonError::OwnershipUncertain)?;
+            let observed = supervisor_process(request_supervisor(
+                Path::new(&process.supervisor_socket),
+                SupervisorRequest::Stop,
+            )?)?;
+            if observed.readiness != ReadinessState::ProcessStopped {
+                return Err(DaemonError::Operation(
+                    "supervisor did not reap process during destroy".into(),
+                ));
+            }
+            remove_supervisor_socket(&process.supervisor_socket)?;
+            mark_destroy_target(&mut targets, "process", DestroyTargetStatus::Destroyed);
+        }
+
+        if request.purge_artifacts {
+            if remove_owned_state_directory(&self.config.state_dir, "artifacts", environment.id)? {
+                purged.push("device evidence artifacts".into());
+            }
+            self.state.mark_artifacts_obsolete(environment.id)?;
+            mark_destroy_target(&mut targets, "artifacts", DestroyTargetStatus::Destroyed);
+        }
+        if request.purge_data {
+            for category in ["logs", "ios-builds"] {
+                if remove_owned_state_directory(&self.config.state_dir, category, environment.id)? {
+                    purged.push(format!("{category}/{}", environment.id));
+                }
+            }
+            mark_destroy_target(
+                &mut targets,
+                "recoverable_data",
+                DestroyTargetStatus::Destroyed,
+            );
+        }
+        self.state.mark_destroyed(environment.id)?;
+        self.emit_event(environment.id, environment.generation, None, "destroyed")?;
+        Ok(DaemonResponse::Destroy(DestroySnapshot {
+            environment_id: environment.id,
+            dry_run: false,
+            targets,
+            retained,
+            purged,
+        }))
+    }
+
+    fn run_destroy_task(
+        process: &StoredProcess,
+        plugin_id: &str,
+        capability: &str,
+        input: serde_json::Value,
+    ) -> Result<(), DaemonError> {
+        match request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::RunPluginTask {
+                operation_id: Uuid::now_v7(),
+                plugin_id: plugin_id.into(),
+                action: PluginAction::Action {
+                    name: capability.into(),
+                    input,
+                },
+                timeout_seconds: None,
+            },
+        )? {
+            SupervisorResponse::TaskOutput { .. } => Ok(()),
+            SupervisorResponse::TaskFailed { stderr, .. } => Err(DaemonError::Operation(format!(
+                "{capability} failed: {stderr}"
+            ))),
+            SupervisorResponse::TaskTimedOut => {
+                Err(DaemonError::Operation(format!("{capability} timed out")))
+            }
+            _ => Err(DaemonError::Operation(format!(
+                "supervisor returned an invalid {capability} response"
+            ))),
+        }
+    }
+
     fn operation_get(&self, operation_id: Uuid) -> Result<DaemonResponse, DaemonError> {
         let operation = self
             .state
@@ -2142,7 +2460,10 @@ impl Daemon {
             .into_iter()
             .filter(|plugin| {
                 plugin.trusted
-                    && matches!(plugin.id.as_str(), "official.ios" | "official.react-native")
+                    && matches!(
+                        plugin.id.as_str(),
+                        "official.compose" | "official.ios" | "official.react-native"
+                    )
             })
             .map(|plugin| {
                 self.verify_plugin_lock(&plugin)?;
@@ -2840,6 +3161,130 @@ fn remove_generated_artifact(path: &Path) {
     }
 }
 
+fn mark_destroy_target(targets: &mut [DestroyTarget], kind: &str, status: DestroyTargetStatus) {
+    if let Some(target) = targets.iter_mut().find(|target| target.kind == kind) {
+        target.status = status;
+    }
+}
+
+fn validate_compose_ownership(
+    environment: &StoredEnvironment,
+    resource: &StoredComposeResource,
+) -> Result<(), DaemonError> {
+    if resource.environment_id != environment.id
+        || resource.project_name != compose_project_name(environment.project_id, environment.id)
+    {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    let environment_worktree = Path::new(&environment.worktree)
+        .canonicalize()
+        .map_err(|_| DaemonError::OwnershipUncertain)?;
+    let worktree = Path::new(&resource.worktree)
+        .canonicalize()
+        .map_err(|_| DaemonError::OwnershipUncertain)?;
+    if worktree != environment_worktree || resource.files.is_empty() {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    for file in &resource.files {
+        let file = Path::new(file);
+        let metadata = file
+            .symlink_metadata()
+            .map_err(|_| DaemonError::OwnershipUncertain)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(DaemonError::OwnershipUncertain);
+        }
+        let file = file
+            .canonicalize()
+            .map_err(|_| DaemonError::OwnershipUncertain)?;
+        if !file.starts_with(&worktree) {
+            return Err(DaemonError::OwnershipUncertain);
+        }
+    }
+    Ok(())
+}
+
+fn remove_owned_state_directory(
+    state_dir: &Path,
+    category: &str,
+    environment_id: Uuid,
+) -> Result<bool, DaemonError> {
+    let root = state_dir.join(category);
+    if !root.exists() {
+        return Ok(false);
+    }
+    let root_metadata = root
+        .symlink_metadata()
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    let target = root.join(environment_id.to_string());
+    if !target.exists() {
+        return Ok(false);
+    }
+    let target_metadata = target
+        .symlink_metadata()
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    if !target_metadata.is_dir() || target_metadata.file_type().is_symlink() {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    validate_owned_tree(&target, &root)?;
+    remove_owned_tree(&target, &root)?;
+    Ok(true)
+}
+
+fn validate_owned_tree(path: &Path, root: &Path) -> Result<(), DaemonError> {
+    if !path.starts_with(root) {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    if metadata.is_dir() {
+        for entry in
+            fs::read_dir(path).map_err(|error| DaemonError::Operation(error.to_string()))?
+        {
+            let entry = entry.map_err(|error| DaemonError::Operation(error.to_string()))?;
+            validate_owned_tree(&entry.path(), root)?;
+        }
+    } else if !metadata.is_file() {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    Ok(())
+}
+
+fn remove_owned_tree(path: &Path, root: &Path) -> Result<(), DaemonError> {
+    if !path.starts_with(root) {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    if metadata.is_dir() {
+        for entry in
+            fs::read_dir(path).map_err(|error| DaemonError::Operation(error.to_string()))?
+        {
+            let entry = entry.map_err(|error| DaemonError::Operation(error.to_string()))?;
+            remove_owned_tree(&entry.path(), root)?;
+        }
+        fs::remove_dir(path).map_err(|error| DaemonError::Operation(error.to_string()))?;
+    } else if metadata.is_file() {
+        fs::remove_file(path).map_err(|error| DaemonError::Operation(error.to_string()))?;
+    } else {
+        return Err(DaemonError::OwnershipUncertain);
+    }
+    Ok(())
+}
+
 fn artifact_snapshot(artifact: StoredArtifact) -> ArtifactSnapshot {
     let kind = match artifact.kind.as_str() {
         "recording" => ArtifactKind::Recording,
@@ -2958,6 +3403,7 @@ fn snapshot(environment: StoredEnvironment, inputs: SnapshotInputs) -> Environme
         StoredLifecycle::Failed => LifecycleState::Failed,
         StoredLifecycle::Degraded => LifecycleState::Degraded,
         StoredLifecycle::Orphaned => LifecycleState::Orphaned,
+        StoredLifecycle::Destroyed => LifecycleState::Destroyed,
     };
     let probe_health = matches!(
         lifecycle,
@@ -3055,6 +3501,7 @@ fn ios_snapshot(device: StoredIosDevice) -> Result<IosSimulatorSnapshot, DaemonE
         "booted" => IosSimulatorLifecycle::Booted,
         "stopped" => IosSimulatorLifecycle::Stopped,
         "uncertain" => IosSimulatorLifecycle::Uncertain,
+        "destroyed" => IosSimulatorLifecycle::Destroyed,
         _ => return Err(DaemonError::OwnershipUncertain),
     };
     Ok(IosSimulatorSnapshot {
@@ -3555,6 +4002,55 @@ mod tests {
     use super::*;
     use std::{fs, net::TcpListener, os::unix::net::UnixListener};
     use tempfile::TempDir;
+
+    #[test]
+    fn compose_destroy_rejects_project_or_symlink_boundary_changes() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let compose = temporary.path().join("compose.yaml");
+        fs::write(&compose, "services: {}\n").expect("Compose fixture");
+        let environment = destroy_environment(temporary.path());
+        let resource = StoredComposeResource {
+            environment_id: environment.id,
+            project_name: compose_project_name(environment.project_id, environment.id),
+            worktree: environment.worktree.clone(),
+            files: vec![compose.display().to_string()],
+            lifecycle: "active".into(),
+        };
+        validate_compose_ownership(&environment, &resource).expect("owned Compose validates");
+        let external = TempDir::new().expect("external directory");
+        let external_file = external.path().join("compose.yaml");
+        fs::write(&external_file, "services: {}\n").expect("external fixture");
+        fs::remove_file(&compose).expect("replace Compose fixture");
+        std::os::unix::fs::symlink(&external_file, &compose).expect("malicious link");
+        assert!(matches!(
+            validate_compose_ownership(&environment, &resource),
+            Err(DaemonError::OwnershipUncertain)
+        ));
+    }
+
+    fn destroy_environment(worktree: &Path) -> StoredEnvironment {
+        StoredEnvironment {
+            id: Uuid::now_v7(),
+            key: "destroy-fixture".into(),
+            project_id: Uuid::now_v7(),
+            worktree_id: Uuid::now_v7(),
+            project_fingerprint: "project".into(),
+            worktree_fingerprint: "worktree".into(),
+            common_git_dir: String::new(),
+            git_dir: String::new(),
+            worktree: worktree.display().to_string(),
+            profile: "compose".into(),
+            instance: None,
+            head: String::new(),
+            branch: None,
+            detached: false,
+            generation: 1,
+            lifecycle: StoredLifecycle::Running,
+            reconciliation_diagnostic: None,
+            process: None,
+            endpoints: Vec::new(),
+        }
+    }
 
     #[test]
     fn removes_a_verified_stopped_supervisor_socket_idempotently() {

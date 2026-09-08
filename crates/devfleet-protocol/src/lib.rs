@@ -128,6 +128,33 @@ pub struct ComposeUpRequest {
     pub authorizations: ComposeAuthorizations,
 }
 
+/// An explicitly authorized teardown request. `dry_run` never invokes a
+/// provider or removes local state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DestroyRequest {
+    pub environment_id: Uuid,
+    pub dry_run: bool,
+    pub authorization: DestroyAuthorization,
+    pub purge_data: bool,
+    pub purge_artifacts: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestroyAuthorization {
+    None,
+    Confirmed,
+    Noninteractive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComposeDestroyRequest {
+    pub worktree: String,
+    pub project_name: String,
+    pub files: Vec<String>,
+    pub purge_data: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InitializationRunRequest {
     pub environment_id: Uuid,
@@ -341,6 +368,7 @@ pub enum IosSimulatorLifecycle {
     Booted,
     Stopped,
     Uncertain,
+    Destroyed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -443,6 +471,7 @@ pub enum DaemonRequest {
         environment_id: Uuid,
     },
     DeviceCapture(DeviceCaptureRequest),
+    Destroy(DestroyRequest),
     Status {
         environment_id: Uuid,
     },
@@ -500,6 +529,32 @@ pub enum DaemonResponse {
     IosApp(IosAppSnapshot),
     IdentityVerification(IdentityVerificationSnapshot),
     Artifact(ArtifactSnapshot),
+    Destroy(DestroySnapshot),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DestroySnapshot {
+    pub environment_id: Uuid,
+    pub dry_run: bool,
+    pub targets: Vec<DestroyTarget>,
+    pub retained: Vec<String>,
+    pub purged: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DestroyTarget {
+    pub kind: String,
+    pub identifier: String,
+    pub status: DestroyTargetStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestroyTargetStatus {
+    Planned,
+    Destroyed,
+    Retained,
+    OwnershipUncertain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -637,6 +692,7 @@ pub enum LifecycleState {
     Failed,
     Degraded,
     Orphaned,
+    Destroyed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

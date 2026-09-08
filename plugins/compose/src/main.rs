@@ -1,7 +1,8 @@
 use clap::Parser;
 use devfleet_plugin_sdk::{PluginError, Provider, ProviderDescriptor, serve_once};
 use devfleet_protocol::{
-    ComposeAuthorizations, ComposeReconcileRequest, HostSpawnRequest, PROTOCOL_VERSION,
+    ComposeAuthorizations, ComposeDestroyRequest, ComposeReconcileRequest, HostSpawnRequest,
+    PROTOCOL_VERSION,
 };
 use semver::Version;
 use serde_json::Value;
@@ -31,6 +32,7 @@ impl Provider for ComposeProvider {
                 "lifecycle.plan".into(),
                 "lifecycle.inspect".into(),
                 "compose.reconcile".into(),
+                "compose.destroy".into(),
                 "lifecycle.stop".into(),
                 "lifecycle.destroy".into(),
                 "lifecycle.action".into(),
@@ -52,6 +54,21 @@ impl Provider for ComposeProvider {
             argv: compose_spawn_args(&request).map_err(|error| plugin_error(&error))?,
             cwd: request.worktree,
             environment: compose_environment(request.environment),
+        })
+        .map_err(|error| PluginError::RequestFailed(error.to_string()))
+    }
+
+    fn action(&self, name: String, input: Value) -> Result<Value, PluginError> {
+        if name != "compose.destroy" {
+            return Err(PluginError::UnsupportedMethod(name));
+        }
+        let request: ComposeDestroyRequest = serde_json::from_value(input)
+            .map_err(|_| PluginError::InvalidCall("invalid compose.destroy input".into()))?;
+        validate_destroy_request(&request).map_err(|error| plugin_error(&error))?;
+        serde_json::to_value(HostSpawnRequest {
+            argv: compose_destroy_args(&request).map_err(|error| plugin_error(&error))?,
+            cwd: request.worktree,
+            environment: compose_environment(BTreeMap::new()),
         })
         .map_err(|error| PluginError::RequestFailed(error.to_string()))
     }
@@ -250,6 +267,67 @@ fn compose_spawn_args(request: &ComposeReconcileRequest) -> Result<Vec<String>, 
         .map(OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ComposeError::DockerUnavailable)
+}
+
+fn compose_destroy_args(request: &ComposeDestroyRequest) -> Result<Vec<String>, ComposeError> {
+    let mut args = compose_destroy_command_args(request);
+    args.insert(0, docker_executable()?);
+    args.into_iter()
+        .map(OsString::into_string)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ComposeError::DockerUnavailable)
+}
+
+fn compose_destroy_command_args(request: &ComposeDestroyRequest) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("compose"),
+        OsString::from("--project-name"),
+        OsString::from(&request.project_name),
+        OsString::from("--project-directory"),
+        OsString::from(&request.worktree),
+    ];
+    for file in &request.files {
+        args.push(OsString::from("--file"));
+        args.push(OsString::from(file));
+    }
+    args.extend([OsString::from("down"), OsString::from("--remove-orphans")]);
+    if request.purge_data {
+        args.push(OsString::from("--volumes"));
+    }
+    args
+}
+
+fn validate_destroy_request(request: &ComposeDestroyRequest) -> Result<(), ComposeError> {
+    let name = request.project_name.split('_').collect::<Vec<_>>();
+    if !matches!(name.as_slice(), ["df", project, environment]
+        if project.len() == 8
+            && environment.len() == 8
+            && project.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && environment.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(ComposeError::Invalid(
+            "invalid DevFleet Compose project name".into(),
+        ));
+    }
+    let worktree = Path::new(&request.worktree)
+        .canonicalize()
+        .map_err(|_| ComposeError::Invalid("worktree must exist".into()))?;
+    if request.files.is_empty() {
+        return Err(ComposeError::Invalid(
+            "Compose ownership has no files".into(),
+        ));
+    }
+    for file in &request.files {
+        let file = Path::new(file)
+            .canonicalize()
+            .map_err(|_| ComposeError::Invalid("Compose file no longer exists".into()))?;
+        if !file.is_file() || !file.starts_with(&worktree) {
+            return Err(ComposeError::Invalid(
+                "Compose file escaped the owned worktree".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn docker_executable() -> Result<OsString, ComposeError> {
@@ -601,8 +679,49 @@ mod tests {
         assert!(validate_model(&model, &fixture.request).is_err());
     }
 
+    #[test]
+    fn destroy_requires_owned_project_files_and_never_requests_volume_removal() {
+        let fixture = fixture();
+        let request = ComposeDestroyRequest {
+            worktree: fixture.directory.path().display().to_string(),
+            project_name: "df_0123abcd_4567efab".into(),
+            files: vec![
+                fixture
+                    .directory
+                    .path()
+                    .join("compose.yaml")
+                    .display()
+                    .to_string(),
+            ],
+            purge_data: false,
+        };
+        validate_destroy_request(&request).expect("owned request validates");
+        let args = compose_destroy_command_args(&request);
+        assert!(
+            args.windows(2).any(|pair| {
+                pair == [OsString::from("down"), OsString::from("--remove-orphans")]
+            })
+        );
+        assert!(!args.iter().any(|argument| argument == "--volumes"));
+        assert!(
+            compose_destroy_command_args(&ComposeDestroyRequest {
+                purge_data: true,
+                ..request.clone()
+            })
+            .iter()
+            .any(|argument| argument == "--volumes")
+        );
+        assert!(
+            validate_destroy_request(&ComposeDestroyRequest {
+                project_name: "foreign-project".into(),
+                ..request
+            })
+            .is_err()
+        );
+    }
+
     struct Fixture {
-        _directory: TempDir,
+        directory: TempDir,
         request: ComposeReconcileRequest,
     }
 
@@ -634,7 +753,7 @@ mod tests {
                     shared_mutable_binds: None,
                 },
             },
-            _directory: directory,
+            directory,
         }
     }
 }
