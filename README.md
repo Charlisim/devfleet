@@ -10,6 +10,7 @@ native build directory, simulator and evidence trail.
 ```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace
 cargo test --workspace
 ./scripts/check-boundaries.sh
 ```
@@ -38,7 +39,7 @@ specified program, working directory and environment. The command must follow
 
 ```sh
 devfleet --socket /tmp/df-$(id -u)/daemon.sock --json up \
-  --trust --key fixture --worktree "$PWD" --cwd "$PWD" \
+  --trust --worktree "$PWD" --cwd "$PWD" \
   -- /bin/sleep 60
 ```
 

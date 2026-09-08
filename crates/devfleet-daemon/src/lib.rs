@@ -1,5 +1,6 @@
 //! Local daemon: private IPC, persistent state, and supervisor composition.
 
+use devfleet_core::discover_git_worktree;
 use devfleet_protocol::{
     DaemonRequest, DaemonResponse, EnvironmentSnapshot, ErrorCode, JsonRpcRequest, JsonRpcResponse,
     LifecycleState, OperationAccepted, ProcessSnapshot, ReadinessState, RpcFailure,
@@ -7,6 +8,7 @@ use devfleet_protocol::{
 };
 use devfleet_state::{
     StateStore, StoredEnvironment, StoredLifecycle, StoredProcess, StoredReadiness,
+    VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -130,25 +132,70 @@ impl Daemon {
         request: devfleet_protocol::EnvironmentUpRequest,
     ) -> Result<DaemonResponse, DaemonError> {
         validate_up_request(&request)?;
-        let existing = self
-            .state
-            .environments()?
-            .into_iter()
-            .find(|environment| environment.key == request.key);
-        if let Some(environment) = existing {
+        let git_identity = discover_git_worktree(Path::new(&request.worktree))
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let git_context = VerifiedGitContext {
+            common_git_dir: git_identity.common_git_dir.display().to_string(),
+            git_dir: git_identity.git_dir.display().to_string(),
+            worktree: request.worktree.clone(),
+            head: git_identity.head.clone(),
+            branch: git_identity.branch.clone(),
+            detached: git_identity.detached,
+        };
+        let environments = self.state.environments()?;
+        let matching_worktree = environments.iter().find(|environment| {
+            environment.project_fingerprint == git_identity.project_fingerprint
+                && environment.worktree_fingerprint == git_identity.worktree_fingerprint
+        });
+        if let Some(environment) = matching_worktree.filter(|environment| {
+            environment.profile == request.profile && environment.instance == request.instance
+        }) {
+            self.state
+                .update_worktree_context(environment.id, &git_context)?;
             return Ok(DaemonResponse::Accepted(OperationAccepted {
                 operation_id: Uuid::nil(),
                 environment_id: environment.id,
             }));
         }
 
+        let project_id = environments
+            .iter()
+            .find(|environment| environment.project_fingerprint == git_identity.project_fingerprint)
+            .map_or_else(Uuid::now_v7, |environment| environment.project_id);
+        let worktree_id =
+            matching_worktree.map_or_else(Uuid::now_v7, |environment| environment.worktree_id);
+
+        self.state.orphan_replaced_worktree(
+            &request.worktree,
+            &request.profile,
+            request.instance.as_deref(),
+            &git_identity.project_fingerprint,
+            &git_identity.worktree_fingerprint,
+        )?;
+
         let environment = StoredEnvironment {
             id: Uuid::now_v7(),
-            key: request.key,
+            key: environment_key(
+                &git_identity.project_fingerprint,
+                &git_identity.worktree_fingerprint,
+                &request.profile,
+                request.instance.as_deref(),
+            ),
+            project_id,
+            worktree_id,
+            project_fingerprint: git_identity.project_fingerprint,
+            worktree_fingerprint: git_identity.worktree_fingerprint,
+            common_git_dir: git_context.common_git_dir,
+            git_dir: git_context.git_dir,
             worktree: request.worktree,
             profile: request.profile,
+            instance: request.instance,
+            head: git_context.head,
+            branch: git_context.branch,
+            detached: git_context.detached,
             generation: 1,
             lifecycle: StoredLifecycle::Starting,
+            reconciliation_diagnostic: None,
             process: None,
         };
         let operation_id = Uuid::now_v7();
@@ -290,9 +337,14 @@ fn validate_up_request(
     if !request.trusted {
         return Err(DaemonError::TrustRequired);
     }
-    if request.key.is_empty() || request.profile.is_empty() || request.process.argv.is_empty() {
+    if request.profile.is_empty() || request.process.argv.is_empty() {
         return Err(DaemonError::InvalidConfig(
-            "environment key, profile, and argv are required".into(),
+            "profile and argv are required".into(),
+        ));
+    }
+    if request.instance.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::InvalidConfig(
+            "instance names must be nonempty when specified".into(),
         ));
     }
     if !Path::new(&request.worktree).is_dir() || !Path::new(&request.process.cwd).is_dir() {
@@ -306,16 +358,20 @@ fn validate_up_request(
 fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
     EnvironmentSnapshot {
         environment_id: environment.id,
-        key: environment.key,
+        project_id: environment.project_id,
+        worktree_id: environment.worktree_id,
         worktree: environment.worktree,
         profile: environment.profile,
+        instance: environment.instance,
         generation: environment.generation,
         lifecycle: match environment.lifecycle {
             StoredLifecycle::Starting => LifecycleState::Starting,
             StoredLifecycle::Running => LifecycleState::Running,
             StoredLifecycle::Stopped => LifecycleState::Stopped,
             StoredLifecycle::Failed => LifecycleState::Failed,
+            StoredLifecycle::Orphaned => LifecycleState::Orphaned,
         },
+        reconciliation_diagnostic: environment.reconciliation_diagnostic,
         process: environment.process.map(|process| ProcessSnapshot {
             pid: process.pid,
             process_group: process.process_group,
@@ -327,6 +383,18 @@ fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
             },
         }),
     }
+}
+
+fn environment_key(
+    project_fingerprint: &str,
+    worktree_fingerprint: &str,
+    profile: &str,
+    instance: Option<&str>,
+) -> String {
+    format!(
+        "{project_fingerprint}|{worktree_fingerprint}|{profile}|{}",
+        instance.unwrap_or_default()
+    )
 }
 
 fn stored_process(process: &ProcessSnapshot) -> StoredProcess {

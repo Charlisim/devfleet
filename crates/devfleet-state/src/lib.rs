@@ -6,7 +6,7 @@ use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -28,10 +28,21 @@ pub enum StateError {
 pub struct StoredEnvironment {
     pub id: Uuid,
     pub key: String,
+    pub project_id: Uuid,
+    pub worktree_id: Uuid,
+    pub project_fingerprint: String,
+    pub worktree_fingerprint: String,
+    pub common_git_dir: String,
+    pub git_dir: String,
     pub worktree: String,
     pub profile: String,
+    pub instance: Option<String>,
+    pub head: String,
+    pub branch: Option<String>,
+    pub detached: bool,
     pub generation: u64,
     pub lifecycle: StoredLifecycle,
+    pub reconciliation_diagnostic: Option<String>,
     pub process: Option<StoredProcess>,
 }
 
@@ -42,6 +53,7 @@ pub enum StoredLifecycle {
     Running,
     Stopped,
     Failed,
+    Orphaned,
 }
 
 impl StoredLifecycle {
@@ -51,6 +63,7 @@ impl StoredLifecycle {
             Self::Running => "running",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
+            Self::Orphaned => "orphaned",
         }
     }
 
@@ -60,6 +73,7 @@ impl StoredLifecycle {
             "running" => Ok(Self::Running),
             "stopped" => Ok(Self::Stopped),
             "failed" => Ok(Self::Failed),
+            "orphaned" => Ok(Self::Orphaned),
             _ => Err(StateError::InvalidLifecycle),
         }
     }
@@ -96,6 +110,16 @@ pub struct StoredProcess {
     pub started_at_unix_ms: u128,
     pub supervisor_socket: String,
     pub readiness: StoredReadiness,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedGitContext {
+    pub common_git_dir: String,
+    pub git_dir: String,
+    pub worktree: String,
+    pub head: String,
+    pub branch: Option<String>,
+    pub detached: bool,
 }
 
 pub struct StateStore {
@@ -152,20 +176,46 @@ impl StateStore {
             i64::try_from(environment.generation).map_err(|_| StateError::NumericOutOfRange)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO environments (id, environment_key, worktree, profile, generation, lifecycle)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO environments (id, environment_key, project_id, worktree_id,
+                                      project_fingerprint, worktree_fingerprint, common_git_dir,
+                                      git_dir, worktree, profile, instance, head, branch, detached,
+                                      generation, lifecycle,
+                                      reconciliation_diagnostic)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(environment_key) DO UPDATE SET
+                project_id = excluded.project_id,
+                worktree_id = excluded.worktree_id,
+                project_fingerprint = excluded.project_fingerprint,
+                worktree_fingerprint = excluded.worktree_fingerprint,
+                common_git_dir = excluded.common_git_dir,
+                git_dir = excluded.git_dir,
                 worktree = excluded.worktree,
                 profile = excluded.profile,
+                instance = excluded.instance,
+                head = excluded.head,
+                branch = excluded.branch,
+                detached = excluded.detached,
                 generation = excluded.generation,
-                lifecycle = excluded.lifecycle",
+                lifecycle = excluded.lifecycle,
+                reconciliation_diagnostic = excluded.reconciliation_diagnostic",
             params![
                 environment.id.to_string(),
                 environment.key,
+                environment.project_id.to_string(),
+                environment.worktree_id.to_string(),
+                environment.project_fingerprint,
+                environment.worktree_fingerprint,
+                environment.common_git_dir,
+                environment.git_dir,
                 environment.worktree,
                 environment.profile,
+                environment.instance,
+                environment.head,
+                environment.branch,
+                environment.detached,
                 generation,
                 environment.lifecycle.as_db(),
+                environment.reconciliation_diagnostic,
             ],
         )?;
         transaction.execute(
@@ -266,75 +316,86 @@ impl StateStore {
         self.query_environments(None)
     }
 
+    /// Updates verified Git context without changing project or worktree identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the verified location.
+    pub fn update_worktree_context(
+        &mut self,
+        id: Uuid,
+        context: &VerifiedGitContext,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE environments
+             SET common_git_dir = ?1, git_dir = ?2, worktree = ?3,
+                 head = ?4, branch = ?5, detached = ?6
+            WHERE id = ?7",
+            params![
+                context.common_git_dir,
+                context.git_dir,
+                context.worktree,
+                context.head,
+                context.branch,
+                context.detached,
+                id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a same-path but different-Git-identity environment as orphaned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the reconciliation diagnostic.
+    pub fn orphan_replaced_worktree(
+        &mut self,
+        worktree: &str,
+        profile: &str,
+        instance: Option<&str>,
+        project_fingerprint: &str,
+        worktree_fingerprint: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE environments
+             SET lifecycle = 'orphaned',
+                 reconciliation_diagnostic = 'Git administrative identity changed at this path; create or reconcile explicitly.'
+             WHERE worktree = ?1
+               AND profile = ?2
+               AND instance IS ?3
+               AND (project_fingerprint != ?4 OR worktree_fingerprint != ?5)
+               AND lifecycle != 'orphaned'",
+            params![
+                worktree,
+                profile,
+                instance,
+                project_fingerprint,
+                worktree_fingerprint,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn query_environments(&self, id: Option<Uuid>) -> Result<Vec<StoredEnvironment>, StateError> {
         let mut statement = self.connection.prepare(
-            "SELECT e.id, e.environment_key, e.worktree, e.profile, e.generation, e.lifecycle,
-                    p.pid, p.process_group, p.started_at_unix_ms, p.supervisor_socket, p.readiness
+            "SELECT e.id, e.environment_key, e.project_id, e.worktree_id,
+                    e.project_fingerprint, e.worktree_fingerprint, e.common_git_dir, e.git_dir,
+                    e.worktree, e.profile, e.instance, e.head, e.branch, e.detached,
+                    e.generation, e.lifecycle, e.reconciliation_diagnostic, p.pid,
+                    p.process_group, p.started_at_unix_ms, p.supervisor_socket, p.readiness
              FROM environments e
              LEFT JOIN processes p ON p.environment_id = e.id
              WHERE (?1 IS NULL OR e.id = ?1)
              ORDER BY e.created_at ASC",
         )?;
         let id = id.map(|value| value.to_string());
-        let rows = statement.query_map(params![id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<i32>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (
-                id,
-                key,
-                worktree,
-                profile,
-                generation,
-                lifecycle,
-                pid,
-                process_group,
-                started_at,
-                supervisor_socket,
-                readiness,
-            ) = row?;
-            let process = match (pid, process_group, started_at, supervisor_socket, readiness) {
-                (
-                    Some(pid),
-                    Some(process_group),
-                    Some(started_at),
-                    Some(supervisor_socket),
-                    Some(readiness),
-                ) => Some(StoredProcess {
-                    pid: pid.try_into().map_err(|_| StateError::InvalidUuid)?,
-                    process_group,
-                    started_at_unix_ms: started_at.parse().map_err(|_| StateError::InvalidUuid)?,
-                    supervisor_socket,
-                    readiness: StoredReadiness::from_db(&readiness)?,
-                }),
-                (None, None, None, None, None) => None,
-                _ => return Err(StateError::InvalidReadiness),
-            };
-            Ok(StoredEnvironment {
-                id: Uuid::parse_str(&id).map_err(|_| StateError::InvalidUuid)?,
-                key,
-                worktree,
-                profile,
-                generation: generation
-                    .try_into()
-                    .map_err(|_| StateError::InvalidLifecycle)?,
-                lifecycle: StoredLifecycle::from_db(&lifecycle)?,
-                process,
-            })
-        })
-        .collect()
+        let mut rows = statement.query(params![id])?;
+        let mut environments = Vec::new();
+        while let Some(row) = rows.next()? {
+            environments.push(stored_environment(row)?);
+        }
+        Ok(environments)
     }
 
     fn migrate(&mut self) -> Result<(), StateError> {
@@ -387,8 +448,96 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 3 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 ALTER TABLE environments ADD COLUMN project_id TEXT;
+                 ALTER TABLE environments ADD COLUMN worktree_id TEXT;
+                 ALTER TABLE environments ADD COLUMN project_fingerprint TEXT;
+                 ALTER TABLE environments ADD COLUMN worktree_fingerprint TEXT;
+                 ALTER TABLE environments ADD COLUMN instance TEXT;
+                 ALTER TABLE environments ADD COLUMN reconciliation_diagnostic TEXT;
+                 UPDATE environments
+                 SET project_id = id,
+                     worktree_id = id,
+                     project_fingerprint = 'legacy:' || id,
+                     worktree_fingerprint = 'legacy:' || id,
+                     lifecycle = 'orphaned',
+                     reconciliation_diagnostic = 'Identity metadata predates Git worktree discovery; reconcile explicitly.';
+                 CREATE UNIQUE INDEX IF NOT EXISTS environments_identity
+                 ON environments (project_fingerprint, worktree_fingerprint, profile, instance);
+                 PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
+        if version < 4 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 ALTER TABLE environments ADD COLUMN common_git_dir TEXT;
+                 ALTER TABLE environments ADD COLUMN git_dir TEXT;
+                 ALTER TABLE environments ADD COLUMN head TEXT;
+                 ALTER TABLE environments ADD COLUMN branch TEXT;
+                 ALTER TABLE environments ADD COLUMN detached INTEGER NOT NULL DEFAULT 0;
+                 UPDATE environments
+                 SET common_git_dir = '', git_dir = '', head = '';
+                 PRAGMA user_version = 4;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
+}
+
+fn stored_environment(row: &rusqlite::Row<'_>) -> Result<StoredEnvironment, StateError> {
+    let pid = row.get::<_, Option<i64>>(17)?;
+    let process_group = row.get::<_, Option<i32>>(18)?;
+    let started_at = row.get::<_, Option<String>>(19)?;
+    let supervisor_socket = row.get::<_, Option<String>>(20)?;
+    let readiness = row.get::<_, Option<String>>(21)?;
+    let process = match (pid, process_group, started_at, supervisor_socket, readiness) {
+        (
+            Some(pid),
+            Some(process_group),
+            Some(started_at),
+            Some(supervisor_socket),
+            Some(readiness),
+        ) => Some(StoredProcess {
+            pid: pid.try_into().map_err(|_| StateError::InvalidUuid)?,
+            process_group,
+            started_at_unix_ms: started_at.parse().map_err(|_| StateError::InvalidUuid)?,
+            supervisor_socket,
+            readiness: StoredReadiness::from_db(&readiness)?,
+        }),
+        (None, None, None, None, None) => None,
+        _ => return Err(StateError::InvalidReadiness),
+    };
+    Ok(StoredEnvironment {
+        id: parse_uuid(&row.get::<_, String>(0)?)?,
+        key: row.get(1)?,
+        project_id: parse_uuid(&row.get::<_, String>(2)?)?,
+        worktree_id: parse_uuid(&row.get::<_, String>(3)?)?,
+        project_fingerprint: row.get(4)?,
+        worktree_fingerprint: row.get(5)?,
+        common_git_dir: row.get(6)?,
+        git_dir: row.get(7)?,
+        worktree: row.get(8)?,
+        profile: row.get(9)?,
+        instance: row.get(10)?,
+        head: row.get(11)?,
+        branch: row.get(12)?,
+        detached: row.get(13)?,
+        generation: row
+            .get::<_, i64>(14)?
+            .try_into()
+            .map_err(|_| StateError::InvalidLifecycle)?,
+        lifecycle: StoredLifecycle::from_db(&row.get::<_, String>(15)?)?,
+        reconciliation_diagnostic: row.get(16)?,
+        process,
+    })
+}
+
+fn parse_uuid(value: &str) -> Result<Uuid, StateError> {
+    Uuid::parse_str(value).map_err(|_| StateError::InvalidUuid)
 }
 
 #[cfg(test)]
@@ -399,10 +548,21 @@ mod tests {
         StoredEnvironment {
             id: Uuid::now_v7(),
             key: "fixture".into(),
+            project_id: Uuid::now_v7(),
+            worktree_id: Uuid::now_v7(),
+            project_fingerprint: "1:2".into(),
+            worktree_fingerprint: "1:3".into(),
+            common_git_dir: "/tmp/project/.git".into(),
+            git_dir: "/tmp/project/.git/worktrees/fixture".into(),
             worktree: "/tmp/worktree".into(),
             profile: "process".into(),
+            instance: None,
+            head: "abc".into(),
+            branch: Some("refs/heads/main".into()),
+            detached: false,
             generation: 1,
             lifecycle: StoredLifecycle::Starting,
+            reconciliation_diagnostic: None,
             process: None,
         }
     }
@@ -433,6 +593,61 @@ mod tests {
         assert_eq!(
             observed.process.expect("process exists").readiness,
             StoredReadiness::ProcessStopped
+        );
+    }
+
+    #[test]
+    fn migrates_pre_identity_environments_to_explicit_orphans() {
+        let legacy_id = Uuid::now_v7();
+        let connection = Connection::open_in_memory().expect("legacy database opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE environments (
+                    id TEXT PRIMARY KEY,
+                    environment_key TEXT NOT NULL UNIQUE,
+                    worktree TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    lifecycle TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE TABLE operations (
+                    id TEXT PRIMARY KEY,
+                    environment_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 CREATE TABLE processes (
+                    environment_id TEXT PRIMARY KEY,
+                    pid INTEGER NOT NULL,
+                    process_group INTEGER NOT NULL,
+                    started_at_unix_ms TEXT NOT NULL,
+                    supervisor_socket TEXT NOT NULL,
+                    readiness TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 2;",
+            )
+            .expect("legacy schema creates");
+        connection
+            .execute(
+                "INSERT INTO environments (id, environment_key, worktree, profile, generation, lifecycle)
+                 VALUES (?1, 'legacy', '/tmp/old', 'process', 1, 'stopped')",
+                params![legacy_id.to_string()],
+            )
+            .expect("legacy environment inserts");
+
+        let mut store = StateStore { connection };
+        store.migrate().expect("identity migration applies");
+        let environment = store
+            .environment(legacy_id)
+            .expect("legacy environment queries")
+            .expect("legacy environment retained");
+        assert_eq!(environment.lifecycle, StoredLifecycle::Orphaned);
+        assert!(environment.reconciliation_diagnostic.is_some());
+        assert_eq!(
+            environment.project_fingerprint,
+            format!("legacy:{legacy_id}")
         );
     }
 }

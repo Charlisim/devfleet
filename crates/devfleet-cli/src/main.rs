@@ -37,13 +37,14 @@ struct UpArgs {
     #[arg(long)]
     trust: bool,
     #[arg(long)]
-    key: String,
-    #[arg(long)]
     worktree: PathBuf,
     #[arg(long, default_value = "process")]
     profile: String,
     #[arg(long)]
     cwd: PathBuf,
+    /// Explicit name for an additional environment instance at this worktree.
+    #[arg(long)]
+    instance: Option<String>,
     /// Explicit process environment entry in KEY=VALUE form. Inherited env is never used.
     #[arg(long = "env")]
     environment: Vec<String>,
@@ -78,9 +79,9 @@ fn main() -> anyhow::Result<()> {
 fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
     match command {
         Command::Up(up) => Ok(DaemonRequest::Up(EnvironmentUpRequest {
-            key: up.key,
             worktree: up.worktree.canonicalize()?.display().to_string(),
             profile: up.profile,
+            instance: up.instance,
             trusted: up.trust,
             process: ProcessSpec {
                 argv: up.argv,
@@ -119,14 +120,20 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
             operation.operation_id, operation.environment_id
         ),
         DaemonResponse::Environment(environment) => println!(
-            "{} {} {:?}",
-            environment.environment_id, environment.key, environment.lifecycle
+            "{} {}/{} {:?}",
+            environment.environment_id,
+            environment.project_id,
+            environment.worktree_id,
+            environment.lifecycle
         ),
         DaemonResponse::Environments(environments) => {
             for environment in environments {
                 println!(
-                    "{} {} {:?}",
-                    environment.environment_id, environment.key, environment.lifecycle
+                    "{} {}/{} {:?}",
+                    environment.environment_id,
+                    environment.project_id,
+                    environment.worktree_id,
+                    environment.lifecycle
                 );
             }
         }

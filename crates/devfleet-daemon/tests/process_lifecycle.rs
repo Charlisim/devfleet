@@ -5,6 +5,7 @@ use devfleet_protocol::{
 };
 use std::{
     collections::BTreeMap,
+    fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -30,6 +31,7 @@ impl Drop for DaemonFixture {
 #[test]
 fn client_reconnects_to_the_same_owned_process_and_stop_preserves_data() {
     let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
     let mut fixture = start_daemon(temporary.path());
     let mut unrelated = Command::new("/bin/sleep")
         .arg("60")
@@ -42,9 +44,9 @@ fn client_reconnects_to_the_same_owned_process_and_stop_preserves_data() {
     let up = request(
         &fixture.socket,
         DaemonRequest::Up(EnvironmentUpRequest {
-            key: "fixture".into(),
             worktree: temporary.path().display().to_string(),
             profile: "process".into(),
+            instance: None,
             trusted: true,
             process: ProcessSpec {
                 argv: vec!["/bin/sleep".into(), "60".into()],
@@ -109,13 +111,14 @@ fn client_reconnects_to_the_same_owned_process_and_stop_preserves_data() {
 #[test]
 fn untrusted_process_never_reaches_the_supervisor() {
     let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
     let fixture = start_daemon(temporary.path());
     let result = request(
         &fixture.socket,
         DaemonRequest::Up(EnvironmentUpRequest {
-            key: "untrusted".into(),
             worktree: temporary.path().display().to_string(),
             profile: "process".into(),
+            instance: None,
             trusted: false,
             process: ProcessSpec {
                 argv: vec!["/usr/bin/false".into()],
@@ -137,13 +140,14 @@ fn untrusted_process_never_reaches_the_supervisor() {
 #[test]
 fn immediately_exited_process_is_retained_as_failed() {
     let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
     let fixture = start_daemon(temporary.path());
     let result = request(
         &fixture.socket,
         DaemonRequest::Up(EnvironmentUpRequest {
-            key: "exits-immediately".into(),
             worktree: temporary.path().display().to_string(),
             profile: "process".into(),
+            instance: None,
             trusted: true,
             process: ProcessSpec {
                 argv: vec!["/usr/bin/false".into()],
@@ -220,4 +224,29 @@ fn wait_for_path(path: &Path) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn initialize_git_repository(path: &Path) {
+    run_git(path, ["init"]);
+    run_git(
+        path,
+        ["config", "user.email", "devfleet-test@example.invalid"],
+    );
+    run_git(path, ["config", "user.name", "DevFleet Test"]);
+    fs::write(path.join("README.md"), "fixture\n").expect("fixture writes");
+    run_git(path, ["add", "README.md"]);
+    run_git(path, ["commit", "-m", "fixture"]);
+}
+
+fn run_git<const N: usize>(path: &Path, arguments: [&str; N]) {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(path)
+        .output()
+        .expect("Git starts");
+    assert!(
+        output.status.success(),
+        "Git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

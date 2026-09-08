@@ -105,9 +105,9 @@ pub struct ProcessSpec {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EnvironmentUpRequest {
-    pub key: String,
     pub worktree: String,
     pub profile: String,
+    pub instance: Option<String>,
     pub trusted: bool,
     pub process: ProcessSpec,
 }
@@ -138,11 +138,14 @@ pub struct OperationAccepted {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EnvironmentSnapshot {
     pub environment_id: Uuid,
-    pub key: String,
+    pub project_id: Uuid,
+    pub worktree_id: Uuid,
     pub worktree: String,
     pub profile: String,
+    pub instance: Option<String>,
     pub generation: u64,
     pub lifecycle: LifecycleState,
+    pub reconciliation_diagnostic: Option<String>,
     pub process: Option<ProcessSnapshot>,
 }
 
@@ -162,6 +165,7 @@ pub enum LifecycleState {
     Running,
     Stopped,
     Failed,
+    Orphaned,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

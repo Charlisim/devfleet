@@ -162,6 +162,7 @@ name = "devfleet-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "thiserror",
  "uuid",
 ]
 
