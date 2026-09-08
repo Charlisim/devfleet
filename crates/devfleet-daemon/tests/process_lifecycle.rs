@@ -3,8 +3,8 @@ use devfleet_protocol::{
     BindingApplyRequest, BindingIntegration, BindingInvalidation, BindingPhase, DaemonRequest,
     DaemonResponse, DestroyAuthorization, DestroyRequest, DestroyTargetStatus,
     EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest, InitializationTask,
-    InitializationTaskKind, LifecycleState, ProcessSpec, ReadinessState, SchedulerConfig,
-    TaskRerunPolicy,
+    InitializationTaskKind, LifecycleState, ProcessSpec, ReadinessState, ResourceAction,
+    ResourceActionRequest, ResourceExecRequest, SchedulerConfig, TaskRerunPolicy,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -31,6 +31,287 @@ impl Drop for DaemonFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn noninteractive_public_methods_keep_operation_identity_and_scoped_exec_output() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let manifest = temporary.path().join("devfleet.toml");
+    fs::write(
+        &manifest,
+        "schema_version = 1\n[profiles.process]\nresources = [\"app\"]\n[resources.app]\nprovider = \"official.process\"\n",
+    )
+    .expect("manifest writes");
+    let plan = request(
+        &fixture.socket,
+        DaemonRequest::Plan(EnvironmentPlanRequest {
+            worktree: temporary.path().display().to_string(),
+            profile: "process".into(),
+            manifest: manifest.display().to_string(),
+            local_override: None,
+            secret_references: Vec::new(),
+            operation_overrides: BTreeMap::new(),
+            runtime_outputs: BTreeMap::new(),
+            planning_endpoints: BTreeMap::new(),
+        }),
+    )
+    .expect("environment plan");
+    assert!(matches!(plan, DaemonResponse::Plan(_)));
+
+    let DaemonResponse::Accepted(up) = request(
+        &fixture.socket,
+        DaemonRequest::Up(EnvironmentUpRequest {
+            worktree: temporary.path().display().to_string(),
+            profile: "process".into(),
+            instance: Some("noninteractive".into()),
+            trusted: true,
+            process: ProcessSpec {
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::new(),
+            },
+        }),
+    )
+    .expect("environment up") else {
+        panic!("expected accepted up operation");
+    };
+    let DaemonResponse::Accepted(repeated_up) = request(
+        &fixture.socket,
+        DaemonRequest::Up(EnvironmentUpRequest {
+            worktree: temporary.path().display().to_string(),
+            profile: "process".into(),
+            instance: Some("noninteractive".into()),
+            trusted: true,
+            process: ProcessSpec {
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::new(),
+            },
+        }),
+    )
+    .expect("repeated environment up") else {
+        panic!("expected repeated accepted up operation");
+    };
+    assert_eq!(repeated_up.operation_id, up.operation_id);
+
+    assert!(matches!(
+        request(
+            &fixture.socket,
+            DaemonRequest::Status {
+                environment_id: up.environment_id
+            }
+        )
+        .expect("environment status"),
+        DaemonResponse::Environment(_)
+    ));
+    let DaemonResponse::Environments(environments) =
+        request(&fixture.socket, DaemonRequest::List).expect("environment list")
+    else {
+        panic!("expected environments");
+    };
+    assert!(
+        environments
+            .iter()
+            .any(|environment| environment.environment_id == up.environment_id)
+    );
+    assert!(matches!(
+        request(
+            &fixture.socket,
+            DaemonRequest::OperationGet {
+                operation_id: up.operation_id
+            }
+        )
+        .expect("up operation reads"),
+        DaemonResponse::Operation(_)
+    ));
+
+    let DaemonResponse::ResourceAction(exec) = request(
+        &fixture.socket,
+        DaemonRequest::ResourceAction(ResourceActionRequest {
+            environment_id: up.environment_id,
+            resource: "environment".into(),
+            action: ResourceAction::Exec(ResourceExecRequest {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "printf '%s' \"$FIXTURE\"".into(),
+                ],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::from([("FIXTURE".into(), "scoped".into())]),
+                timeout_seconds: 5,
+            }),
+        }),
+    )
+    .expect("scoped exec") else {
+        panic!("expected scoped exec response");
+    };
+    let operation = exec.operation.expect("scoped exec operation");
+    assert_eq!(
+        operation.status,
+        devfleet_protocol::OperationStatus::Accepted
+    );
+    let operation = wait_for_operation(&fixture.socket, operation.operation_id);
+    assert_eq!(
+        operation.status,
+        devfleet_protocol::OperationStatus::Completed
+    );
+    assert!(matches!(
+        request(
+            &fixture.socket,
+            DaemonRequest::LogsTail {
+                environment_id: up.environment_id,
+                resource: "process".into(),
+                after: None,
+                limit: 10,
+            }
+        )
+        .expect("logs tail"),
+        DaemonResponse::Logs(_)
+    ));
+    let DaemonResponse::Logs(exec_logs) = request(
+        &fixture.socket,
+        DaemonRequest::LogsTail {
+            environment_id: up.environment_id,
+            resource: format!("exec-{}", operation.operation_id),
+            after: None,
+            limit: 10,
+        },
+    )
+    .expect("scoped exec logs tail") else {
+        panic!("expected scoped exec logs");
+    };
+    assert_eq!(exec_logs.lines, vec!["scoped"]);
+    assert!(matches!(
+        request(
+            &fixture.socket,
+            DaemonRequest::EventsSubscribe {
+                environment_id: up.environment_id,
+                after: Some(0),
+            }
+        )
+        .expect("events subscribe"),
+        DaemonResponse::Events(_)
+    ));
+    let DaemonResponse::ResourceAction(timed_out) = request(
+        &fixture.socket,
+        DaemonRequest::ResourceAction(ResourceActionRequest {
+            environment_id: up.environment_id,
+            resource: "environment".into(),
+            action: ResourceAction::Exec(ResourceExecRequest {
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::new(),
+                timeout_seconds: 1,
+            }),
+        }),
+    )
+    .expect("scoped timeout returns typed result") else {
+        panic!("expected scoped timeout response");
+    };
+    let timed_out = wait_for_operation(
+        &fixture.socket,
+        timed_out.operation.expect("timeout operation").operation_id,
+    );
+    assert_eq!(timed_out.status, devfleet_protocol::OperationStatus::Failed);
+    let DaemonResponse::Logs(timeout_logs) = request(
+        &fixture.socket,
+        DaemonRequest::LogsTail {
+            environment_id: up.environment_id,
+            resource: format!("exec-{}", timed_out.operation_id),
+            after: None,
+            limit: 10,
+        },
+    )
+    .expect("timed-out scoped exec logs tail") else {
+        panic!("expected timed-out scoped exec logs");
+    };
+    assert!(
+        timeout_logs
+            .lines
+            .iter()
+            .any(|line| line.contains("deadline"))
+    );
+    let DaemonResponse::ResourceAction(long_running) = request(
+        &fixture.socket,
+        DaemonRequest::ResourceAction(ResourceActionRequest {
+            environment_id: up.environment_id,
+            resource: "environment".into(),
+            action: ResourceAction::Exec(ResourceExecRequest {
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::new(),
+                timeout_seconds: 30,
+            }),
+        }),
+    )
+    .expect("long scoped exec is accepted") else {
+        panic!("expected long scoped exec response");
+    };
+    let long_running = long_running.operation.expect("long scoped exec operation");
+    assert!(matches!(
+        request(
+            &fixture.socket,
+            DaemonRequest::Status {
+                environment_id: up.environment_id
+            }
+        )
+        .expect("daemon remains responsive while scoped exec runs"),
+        DaemonResponse::Environment(_)
+    ));
+    let DaemonResponse::Operation(cancelling) = request(
+        &fixture.socket,
+        DaemonRequest::OperationCancel {
+            operation_id: long_running.operation_id,
+        },
+    )
+    .expect("scoped exec cancellation is accepted") else {
+        panic!("expected operation response");
+    };
+    assert_eq!(
+        cancelling.status,
+        devfleet_protocol::OperationStatus::CancellationRequested
+    );
+    assert_eq!(
+        wait_for_operation(&fixture.socket, long_running.operation_id).status,
+        devfleet_protocol::OperationStatus::Cancelled
+    );
+    let unsupported = request(
+        &fixture.socket,
+        DaemonRequest::ResourceAction(ResourceActionRequest {
+            environment_id: up.environment_id,
+            resource: "unavailable_provider".into(),
+            action: ResourceAction::Open,
+        }),
+    )
+    .expect_err("unsupported action rejects");
+    assert!(unsupported.to_string().contains("CAPABILITY_UNSUPPORTED"));
+    assert!(matches!(
+        request(
+            &fixture.socket,
+            DaemonRequest::OperationCancel {
+                operation_id: up.operation_id
+            }
+        )
+        .expect("up operation cancels"),
+        DaemonResponse::Operation(_)
+    ));
+    assert!(matches!(
+        request(
+            &fixture.socket,
+            DaemonRequest::Destroy(DestroyRequest {
+                environment_id: up.environment_id,
+                dry_run: true,
+                authorization: DestroyAuthorization::None,
+                purge_data: false,
+                purge_artifacts: false,
+            })
+        )
+        .expect("destroy preview"),
+        DaemonResponse::Destroy(_)
+    ));
 }
 
 #[test]
@@ -1053,6 +1334,34 @@ fn wait_for_daemon(socket: &Path) {
             "daemon socket startup timed out"
         );
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_operation(
+    socket: &Path,
+    operation_id: uuid::Uuid,
+) -> devfleet_protocol::OperationSnapshot {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let DaemonResponse::Operation(operation) =
+            request(socket, DaemonRequest::OperationGet { operation_id }).expect("operation reads")
+        else {
+            panic!("expected operation response");
+        };
+        if matches!(
+            operation.status,
+            devfleet_protocol::OperationStatus::Completed
+                | devfleet_protocol::OperationStatus::Failed
+                | devfleet_protocol::OperationStatus::Cancelled
+                | devfleet_protocol::OperationStatus::Uncertain
+        ) {
+            return operation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "operation did not become terminal"
+        );
+        thread::sleep(Duration::from_millis(25));
     }
 }
 

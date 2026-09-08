@@ -7,7 +7,9 @@ use devfleet_protocol::{
     InitializationRunRequest, InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest,
     IosSimulatorAction, IosSimulatorActionRequest, MetroUpRequest,
     PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec,
-    ProjectInitRequest, SchedulerConfig, SmokeResponse, SmokeStatus, VerificationMode,
+    ProjectInitRequest, RESOURCE_EXEC_DEFAULT_TIMEOUT_SECONDS, ResourceAction,
+    ResourceActionRequest, ResourceExecRequest, SchedulerConfig, SmokeResponse, SmokeStatus,
+    VerificationMode,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -54,6 +56,7 @@ enum Command {
     Prepare(PrepareArgs),
     Bindings(BindingsArgs),
     Ios(IosArgs),
+    Resource(ResourceArgs),
     Identity(IdentityArgs),
     Plugin(PluginArgs),
 }
@@ -297,8 +300,52 @@ struct OperationArgs {
 
 #[derive(Subcommand)]
 enum OperationCommand {
-    Get { operation_id: Uuid },
-    Cancel { operation_id: Uuid },
+    Get {
+        operation_id: Uuid,
+    },
+    Cancel {
+        operation_id: Uuid,
+    },
+    Wait {
+        operation_id: Uuid,
+        #[arg(long, value_enum, default_value_t = OperationCondition::Terminal)]
+        until: OperationCondition,
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OperationCondition {
+    Accepted,
+    Terminal,
+}
+
+#[derive(ClapArgs)]
+struct ResourceArgs {
+    #[command(subcommand)]
+    command: ResourceCommand,
+}
+
+#[derive(Subcommand)]
+enum ResourceCommand {
+    Exec {
+        environment_id: Uuid,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long = "env")]
+        environment: Vec<String>,
+        #[arg(long, default_value_t = RESOURCE_EXEC_DEFAULT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    Open {
+        environment_id: Uuid,
+    },
+    Stop {
+        environment_id: Uuid,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -353,6 +400,9 @@ struct UpArgs {
     /// Explicit name for an additional environment instance at this worktree.
     #[arg(long)]
     instance: Option<String>,
+    /// Return as soon as the daemon has durably accepted the start operation.
+    #[arg(long)]
+    detach: bool,
     /// Explicit process environment entry in KEY=VALUE form. Inherited env is never used.
     #[arg(long = "env")]
     environment: Vec<String>,
@@ -428,10 +478,68 @@ fn main() -> anyhow::Result<()> {
     match command {
         Command::Logs(logs) => print_logs(&socket, &logs, args.json),
         Command::Events(events) => print_events(&socket, &events, args.json),
+        Command::Operation(OperationArgs {
+            command:
+                OperationCommand::Wait {
+                    operation_id,
+                    until,
+                    timeout_seconds,
+                },
+        }) => wait_for_operation(&socket, operation_id, until, timeout_seconds, args.json),
         command => {
             let response = request(&socket, request_from(command)?)?;
             print_response(&response, args.json)
         }
+    }
+}
+
+fn wait_for_operation(
+    socket: &Path,
+    operation_id: Uuid,
+    until: OperationCondition,
+    timeout_seconds: u64,
+    json: bool,
+) -> anyhow::Result<()> {
+    if timeout_seconds == 0 {
+        anyhow::bail!("--timeout-seconds must be nonzero");
+    }
+    let started = std::time::Instant::now();
+    loop {
+        let response = request(socket, DaemonRequest::OperationGet { operation_id })?;
+        let DaemonResponse::Operation(operation) = &response else {
+            anyhow::bail!("daemon returned an unexpected operation response");
+        };
+        if operation_matches_condition(operation.status, until) {
+            return print_response(&response, json);
+        }
+        if started.elapsed() >= Duration::from_secs(timeout_seconds) {
+            anyhow::bail!("operation did not satisfy the requested condition before the deadline");
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn operation_matches_condition(
+    status: devfleet_protocol::OperationStatus,
+    condition: OperationCondition,
+) -> bool {
+    match condition {
+        OperationCondition::Accepted => matches!(
+            status,
+            devfleet_protocol::OperationStatus::Accepted
+                | devfleet_protocol::OperationStatus::CancellationRequested
+                | devfleet_protocol::OperationStatus::Cancelled
+                | devfleet_protocol::OperationStatus::Completed
+                | devfleet_protocol::OperationStatus::Failed
+                | devfleet_protocol::OperationStatus::Uncertain
+        ),
+        OperationCondition::Terminal => matches!(
+            status,
+            devfleet_protocol::OperationStatus::Completed
+                | devfleet_protocol::OperationStatus::Failed
+                | devfleet_protocol::OperationStatus::Cancelled
+                | devfleet_protocol::OperationStatus::Uncertain
+        ),
     }
 }
 
@@ -700,6 +808,38 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 },
             )),
         },
+        Command::Resource(resource) => match resource.command {
+            ResourceCommand::Exec {
+                environment_id,
+                cwd,
+                environment,
+                timeout_seconds,
+                argv,
+            } => Ok(DaemonRequest::ResourceAction(ResourceActionRequest {
+                environment_id,
+                resource: "environment".into(),
+                action: ResourceAction::Exec(ResourceExecRequest {
+                    argv,
+                    cwd: cwd.canonicalize()?.display().to_string(),
+                    environment: parse_environment(environment)?,
+                    timeout_seconds,
+                }),
+            })),
+            ResourceCommand::Open { environment_id } => {
+                Ok(DaemonRequest::ResourceAction(ResourceActionRequest {
+                    environment_id,
+                    resource: "ios_simulator".into(),
+                    action: ResourceAction::Open,
+                }))
+            }
+            ResourceCommand::Stop { environment_id } => {
+                Ok(DaemonRequest::ResourceAction(ResourceActionRequest {
+                    environment_id,
+                    resource: "ios_simulator".into(),
+                    action: ResourceAction::Stop,
+                }))
+            }
+        },
         Command::Identity(identity) => match identity.command {
             IdentityCommand::Start {
                 environment_id,
@@ -775,6 +915,9 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
             }
             OperationCommand::Cancel { operation_id } => {
                 Ok(DaemonRequest::OperationCancel { operation_id })
+            }
+            OperationCommand::Wait { .. } => {
+                anyhow::bail!("operation wait is handled by the client")
             }
         },
         Command::Events(events) => Ok(DaemonRequest::EventsSubscribe {
@@ -885,7 +1028,7 @@ fn parse_compose_endpoints(values: Vec<String>) -> anyhow::Result<Vec<ComposeEnd
 fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string(response)?);
-        return Ok(());
+        return resource_action_result(response);
     }
     match response {
         DaemonResponse::ProjectInit(project) => {
@@ -987,6 +1130,26 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
             operation.phase,
             operation.resource_id.as_deref().unwrap_or("environment")
         ),
+        DaemonResponse::ResourceAction(action) => {
+            println!(
+                "{} {} {}{}",
+                action.environment_id,
+                action.resource,
+                action.action,
+                action
+                    .operation
+                    .as_ref()
+                    .map_or_else(String::new, |operation| {
+                        format!(" operation={}", operation.operation_id)
+                    })
+            );
+            if !action.stdout.is_empty() {
+                print!("{}", action.stdout);
+            }
+            if !action.stderr.is_empty() {
+                eprint!("{}", action.stderr);
+            }
+        }
         DaemonResponse::Events(events) => {
             for event in events {
                 println!("{} {} {}", event.sequence, event.id, event.kind);
@@ -1112,6 +1275,27 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
             }
         }
     }
+    resource_action_result(response)
+}
+
+fn resource_action_result(response: &DaemonResponse) -> anyhow::Result<()> {
+    let Some(operation) = matches!(response, DaemonResponse::ResourceAction(_))
+        .then(|| response)
+        .and_then(|response| match response {
+            DaemonResponse::ResourceAction(action) => action.operation.as_ref(),
+            _ => None,
+        })
+    else {
+        return Ok(());
+    };
+    if matches!(
+        operation.status,
+        devfleet_protocol::OperationStatus::Failed
+            | devfleet_protocol::OperationStatus::Cancelled
+            | devfleet_protocol::OperationStatus::Uncertain
+    ) {
+        anyhow::bail!("resource action did not complete successfully");
+    }
     Ok(())
 }
 
@@ -1183,6 +1367,56 @@ mod tests {
         };
         assert!(Path::new(&worktree).is_absolute());
         assert!(worktree.ends_with("missing-worktree"));
+    }
+
+    #[test]
+    fn maps_environment_scoped_exec_to_the_public_resource_action() {
+        let worktree = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let request = request_from(Command::Resource(ResourceArgs {
+            command: ResourceCommand::Exec {
+                environment_id: Uuid::nil(),
+                cwd: worktree,
+                environment: vec!["FIXTURE=value".into()],
+                timeout_seconds: 5,
+                argv: vec!["/bin/true".into()],
+            },
+        }))
+        .expect("resource exec request builds");
+        let DaemonRequest::ResourceAction(action) = request else {
+            panic!("expected resource action");
+        };
+        assert_eq!(action.resource, "environment");
+        assert!(matches!(
+            action.action,
+            ResourceAction::Exec(ResourceExecRequest {
+                timeout_seconds: 5,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_wait_conditions_distinguish_acceptance_from_terminal_states() {
+        assert!(operation_matches_condition(
+            devfleet_protocol::OperationStatus::Accepted,
+            OperationCondition::Accepted
+        ));
+        assert!(operation_matches_condition(
+            devfleet_protocol::OperationStatus::Completed,
+            OperationCondition::Accepted
+        ));
+        assert!(!operation_matches_condition(
+            devfleet_protocol::OperationStatus::Accepted,
+            OperationCondition::Terminal
+        ));
+        assert!(operation_matches_condition(
+            devfleet_protocol::OperationStatus::Completed,
+            OperationCondition::Terminal
+        ));
     }
 
     #[test]

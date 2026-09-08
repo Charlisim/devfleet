@@ -16,8 +16,8 @@ cargo test --workspace
 ```
 
 The workspace uses Rust 1.98.0. `devfleet`, `devfleetd` and
-`devfleet-supervisor` now support the first local-process vertical slice. The
-remaining v0.1 providers and lifecycle operations are still being implemented.
+`devfleet-supervisor` expose the v0.1 noninteractive control slice through a
+private Unix socket.
 
 ## Supervised local-process fixture
 
@@ -139,6 +139,33 @@ environment, operation and process identity in SQLite. Local peer UID checks,
 0600 sockets, a 0700 state directory, a single writer lock and 1 MiB JSON-RPC
 frames protect this bounded slice. Plugins are trusted native code; these
 controls are not an OS sandbox.
+
+## Noninteractive client workflow
+
+The public methods are `environment.plan`, `environment.up`,
+`environment.status`, `environment.list`, `environment.stop`,
+`environment.destroy`, `operation.get`, `operation.cancel`, `resource.action`,
+`logs.tail`, and `events.subscribe`. The CLI's `--json` output is the matching
+typed response envelope. `up --detach --json` returns a durable accepted
+operation ID; acceptance is separate from a terminal operation state.
+
+```sh
+devfleet --socket /tmp/df-$(id -u)/daemon.sock --json up \
+  --detach --trust --worktree "$PWD" --cwd "$PWD" -- /bin/sleep 60
+devfleet --socket /tmp/df-$(id -u)/daemon.sock operation wait <operation-id> \
+  --until accepted
+devfleet --socket /tmp/df-$(id -u)/daemon.sock --json resource exec <environment-id> \
+  --cwd "$PWD" --env CLIENT_MODE=noninteractive -- /usr/bin/env
+devfleet --socket /tmp/df-$(id -u)/daemon.sock resource open <environment-id>
+```
+
+Scoped exec clears inherited variables, requires an existing cwd inside the
+environment worktree, runs in an owned process group, and returns bounded
+stdout/stderr through `logs <environment-id> --resource exec-<operation-id>`
+after its retained operation reaches a terminal state. An unsupported resource
+action returns `CAPABILITY_UNSUPPORTED`. The runnable
+[`examples/noninteractive-client.sh`](examples/noninteractive-client.sh)
+performs status recovery before following durable, deduplicated events.
 
 ## Events and logs
 

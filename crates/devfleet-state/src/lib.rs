@@ -456,6 +456,24 @@ impl StateStore {
         Ok(())
     }
 
+    /// Persists a scoped operation before its supervisor request is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the operation intent.
+    pub fn record_operation_intent(
+        &mut self,
+        operation_id: Uuid,
+        environment_id: Uuid,
+        kind: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO operations (id, environment_id, kind, status) VALUES (?1, ?2, ?3, 'accepted')",
+            params![operation_id.to_string(), environment_id.to_string(), kind],
+        )?;
+        Ok(())
+    }
+
     /// Records explicit project trust and an optional validated local simulator selection.
     ///
     /// # Errors
@@ -1228,6 +1246,29 @@ impl StateStore {
         }
     }
 
+    /// Returns the most recent operation of one kind for an environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read or decode the operation.
+    pub fn latest_operation_of_kind(
+        &self,
+        environment_id: Uuid,
+        kind: &str,
+    ) -> Result<Option<StoredOperation>, StateError> {
+        let row = self.connection.query_row(
+            "SELECT id, environment_id, kind, status, deadline_unix_ms, cancellation_requested, phase, resource_id
+             FROM operations WHERE environment_id = ?1 AND kind = ?2 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![environment_id.to_string(), kind],
+            stored_operation_from_row,
+        );
+        match row {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(StateError::Sqlite(error)),
+        }
+    }
+
     /// Appends a compact event; callers must keep large logs and artifacts on disk.
     ///
     /// # Errors
@@ -1318,6 +1359,32 @@ impl StateStore {
     pub fn mark_operation_cancelled(&mut self, id: Uuid, phase: &str) -> Result<(), StateError> {
         self.connection.execute(
             "UPDATE operations SET status = 'cancelled', phase = ?1 WHERE id = ?2",
+            params![phase, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Records a completed scoped operation while retaining its identity for reconnecting clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the terminal operation state.
+    pub fn mark_operation_completed(&mut self, id: Uuid, phase: &str) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE operations SET status = 'completed', phase = ?1 WHERE id = ?2",
+            params![phase, id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Records a failed scoped operation while retaining its identity and diagnostics phase.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the terminal operation state.
+    pub fn mark_operation_failed(&mut self, id: Uuid, phase: &str) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE operations SET status = 'failed', phase = ?1 WHERE id = ?2",
             params![phase, id.to_string()],
         )?;
         Ok(())

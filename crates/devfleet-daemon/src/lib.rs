@@ -21,8 +21,9 @@ use devfleet_protocol::{
     JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
     MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
     PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
-    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ProjectInitRequest,
-    ProjectInitSnapshot, ReactNativeIdentityHook, ReadinessState, RpcFailure, ScheduledResource,
+    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ProcessSpec,
+    ProjectInitRequest, ProjectInitSnapshot, ReactNativeIdentityHook, ReadinessState,
+    ResourceAction, ResourceActionRequest, ResourceActionSnapshot, RpcFailure, ScheduledResource,
     SchedulingPriority, SchedulingRequest, SupervisorIdentityVerificationRequest,
     SupervisorRequest, SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy,
     TrustedTaskPlugin, VerificationMode, read_json_line, write_json_line,
@@ -49,6 +50,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -100,18 +102,30 @@ pub fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let _socket_cleanup = DaemonSocketCleanup(config.socket.clone());
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
     let state = StateStore::open(&config.state_dir.join("state.sqlite3"))?;
+    listener.set_nonblocking(true)?;
+    let (scoped_exec_completions, scoped_exec_receiver) = mpsc::channel();
     let mut daemon = Daemon {
         config,
         state,
         scheduler: HostScheduler::default(),
+        scoped_exec_completions,
     };
     daemon.reconcile_startup()?;
 
     loop {
-        let (stream, _) = listener.accept()?;
-        assert_same_user(&stream)?;
-        if let Err(error) = daemon.handle_connection(stream) {
-            eprintln!("daemon client request failed: {error:#}");
+        daemon.drain_scoped_exec_completions(&scoped_exec_receiver);
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                assert_same_user(&stream)?;
+                if let Err(error) = daemon.handle_connection(stream) {
+                    eprintln!("daemon client request failed: {error:#}");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(SOCKET_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -120,6 +134,14 @@ struct Daemon {
     config: DaemonConfig,
     state: StateStore,
     scheduler: HostScheduler,
+    scoped_exec_completions: Sender<ScopedExecCompletion>,
+}
+
+struct ScopedExecCompletion {
+    environment_id: Uuid,
+    generation: u64,
+    operation_id: Uuid,
+    result: Result<SupervisorResponse, String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -244,6 +266,7 @@ impl Daemon {
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
             DaemonRequest::OperationGet { operation_id } => self.operation_get(operation_id),
             DaemonRequest::OperationCancel { operation_id } => self.operation_cancel(operation_id),
+            DaemonRequest::ResourceAction(request) => self.resource_action(request),
             DaemonRequest::Events {
                 environment_id,
                 after,
@@ -847,7 +870,6 @@ impl Daemon {
         request: devfleet_protocol::EnvironmentUpRequest,
     ) -> Result<DaemonResponse, DaemonError> {
         validate_up_request(&request)?;
-        let process_plugin = self.trusted_process_plugin()?;
         let git_identity = discover_git_worktree(Path::new(&request.worktree))
             .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
         let git_context = VerifiedGitContext {
@@ -882,12 +904,21 @@ impl Daemon {
         }) {
             self.state
                 .update_worktree_context(environment.id, &git_context)?;
+            let operation = self
+                .state
+                .latest_operation_of_kind(environment.id, "up")?
+                .ok_or_else(|| {
+                    DaemonError::Operation(
+                        "running environment has no retained up operation identity".into(),
+                    )
+                })?;
             return Ok(DaemonResponse::Accepted(OperationAccepted {
-                operation_id: Uuid::nil(),
+                operation_id: operation.id,
                 environment_id: environment.id,
             }));
         }
         cleanup_stopped_supervisor_socket(matching_environment)?;
+        let process_plugin = self.trusted_process_plugin()?;
 
         let project_id = environments
             .iter()
@@ -1369,6 +1400,8 @@ impl Daemon {
                     return Err(DaemonError::Operation(format!("{}: {diagnostic}", task.id)));
                 }
                 SupervisorResponse::Process(_)
+                | SupervisorResponse::TaskAccepted
+                | SupervisorResponse::TaskCancelled
                 | SupervisorResponse::TaskOutput { .. }
                 | SupervisorResponse::TaskTimedOut
                 | SupervisorResponse::IdentityVerification(_) => {
@@ -1499,6 +1532,9 @@ impl Daemon {
                     Some("task process exited unsuccessfully")
                 }
                 SupervisorResponse::TaskTimedOut => Some("task deadline exceeded"),
+                SupervisorResponse::TaskAccepted | SupervisorResponse::TaskCancelled => {
+                    Some("supervisor returned an async task response")
+                }
                 SupervisorResponse::Process(_) => Some("supervisor returned a process response"),
                 SupervisorResponse::IdentityVerification(_) => {
                     Some("supervisor returned an identity verification response")
@@ -1876,6 +1912,8 @@ impl Daemon {
                 ));
             }
             SupervisorResponse::TaskCompleted
+            | SupervisorResponse::TaskAccepted
+            | SupervisorResponse::TaskCancelled
             | SupervisorResponse::Process(_)
             | SupervisorResponse::IdentityVerification(_) => {
                 self.finish_scheduled_work(&environment, scheduler_job)?;
@@ -2254,6 +2292,8 @@ impl Daemon {
                 ))
             }
             SupervisorResponse::TaskCompleted
+            | SupervisorResponse::TaskAccepted
+            | SupervisorResponse::TaskCancelled
             | SupervisorResponse::Process(_)
             | SupervisorResponse::IdentityVerification(_) => {
                 remove_generated_artifact(&task.path);
@@ -2309,6 +2349,8 @@ impl Daemon {
                 Err(DaemonError::DeviceUnavailable(capability.into()))
             }
             SupervisorResponse::TaskCompleted
+            | SupervisorResponse::TaskAccepted
+            | SupervisorResponse::TaskCancelled
             | SupervisorResponse::TaskTimedOut
             | SupervisorResponse::Process(_)
             | SupervisorResponse::IdentityVerification(_) => Err(DaemonError::Operation(
@@ -3197,6 +3239,296 @@ impl Daemon {
         }
     }
 
+    fn resource_action(
+        &mut self,
+        request: ResourceActionRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        match request.action {
+            ResourceAction::Exec(exec) => {
+                self.resource_exec(request.environment_id, &request.resource, exec)
+            }
+            ResourceAction::Open => self.resource_device_action(
+                request.environment_id,
+                &request.resource,
+                IosSimulatorAction::Open,
+                "open",
+            ),
+            ResourceAction::Stop => self.resource_device_action(
+                request.environment_id,
+                &request.resource,
+                IosSimulatorAction::Stop,
+                "stop",
+            ),
+        }
+    }
+
+    fn resource_device_action(
+        &mut self,
+        environment_id: Uuid,
+        resource: &str,
+        action: IosSimulatorAction,
+        action_name: &str,
+    ) -> Result<DaemonResponse, DaemonError> {
+        if resource != "ios_simulator" {
+            return Err(DaemonError::CapabilityUnsupported(format!(
+                "{resource}.{action_name}"
+            )));
+        }
+        let response = self.ios_simulator_action(&IosSimulatorActionRequest {
+            environment_id,
+            action,
+        })?;
+        let DaemonResponse::IosSimulator(_) = response else {
+            return Err(DaemonError::Operation(
+                "simulator action returned an invalid response".into(),
+            ));
+        };
+        Ok(DaemonResponse::ResourceAction(ResourceActionSnapshot {
+            environment_id,
+            resource: resource.into(),
+            action: action_name.into(),
+            operation: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn resource_exec(
+        &mut self,
+        environment_id: Uuid,
+        resource: &str,
+        request: devfleet_protocol::ResourceExecRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        if resource != "environment" {
+            return Err(DaemonError::CapabilityUnsupported(format!(
+                "{resource}.exec"
+            )));
+        }
+        if request.argv.is_empty() || request.timeout_seconds == 0 {
+            return Err(DaemonError::InvalidConfig(
+                "scoped exec requires argv and a nonzero timeout".into(),
+            ));
+        }
+        if request
+            .environment
+            .keys()
+            .any(|key| !valid_environment_key(key))
+        {
+            return Err(DaemonError::InvalidConfig(
+                "scoped exec environment keys must use shell variable syntax".into(),
+            ));
+        }
+        let environment = self
+            .state
+            .environment(environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment
+            .process
+            .clone()
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        let worktree = Path::new(&environment.worktree)
+            .canonicalize()
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let cwd = Path::new(&request.cwd)
+            .canonicalize()
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        if !cwd.is_dir() || !cwd.starts_with(&worktree) {
+            return Err(DaemonError::InvalidConfig(
+                "scoped exec cwd must be an existing directory inside the environment worktree"
+                    .into(),
+            ));
+        }
+        let operation_id = Uuid::now_v7();
+        self.state
+            .record_operation_intent(operation_id, environment_id, "resource.action")?;
+        let deadline = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?
+            .as_millis()
+            .checked_add(u128::from(request.timeout_seconds) * 1_000)
+            .ok_or_else(|| {
+                DaemonError::InvalidConfig("scoped exec deadline exceeds range".into())
+            })?;
+        self.state
+            .set_operation_context(operation_id, deadline, "environment.exec")?;
+        self.emit_event(
+            environment_id,
+            environment.generation,
+            Some(operation_id),
+            "resource_action_accepted",
+        )?;
+        let response = request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::Exec {
+                operation_id,
+                process: ProcessSpec {
+                    argv: request.argv,
+                    cwd: cwd.display().to_string(),
+                    environment: request.environment,
+                },
+                timeout_seconds: request.timeout_seconds,
+            },
+        );
+        match response {
+            Ok(SupervisorResponse::TaskAccepted) => {}
+            Ok(_) => {
+                self.state
+                    .mark_operation_failed(operation_id, "invalid_response")?;
+                return Err(DaemonError::Operation(
+                    "supervisor did not accept scoped exec".into(),
+                ));
+            }
+            Err(error) => {
+                self.state
+                    .mark_operation_failed(operation_id, "supervisor_unavailable")?;
+                return Err(error);
+            }
+        }
+        self.monitor_scoped_exec(
+            environment_id,
+            environment.generation,
+            operation_id,
+            process.supervisor_socket,
+        );
+        let operation = self
+            .state
+            .operation(operation_id)?
+            .ok_or(DaemonError::NotFound)?;
+        Ok(DaemonResponse::ResourceAction(ResourceActionSnapshot {
+            environment_id,
+            resource: resource.into(),
+            action: "exec".into(),
+            operation: Some(operation_snapshot(operation)),
+            stdout: String::new(),
+            stderr: String::new(),
+        }))
+    }
+
+    fn monitor_scoped_exec(
+        &self,
+        environment_id: Uuid,
+        generation: u64,
+        operation_id: Uuid,
+        supervisor_socket: String,
+    ) {
+        let sender = self.scoped_exec_completions.clone();
+        thread::spawn(move || {
+            loop {
+                let result = request_supervisor(
+                    Path::new(&supervisor_socket),
+                    SupervisorRequest::ExecStatus { operation_id },
+                );
+                match result {
+                    Ok(SupervisorResponse::TaskAccepted) => thread::sleep(SOCKET_RETRY_INTERVAL),
+                    Ok(response) => {
+                        let _ = sender.send(ScopedExecCompletion {
+                            environment_id,
+                            generation,
+                            operation_id,
+                            result: Ok(response),
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        let _ = sender.send(ScopedExecCompletion {
+                            environment_id,
+                            generation,
+                            operation_id,
+                            result: Err(error.to_string()),
+                        });
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    fn drain_scoped_exec_completions(&mut self, receiver: &Receiver<ScopedExecCompletion>) {
+        loop {
+            match receiver.try_recv() {
+                Ok(completion) => {
+                    if let Err(error) = self.complete_scoped_exec(completion) {
+                        eprintln!("scoped exec completion failed: {error}");
+                    }
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+    fn complete_scoped_exec(
+        &mut self,
+        completion: ScopedExecCompletion,
+    ) -> Result<(), DaemonError> {
+        let cancelled = self
+            .state
+            .operation(completion.operation_id)?
+            .ok_or(DaemonError::NotFound)?
+            .cancellation_requested;
+        let resource = scoped_exec_log_resource(completion.operation_id);
+        let (stdout, stderr, phase) = match completion.result {
+            Ok(SupervisorResponse::TaskOutput { stdout, stderr }) if !cancelled => {
+                self.state
+                    .mark_operation_completed(completion.operation_id, "completed")?;
+                (stdout, stderr, "resource_action_completed")
+            }
+            Ok(
+                SupervisorResponse::TaskOutput { stdout, stderr }
+                | SupervisorResponse::TaskFailed { stdout, stderr },
+            ) if cancelled => {
+                self.state
+                    .mark_operation_cancelled(completion.operation_id, "cancelled")?;
+                (stdout, stderr, "resource_action_cancelled")
+            }
+            Ok(SupervisorResponse::TaskFailed { stdout, stderr }) => {
+                self.state
+                    .mark_operation_failed(completion.operation_id, "failed")?;
+                (stdout, stderr, "resource_action_failed")
+            }
+            Ok(SupervisorResponse::TaskTimedOut) if cancelled => {
+                self.state
+                    .mark_operation_cancelled(completion.operation_id, "cancelled")?;
+                (String::new(), String::new(), "resource_action_cancelled")
+            }
+            Ok(SupervisorResponse::TaskTimedOut) => {
+                self.state
+                    .mark_operation_failed(completion.operation_id, "timed_out")?;
+                (
+                    String::new(),
+                    "scoped command exceeded its deadline and its process group was stopped".into(),
+                    "resource_action_timed_out",
+                )
+            }
+            Ok(SupervisorResponse::TaskCancelled) => {
+                self.state
+                    .mark_operation_cancelled(completion.operation_id, "cancelled")?;
+                (String::new(), String::new(), "resource_action_cancelled")
+            }
+            Ok(_) => {
+                self.state
+                    .mark_operation_failed(completion.operation_id, "invalid_response")?;
+                (
+                    String::new(),
+                    "supervisor returned an invalid scoped exec response".into(),
+                    "resource_action_failed",
+                )
+            }
+            Err(error) => {
+                self.state
+                    .mark_operation_failed(completion.operation_id, "supervisor_unavailable")?;
+                (String::new(), error, "resource_action_failed")
+            }
+        };
+        self.append_scoped_exec_log(completion.environment_id, &resource, &stdout, &stderr)?;
+        self.emit_event(
+            completion.environment_id,
+            completion.generation,
+            Some(completion.operation_id),
+            phase,
+        )
+    }
+
     fn operation_get(&self, operation_id: Uuid) -> Result<DaemonResponse, DaemonError> {
         let operation = self
             .state
@@ -3210,6 +3542,39 @@ impl Daemon {
             .state
             .request_operation_cancel(operation_id)?
             .ok_or(DaemonError::NotFound)?;
+        if !matches!(
+            operation.status,
+            devfleet_state::OperationStatus::Accepted
+                | devfleet_state::OperationStatus::CancellationRequested
+        ) {
+            return Ok(DaemonResponse::Operation(operation_snapshot(operation)));
+        }
+        if operation.kind == "resource.action"
+            && operation.resource_id.as_deref() == Some("environment.exec")
+        {
+            let environment = self
+                .state
+                .environment(operation.environment_id)?
+                .ok_or(DaemonError::NotFound)?;
+            let process = environment.process.ok_or(DaemonError::OwnershipUncertain)?;
+            match request_supervisor(
+                Path::new(&process.supervisor_socket),
+                SupervisorRequest::CancelExec { operation_id },
+            )? {
+                SupervisorResponse::TaskAccepted | SupervisorResponse::TaskCancelled => {}
+                _ => {
+                    return Err(DaemonError::Operation(
+                        "supervisor returned an invalid scoped exec cancellation response".into(),
+                    ));
+                }
+            }
+            return self.operation_get(operation_id);
+        }
+        if operation.kind != "up" {
+            return Err(DaemonError::CapabilityUnsupported(
+                "operation.cancel for this operation kind".into(),
+            ));
+        }
         if let Some(environment) = self.state.environment(operation.environment_id)?
             && let Some(process) = environment.process.as_ref()
         {
@@ -3262,7 +3627,7 @@ impl Daemon {
         self.state
             .environment(environment_id)?
             .ok_or(DaemonError::NotFound)?;
-        if resource != "process" {
+        if resource != "process" && !self.scoped_exec_log_belongs_to(environment_id, resource)? {
             return Err(DaemonError::NotFound);
         }
         let logs = LogStore::new(
@@ -3326,6 +3691,47 @@ impl Daemon {
                 .map_err(|error| DaemonError::Operation(error.to_string()))?;
         }
         Ok(())
+    }
+
+    fn append_scoped_exec_log(
+        &self,
+        environment_id: Uuid,
+        resource: &str,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<(), DaemonError> {
+        let logs = LogStore::new(
+            log_directory(&self.config.state_dir, environment_id),
+            MAX_RESOURCE_LOG_BYTES,
+            Vec::new(),
+        )
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        for line in stdout.lines().chain(stderr.lines()) {
+            logs.append(resource, line)
+                .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn scoped_exec_log_belongs_to(
+        &self,
+        environment_id: Uuid,
+        resource: &str,
+    ) -> Result<bool, DaemonError> {
+        let Some(operation_id) = resource
+            .strip_prefix("exec-")
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            return Ok(false);
+        };
+        Ok(self
+            .state
+            .operation(operation_id)?
+            .is_some_and(|operation| {
+                operation.environment_id == environment_id
+                    && operation.kind == "resource.action"
+                    && operation.resource_id.as_deref() == Some("environment.exec")
+            }))
     }
 
     fn start_supervisor(
@@ -3677,6 +4083,16 @@ fn validate_up_request(
         ));
     }
     Ok(())
+}
+
+fn valid_environment_key(key: &str) -> bool {
+    let mut characters = key.bytes();
+    matches!(characters.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && characters.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn scoped_exec_log_resource(operation_id: Uuid) -> String {
+    format!("exec-{operation_id}")
 }
 
 fn validate_compose_up_request(request: &ComposeUpRequest) -> Result<(), DaemonError> {
@@ -4838,6 +5254,8 @@ fn supervisor_process(response: SupervisorResponse) -> Result<ProcessSnapshot, D
     match response {
         SupervisorResponse::Process(process) => Ok(process),
         SupervisorResponse::TaskCompleted
+        | SupervisorResponse::TaskAccepted
+        | SupervisorResponse::TaskCancelled
         | SupervisorResponse::TaskFailed { .. }
         | SupervisorResponse::TaskTimedOut
         | SupervisorResponse::TaskOutput { .. }

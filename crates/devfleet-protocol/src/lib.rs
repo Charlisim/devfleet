@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const PREPARATION_DEFAULT_TIMEOUT_SECONDS: u64 = 900;
+pub const RESOURCE_EXEC_DEFAULT_TIMEOUT_SECONDS: u64 = 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -115,6 +116,29 @@ pub struct EnvironmentUpRequest {
     pub instance: Option<String>,
     pub trusted: bool,
     pub process: ProcessSpec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceActionRequest {
+    pub environment_id: Uuid,
+    pub resource: String,
+    pub action: ResourceAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "arguments", rename_all = "snake_case")]
+pub enum ResourceAction {
+    Exec(ResourceExecRequest),
+    Open,
+    Stop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceExecRequest {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub environment: BTreeMap<String, String>,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -642,7 +666,9 @@ pub struct DoctorSnapshot {
 pub enum DaemonRequest {
     ProjectInit(ProjectInitRequest),
     Doctor(DoctorRequest),
+    #[serde(rename = "environment.plan", alias = "plan")]
     Plan(EnvironmentPlanRequest),
+    #[serde(rename = "environment.up", alias = "up")]
     Up(EnvironmentUpRequest),
     ComposeUp(ComposeUpRequest),
     MetroUp(MetroUpRequest),
@@ -657,6 +683,7 @@ pub enum DaemonRequest {
         environment_id: Uuid,
     },
     DeviceCapture(DeviceCaptureRequest),
+    #[serde(rename = "environment.destroy", alias = "destroy")]
     Destroy(DestroyRequest),
     Reconcile {
         environment_id: Uuid,
@@ -666,28 +693,36 @@ pub enum DaemonRequest {
     SchedulerFocus {
         environment_id: Uuid,
     },
+    #[serde(rename = "environment.status", alias = "status")]
     Status {
         environment_id: Uuid,
     },
+    #[serde(rename = "environment.list", alias = "list")]
     List,
+    #[serde(rename = "environment.stop", alias = "stop")]
     Stop {
         environment_id: Uuid,
     },
+    #[serde(rename = "operation.get", alias = "operation_get")]
     OperationGet {
         operation_id: Uuid,
     },
+    #[serde(rename = "operation.cancel", alias = "operation_cancel")]
     OperationCancel {
         operation_id: Uuid,
     },
+    #[serde(rename = "resource.action", alias = "resource_action")]
+    ResourceAction(ResourceActionRequest),
     Events {
         environment_id: Uuid,
         after: Option<u64>,
     },
-    #[serde(rename = "events.subscribe")]
+    #[serde(rename = "events.subscribe", alias = "events_subscribe")]
     EventsSubscribe {
         environment_id: Uuid,
         after: Option<u64>,
     },
+    #[serde(rename = "logs.tail", alias = "logs_tail")]
     LogsTail {
         environment_id: Uuid,
         resource: String,
@@ -714,6 +749,7 @@ pub enum DaemonResponse {
     Environment(EnvironmentSnapshot),
     Environments(Vec<EnvironmentSnapshot>),
     Operation(OperationSnapshot),
+    ResourceAction(ResourceActionSnapshot),
     Events(Vec<EventSnapshot>),
     Logs(LogSnapshot),
     Plugin(PluginSnapshot),
@@ -785,6 +821,16 @@ pub struct OperationSnapshot {
     pub phase: String,
     pub resource_id: Option<String>,
     pub retryable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourceActionSnapshot {
+    pub environment_id: Uuid,
+    pub resource: String,
+    pub action: String,
+    pub operation: Option<OperationSnapshot>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1068,6 +1114,17 @@ pub enum SupervisorRequest {
         operation_id: Uuid,
         process: ProcessSpec,
     },
+    Exec {
+        operation_id: Uuid,
+        process: ProcessSpec,
+        timeout_seconds: u64,
+    },
+    ExecStatus {
+        operation_id: Uuid,
+    },
+    CancelExec {
+        operation_id: Uuid,
+    },
     RunPluginTask {
         operation_id: Uuid,
         plugin_id: String,
@@ -1086,6 +1143,8 @@ pub enum SupervisorRequest {
 pub enum SupervisorResponse {
     Process(ProcessSnapshot),
     TaskCompleted,
+    TaskAccepted,
+    TaskCancelled,
     TaskFailed { stdout: String, stderr: String },
     TaskTimedOut,
     TaskOutput { stdout: String, stderr: String },
@@ -1184,6 +1243,116 @@ mod tests {
     fn requires_matching_major_protocol_version() {
         assert!(PROTOCOL_VERSION.compatible_with(ProtocolVersion { major: 1, minor: 5 }));
         assert!(!PROTOCOL_VERSION.compatible_with(ProtocolVersion { major: 2, minor: 0 }));
+    }
+
+    #[test]
+    fn serializes_the_complete_public_noninteractive_method_set() {
+        let environment_id = Uuid::nil();
+        let operation_id = Uuid::now_v7();
+        let plan = DaemonRequest::Plan(EnvironmentPlanRequest {
+            worktree: "/private/worktree".into(),
+            profile: "process".into(),
+            manifest: "/private/worktree/devfleet.toml".into(),
+            local_override: None,
+            secret_references: Vec::new(),
+            operation_overrides: BTreeMap::new(),
+            runtime_outputs: BTreeMap::new(),
+            planning_endpoints: BTreeMap::new(),
+        });
+        let up = DaemonRequest::Up(EnvironmentUpRequest {
+            worktree: "/private/worktree".into(),
+            profile: "process".into(),
+            instance: None,
+            trusted: true,
+            process: ProcessSpec {
+                argv: vec!["/bin/true".into()],
+                cwd: "/private/worktree".into(),
+                environment: BTreeMap::new(),
+            },
+        });
+        let methods = vec![
+            (plan, "environment.plan"),
+            (up, "environment.up"),
+            (
+                DaemonRequest::Status { environment_id },
+                "environment.status",
+            ),
+            (DaemonRequest::List, "environment.list"),
+            (DaemonRequest::Stop { environment_id }, "environment.stop"),
+            (
+                DaemonRequest::Destroy(DestroyRequest {
+                    environment_id,
+                    dry_run: true,
+                    authorization: DestroyAuthorization::None,
+                    purge_data: false,
+                    purge_artifacts: false,
+                }),
+                "environment.destroy",
+            ),
+            (
+                DaemonRequest::OperationGet { operation_id },
+                "operation.get",
+            ),
+            (
+                DaemonRequest::OperationCancel { operation_id },
+                "operation.cancel",
+            ),
+            (
+                DaemonRequest::ResourceAction(ResourceActionRequest {
+                    environment_id,
+                    resource: "environment".into(),
+                    action: ResourceAction::Exec(ResourceExecRequest {
+                        argv: vec!["/bin/true".into()],
+                        cwd: "/private/worktree".into(),
+                        environment: BTreeMap::new(),
+                        timeout_seconds: 1,
+                    }),
+                }),
+                "resource.action",
+            ),
+            (
+                DaemonRequest::LogsTail {
+                    environment_id,
+                    resource: "process".into(),
+                    after: None,
+                    limit: 1,
+                },
+                "logs.tail",
+            ),
+            (
+                DaemonRequest::EventsSubscribe {
+                    environment_id,
+                    after: None,
+                },
+                "events.subscribe",
+            ),
+        ];
+        for (request, method) in methods {
+            assert_eq!(
+                serde_json::to_value(request).expect("serializes")["command"],
+                method
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_legacy_unqualified_public_method_names() {
+        let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "command": "up",
+            "arguments": {
+                "worktree": "/private/worktree",
+                "profile": "process",
+                "instance": null,
+                "trusted": true,
+                "process": {
+                    "argv": ["/bin/true"],
+                    "cwd": "/private/worktree",
+                    "environment": {}
+                }
+            }
+        }))
+        .expect("legacy up deserializes");
+        assert!(matches!(request, DaemonRequest::Up(_)));
     }
 
     #[test]
