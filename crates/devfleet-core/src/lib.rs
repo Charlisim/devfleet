@@ -10,8 +10,14 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod execution;
 pub mod plan;
 
+pub use execution::{
+    ExecutionContext, ExecutionError, ExecutionJournal, ExecutionNode, ExecutionPlan,
+    ExecutionResult, GraphProvider, NodeOwnership, NodeResult, OperationCoordinator,
+    OperationDisposition,
+};
 pub use plan::{
     DependencyEdge, DependencyKind, EffectivePlan, PlanOptions, PlannedResource, compile_document,
     compile_manifest,
