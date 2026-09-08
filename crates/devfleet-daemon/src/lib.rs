@@ -68,7 +68,8 @@ pub fn run(config: DaemonConfig) -> anyhow::Result<()> {
     }
     let listener = UnixListener::bind(&config.socket)?;
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
-    let state = StateStore::open(&config.state_dir.join("state.sqlite3"))?;
+    let mut state = StateStore::open(&config.state_dir.join("state.sqlite3"))?;
+    reconcile_supervisors(&mut state)?;
     let mut daemon = Daemon { config, state };
 
     loop {
@@ -716,6 +717,7 @@ fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
             StoredLifecycle::Running => LifecycleState::Running,
             StoredLifecycle::Stopped => LifecycleState::Stopped,
             StoredLifecycle::Failed => LifecycleState::Failed,
+            StoredLifecycle::Degraded => LifecycleState::Degraded,
             StoredLifecycle::Orphaned => LifecycleState::Orphaned,
         },
         reconciliation_diagnostic: environment.reconciliation_diagnostic,
@@ -730,6 +732,26 @@ fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
             },
         }),
     }
+}
+
+fn reconcile_supervisors(state: &mut StateStore) -> Result<(), anyhow::Error> {
+    for environment in state.environments()? {
+        let Some(process) = environment.process else {
+            continue;
+        };
+        if !matches!(
+            environment.lifecycle,
+            StoredLifecycle::Running | StoredLifecycle::Starting | StoredLifecycle::Degraded
+        ) {
+            continue;
+        }
+        match request_supervisor(Path::new(&process.supervisor_socket), SupervisorRequest::Inspect) {
+            Ok(SupervisorResponse::Process(observed)) if observed.pid == process.pid && observed.process_group == process.process_group => state.mark_recovered(environment.id)?,
+            Ok(_) => state.mark_degraded(environment.id, "Supervisor identity differs from the retained journal; ownership uncertain and no process was terminated.")?,
+            Err(_) => state.mark_degraded(environment.id, "Supervisor is unavailable after daemon restart; ownership uncertain and no process was terminated.")?,
+        }
+    }
+    Ok(())
 }
 
 fn environment_key(

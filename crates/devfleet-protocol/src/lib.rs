@@ -231,6 +231,7 @@ pub enum LifecycleState {
     Running,
     Stopped,
     Failed,
+    Degraded,
     Orphaned,
 }
 

@@ -59,6 +59,7 @@ pub enum StoredLifecycle {
     Running,
     Stopped,
     Failed,
+    Degraded,
     Orphaned,
 }
 
@@ -69,6 +70,7 @@ impl StoredLifecycle {
             Self::Running => "running",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
+            Self::Degraded => "degraded",
             Self::Orphaned => "orphaned",
         }
     }
@@ -79,6 +81,7 @@ impl StoredLifecycle {
             "running" => Ok(Self::Running),
             "stopped" => Ok(Self::Stopped),
             "failed" => Ok(Self::Failed),
+            "degraded" => Ok(Self::Degraded),
             "orphaned" => Ok(Self::Orphaned),
             _ => Err(StateError::InvalidLifecycle),
         }
@@ -378,6 +381,36 @@ impl StateStore {
     pub fn mark_failed(&mut self, environment_id: Uuid) -> Result<(), StateError> {
         self.connection.execute(
             "UPDATE environments SET lifecycle = 'failed' WHERE id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Retains an uncertain process record without adopting or terminating it by PID alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the diagnostic.
+    pub fn mark_degraded(
+        &mut self,
+        environment_id: Uuid,
+        diagnostic: &str,
+    ) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE environments SET lifecycle = 'degraded', reconciliation_diagnostic = ?1 WHERE id = ?2",
+            params![diagnostic, environment_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Records a supervisor-backed recovery after identity matching, without claiming pipe recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain recovered observation.
+    pub fn mark_recovered(&mut self, environment_id: Uuid) -> Result<(), StateError> {
+        self.connection.execute(
+            "UPDATE environments SET lifecycle = 'running', reconciliation_diagnostic = 'Recovered supervisor observation; prior pipes and handles were not adopted.' WHERE id = ?1",
             params![environment_id.to_string()],
         )?;
         Ok(())
