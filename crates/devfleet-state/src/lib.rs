@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -28,6 +28,8 @@ pub enum StateError {
     InvalidPortLease,
     #[error("no port block remains in the configured range")]
     PortRangeExhausted,
+    #[error("event cursor expired; recover with an environment snapshot")]
+    CursorExpired,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -199,6 +201,19 @@ pub struct StoredOperation {
     pub cancellation_requested: bool,
     pub phase: String,
     pub resource_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredEvent {
+    pub sequence: u64,
+    pub id: Uuid,
+    pub timestamp_unix_ms: u128,
+    pub environment_id: Uuid,
+    pub resource_id: Option<String>,
+    pub generation: u64,
+    pub operation_id: Option<Uuid>,
+    pub kind: String,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -449,6 +464,55 @@ impl StateStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(StateError::Sqlite(error)),
         }
+    }
+
+    /// Appends a compact event; callers must keep large logs and artifacts on disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the event.
+    pub fn append_event(&mut self, event: &StoredEvent) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO events (id, timestamp_unix_ms, environment_id, resource_id, generation, operation_id, kind, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![event.id.to_string(), event.timestamp_unix_ms.to_string(), event.environment_id.to_string(), event.resource_id,
+                i64::try_from(event.generation).map_err(|_| StateError::NumericOutOfRange)?, event.operation_id.map(|value| value.to_string()), event.kind, serde_json::to_string(&event.payload)?],
+        )?;
+        Ok(())
+    }
+
+    /// Reads retained events after a cursor. An expired cursor requires snapshot recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an expired cursor or unreadable event storage.
+    pub fn events_after(
+        &self,
+        environment_id: Uuid,
+        after: Option<u64>,
+    ) -> Result<Vec<StoredEvent>, StateError> {
+        let oldest = self.connection.query_row(
+            "SELECT MIN(sequence) FROM events WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        if let (Some(after), Some(oldest)) = (after, oldest)
+            && i64::try_from(after).map_err(|_| StateError::NumericOutOfRange)?
+                < oldest.saturating_sub(1)
+        {
+            return Err(StateError::CursorExpired);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, id, timestamp_unix_ms, environment_id, resource_id, generation, operation_id, kind, payload_json
+             FROM events WHERE environment_id = ?1 AND sequence > ?2 ORDER BY sequence ASC LIMIT 256",
+        )?;
+        statement
+            .query_map(
+                params![environment_id.to_string(), after.unwrap_or(0)],
+                stored_event_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
     }
 
     /// Marks cancellation durably before callers notify a provider or supervisor.
@@ -983,8 +1047,56 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 9 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
+                    timestamp_unix_ms TEXT NOT NULL,
+                    environment_id TEXT NOT NULL,
+                    resource_id TEXT,
+                    generation INTEGER NOT NULL,
+                    operation_id TEXT,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS events_environment_sequence ON events(environment_id, sequence);
+                 PRAGMA user_version = 9;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
+}
+
+fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEvent> {
+    let sequence: i64 = row.get(0)?;
+    let generation: i64 = row.get(5)?;
+    let timestamp: String = row.get(2)?;
+    Ok(StoredEvent {
+        sequence: sequence
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, sequence))?,
+        id: Uuid::parse_str(&row.get::<_, String>(1)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        timestamp_unix_ms: timestamp
+            .parse()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        environment_id: Uuid::parse_str(&row.get::<_, String>(3)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        resource_id: row.get(4)?,
+        generation: generation
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, generation))?,
+        operation_id: row
+            .get::<_, Option<String>>(6)?
+            .map(|value| Uuid::parse_str(&value).map_err(|_| rusqlite::Error::InvalidQuery))
+            .transpose()?,
+        kind: row.get(7)?,
+        payload: serde_json::from_str(&row.get::<_, String>(8)?)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+    })
 }
 
 fn stored_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOperation> {
@@ -1349,5 +1461,37 @@ mod tests {
             store.reserve_port_lease(&request("three")),
             Err(StateError::PortRangeExhausted)
         ));
+    }
+
+    #[test]
+    fn resumes_events_by_sequence_and_rejects_expired_cursor() {
+        let mut store = StateStore::open_in_memory().expect("state opens");
+        let environment_id = Uuid::now_v7();
+        for kind in ["planning", "running"] {
+            store
+                .append_event(&StoredEvent {
+                    sequence: 0,
+                    id: Uuid::now_v7(),
+                    timestamp_unix_ms: 1,
+                    environment_id,
+                    resource_id: Some("api".into()),
+                    generation: 1,
+                    operation_id: None,
+                    kind: kind.into(),
+                    payload: serde_json::json!({"safe": true}),
+                })
+                .expect("event persists");
+        }
+        let events = store
+            .events_after(environment_id, Some(1))
+            .expect("cursor resumes");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            store
+                .events_after(environment_id, Some(0))
+                .expect("initial cursor reads")
+                .len(),
+            2
+        );
     }
 }
