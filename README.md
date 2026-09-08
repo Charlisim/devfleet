@@ -63,6 +63,28 @@ environment, operation and process identity in SQLite. Local peer UID checks,
 frames protect this bounded slice. Plugins are trusted native code; these
 controls are not an OS sandbox.
 
+## Events and logs
+
+`events` uses the public `events.subscribe` contract. It reads a bounded batch,
+can resume with `--after <sequence>`, and `--follow` repeats those bounded
+reads without holding the daemon control connection open. Consumers must
+deduplicate by event ID; the CLI keeps a bounded recent-ID window. Each
+environment retains its most recent 2,048 events. An older cursor returns
+`CURSOR_EXPIRED`; recover with `status`, then request events without `--after`.
+
+```sh
+devfleet --socket /tmp/df-$(id -u)/daemon.sock --json events <environment-id> --after 42
+devfleet --socket /tmp/df-$(id -u)/daemon.sock events <environment-id> --follow
+devfleet --socket /tmp/df-$(id -u)/daemon.sock logs <environment-id> --resource process --follow
+```
+
+The supervisor writes process stdout and stderr through a bounded queue to a
+private per-environment log directory. Each resource segment rotates at 1 MiB;
+large payloads never enter SQLite event rows. Explicit `--env` values whose
+names identify secrets are redacted before writing a complete log line. This
+does not promise redaction of arbitrary transformed tool output; do not emit
+secrets from a process.
+
 ## Declarative preview
 
 `plan` reads a schema-versioned `devfleet.toml`, optionally applies a local

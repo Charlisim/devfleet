@@ -149,6 +149,17 @@ pub enum DaemonRequest {
         environment_id: Uuid,
         after: Option<u64>,
     },
+    #[serde(rename = "events.subscribe")]
+    EventsSubscribe {
+        environment_id: Uuid,
+        after: Option<u64>,
+    },
+    LogsTail {
+        environment_id: Uuid,
+        resource: String,
+        after: Option<u64>,
+        limit: usize,
+    },
     PluginList,
     PluginInstall {
         path: String,
@@ -167,6 +178,7 @@ pub enum DaemonResponse {
     Environments(Vec<EnvironmentSnapshot>),
     Operation(OperationSnapshot),
     Events(Vec<EventSnapshot>),
+    Logs(LogSnapshot),
     Plugin(PluginSnapshot),
     Plugins(Vec<PluginSnapshot>),
 }
@@ -182,6 +194,15 @@ pub struct EventSnapshot {
     pub operation_id: Option<Uuid>,
     pub kind: String,
     pub payload: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LogSnapshot {
+    pub environment_id: Uuid,
+    pub resource: String,
+    pub cursor: u64,
+    pub reset: bool,
+    pub lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -344,6 +365,12 @@ pub struct SupervisorStartRequest {
     pub environment_id: Uuid,
     pub operation_id: Uuid,
     pub process: ProcessSpec,
+    /// Private per-environment directory, created by the daemon before launch.
+    pub log_directory: String,
+    /// Per-resource disk cap. Payloads never enter daemon state or event rows.
+    pub log_max_bytes: u64,
+    /// Explicit values that should be redacted before a line reaches disk.
+    pub redactions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -458,5 +485,15 @@ mod tests {
         let mut input = std::io::Cursor::new(b"{}".to_vec());
         let result = read_json_line::<Value>(&mut input);
         assert_eq!(result, Err(ProtocolError::MissingFrameTerminator));
+    }
+
+    #[test]
+    fn serializes_the_public_event_subscription_method() {
+        let request = DaemonRequest::EventsSubscribe {
+            environment_id: Uuid::nil(),
+            after: Some(7),
+        };
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(encoded["command"], "events.subscribe");
     }
 }

@@ -4,7 +4,12 @@ use devfleet_protocol::{
     DaemonRequest, DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, PROTOCOL_VERSION,
     ProcessSpec, SmokeResponse, SmokeStatus,
 };
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -27,20 +32,33 @@ struct Args {
 enum Command {
     Plan(PlanArgs),
     Up(UpArgs),
-    Status {
-        environment_id: Uuid,
-    },
+    Status { environment_id: Uuid },
     List,
-    Stop {
-        environment_id: Uuid,
-    },
+    Stop { environment_id: Uuid },
     Operation(OperationArgs),
-    Events {
-        environment_id: Uuid,
-        #[arg(long)]
-        after: Option<u64>,
-    },
+    Events(EventsArgs),
+    Logs(LogsArgs),
     Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct LogsArgs {
+    environment_id: Uuid,
+    #[arg(long, default_value = "process")]
+    resource: String,
+    #[arg(long)]
+    follow: bool,
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+}
+
+#[derive(ClapArgs)]
+struct EventsArgs {
+    environment_id: Uuid,
+    #[arg(long)]
+    after: Option<u64>,
+    #[arg(long)]
+    follow: bool,
 }
 
 #[derive(ClapArgs)]
@@ -133,9 +151,105 @@ fn main() -> anyhow::Result<()> {
     let command = args
         .command
         .ok_or_else(|| anyhow::anyhow!("a control command is required"))?;
-    let response = request(&socket, request_from(command)?)?;
-    print_response(&response, args.json)?;
-    Ok(())
+    match command {
+        Command::Logs(logs) => print_logs(&socket, &logs, args.json),
+        Command::Events(events) => print_events(&socket, &events, args.json),
+        command => {
+            let response = request(&socket, request_from(command)?)?;
+            print_response(&response, args.json)
+        }
+    }
+}
+
+fn print_events(socket: &Path, events: &EventsArgs, json: bool) -> anyhow::Result<()> {
+    let mut after = events.after;
+    let mut deduplicator = EventDeduplicator::new();
+    loop {
+        let response = request(
+            socket,
+            DaemonRequest::EventsSubscribe {
+                environment_id: events.environment_id,
+                after,
+            },
+        )?;
+        let DaemonResponse::Events(received) = response else {
+            anyhow::bail!("daemon returned an unexpected events response");
+        };
+        if let Some(event) = received.last() {
+            after = Some(event.sequence);
+        }
+        let deduplicated = received
+            .into_iter()
+            .filter(|event| deduplicator.insert(event.id))
+            .collect();
+        print_response(&DaemonResponse::Events(deduplicated), json)?;
+        if !events.follow {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+struct EventDeduplicator {
+    ids: HashSet<Uuid>,
+    order: VecDeque<Uuid>,
+}
+
+impl EventDeduplicator {
+    const CAPACITY: usize = 256;
+
+    fn new() -> Self {
+        Self {
+            ids: HashSet::with_capacity(Self::CAPACITY),
+            order: VecDeque::with_capacity(Self::CAPACITY),
+        }
+    }
+
+    fn insert(&mut self, id: Uuid) -> bool {
+        if !self.ids.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > Self::CAPACITY
+            && let Some(expired) = self.order.pop_front()
+        {
+            self.ids.remove(&expired);
+        }
+        true
+    }
+}
+
+fn print_logs(socket: &Path, logs: &LogsArgs, json: bool) -> anyhow::Result<()> {
+    let mut after = None;
+    loop {
+        let response = request(
+            socket,
+            DaemonRequest::LogsTail {
+                environment_id: logs.environment_id,
+                resource: logs.resource.clone(),
+                after,
+                limit: logs.limit,
+            },
+        )?;
+        let DaemonResponse::Logs(segment) = response else {
+            anyhow::bail!("daemon returned an unexpected log response");
+        };
+        if json {
+            println!("{}", serde_json::to_string(&segment)?);
+        } else {
+            for line in &segment.lines {
+                println!("{line}");
+            }
+            if segment.reset {
+                eprintln!("log cursor reset after rotation; showing the current file");
+            }
+        }
+        after = Some(segment.cursor);
+        if !logs.follow {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
@@ -183,12 +297,15 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 Ok(DaemonRequest::OperationCancel { operation_id })
             }
         },
-        Command::Events {
-            environment_id,
-            after,
-        } => Ok(DaemonRequest::Events {
-            environment_id,
-            after,
+        Command::Events(events) => Ok(DaemonRequest::EventsSubscribe {
+            environment_id: events.environment_id,
+            after: events.after,
+        }),
+        Command::Logs(logs) => Ok(DaemonRequest::LogsTail {
+            environment_id: logs.environment_id,
+            resource: logs.resource,
+            after: None,
+            limit: logs.limit,
         }),
         Command::Plugin(plugin) => match plugin.command {
             PluginCommand::List => Ok(DaemonRequest::PluginList),
@@ -291,6 +408,11 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                 println!("{} {} {}", event.sequence, event.id, event.kind);
             }
         }
+        DaemonResponse::Logs(logs) => {
+            for line in &logs.lines {
+                println!("{line}");
+            }
+        }
         DaemonResponse::Plugin(plugin) => println!(
             "{} {} {} trusted={}",
             plugin.id, plugin.version, plugin.checksum, plugin.trusted
@@ -323,5 +445,17 @@ mod tests {
         assert!(parse_json_values(vec!["missing".into()], "--output").is_err());
         assert!(parse_json_values(vec!["api.port=not-json".into()], "--output").is_err());
         assert!(parse_references(vec!["API_TOKEN".into(), "API_TOKEN".into()]).is_err());
+    }
+
+    #[test]
+    fn deduplicates_events_without_unbounded_client_memory() {
+        let mut deduplicator = EventDeduplicator::new();
+        let first = Uuid::now_v7();
+        assert!(deduplicator.insert(first));
+        assert!(!deduplicator.insert(first));
+        for _ in 0..EventDeduplicator::CAPACITY {
+            assert!(deduplicator.insert(Uuid::now_v7()));
+        }
+        assert!(deduplicator.insert(first));
     }
 }

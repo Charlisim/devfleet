@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -477,6 +478,20 @@ impl StateStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![event.id.to_string(), event.timestamp_unix_ms.to_string(), event.environment_id.to_string(), event.resource_id,
                 i64::try_from(event.generation).map_err(|_| StateError::NumericOutOfRange)?, event.operation_id.map(|value| value.to_string()), event.kind, serde_json::to_string(&event.payload)?],
+        )?;
+        self.connection.execute(
+            "DELETE FROM events
+             WHERE environment_id = ?1
+               AND sequence NOT IN (
+                   SELECT sequence FROM events
+                   WHERE environment_id = ?1
+                   ORDER BY sequence DESC
+                   LIMIT ?2
+               )",
+            params![
+                event.environment_id.to_string(),
+                MAX_RETAINED_EVENTS_PER_ENVIRONMENT
+            ],
         )?;
         Ok(())
     }
@@ -1467,6 +1482,7 @@ mod tests {
     fn resumes_events_by_sequence_and_rejects_expired_cursor() {
         let mut store = StateStore::open_in_memory().expect("state opens");
         let environment_id = Uuid::now_v7();
+        let other_environment_id = Uuid::now_v7();
         for kind in ["planning", "running"] {
             store
                 .append_event(&StoredEvent {
@@ -1482,16 +1498,50 @@ mod tests {
                 })
                 .expect("event persists");
         }
+        store
+            .append_event(&StoredEvent {
+                sequence: 0,
+                id: Uuid::now_v7(),
+                timestamp_unix_ms: 1,
+                environment_id: other_environment_id,
+                resource_id: Some("other".into()),
+                generation: 1,
+                operation_id: None,
+                kind: "other".into(),
+                payload: serde_json::json!({}),
+            })
+            .expect("other event persists");
         let events = store
             .events_after(environment_id, Some(1))
             .expect("cursor resumes");
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            store
-                .events_after(environment_id, Some(0))
-                .expect("initial cursor reads")
-                .len(),
-            2
+        let initial = store
+            .events_after(environment_id, Some(0))
+            .expect("initial cursor reads");
+        assert_eq!(initial.len(), 2);
+        assert!(
+            initial
+                .iter()
+                .all(|event| event.environment_id == environment_id)
         );
+        for sequence in 0..MAX_RETAINED_EVENTS_PER_ENVIRONMENT {
+            store
+                .append_event(&StoredEvent {
+                    sequence: 0,
+                    id: Uuid::now_v7(),
+                    timestamp_unix_ms: u128::try_from(sequence).expect("positive sequence"),
+                    environment_id,
+                    resource_id: Some("api".into()),
+                    generation: 1,
+                    operation_id: None,
+                    kind: "retained".into(),
+                    payload: serde_json::json!({}),
+                })
+                .expect("event persists");
+        }
+        assert!(matches!(
+            store.events_after(environment_id, Some(0)),
+            Err(StateError::CursorExpired)
+        ));
     }
 }

@@ -1,6 +1,7 @@
 //! Per-environment owner of one process group and its private control socket.
 
 use anyhow::Context as _;
+use devfleet_core::LogStore;
 use devfleet_protocol::{
     HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginAction, PluginCall,
     PluginReconcileRequest, ProcessSnapshot, ReadinessState, SupervisorRequest, SupervisorResponse,
@@ -13,17 +14,21 @@ use nix::{
 };
 use std::{
     fs,
-    io::{self, BufReader, Write},
+    io::{self, BufReader, Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixListener, process::CommandExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    thread,
+    sync::mpsc::{self, SyncSender},
+    thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const SIGNAL_WAIT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INITIAL_READINESS_WINDOW: Duration = Duration::from_millis(50);
+const LOG_QUEUE_CAPACITY: usize = 128;
+const LOG_READ_BUFFER_BYTES: usize = 4 * 1024;
+const MAX_CAPTURED_LINE_BYTES: usize = 16 * 1024;
 
 /// Starts one supervisor using a request received on standard input.
 ///
@@ -40,6 +45,7 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
     let spawn_request =
         request_spawn(process_plugin, &initial).context("request process provider spawn")?;
     let mut child = spawn(&spawn_request).context("spawn provider process")?;
+    let logs = capture_logs(&mut child, &initial).context("capture provider process logs")?;
     let pid = i32::try_from(child.id()).map_err(|_| anyhow::anyhow!("PID exceeds i32"))?;
     let mut snapshot = ProcessSnapshot {
         pid: pid
@@ -66,6 +72,7 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
         match listener.accept() {
             Ok((stream, _)) => {
                 if handle_control(stream, &mut child, &mut snapshot)? {
+                    logs.finish();
                     return Ok(());
                 }
             }
@@ -137,9 +144,84 @@ fn spawn(request: &HostSpawnRequest) -> anyhow::Result<Child> {
         .envs(&request.environment)
         .process_group(0)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     Ok(command.spawn()?)
+}
+
+struct LogCapture {
+    readers: Vec<JoinHandle<()>>,
+    writer: JoinHandle<()>,
+}
+
+impl LogCapture {
+    fn finish(self) {
+        for reader in self.readers {
+            let _ = reader.join();
+        }
+        let _ = self.writer.join();
+    }
+}
+
+fn capture_logs(child: &mut Child, initial: &SupervisorStartRequest) -> anyhow::Result<LogCapture> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("provider process stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("provider process stderr unavailable"))?;
+    let logs = LogStore::new(
+        PathBuf::from(&initial.log_directory),
+        initial.log_max_bytes,
+        initial.redactions.clone(),
+    )?;
+    let (sender, receiver) = mpsc::sync_channel(LOG_QUEUE_CAPACITY);
+    let readers = vec![
+        capture_stream(stdout, sender.clone()),
+        capture_stream(stderr, sender),
+    ];
+    let writer = thread::spawn(move || {
+        while let Ok(line) = receiver.recv() {
+            if logs.append("process", &line).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(LogCapture { readers, writer })
+}
+
+fn capture_stream<R>(mut stream: R, sender: SyncSender<String>) -> JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; LOG_READ_BUFFER_BYTES];
+        let mut line = Vec::with_capacity(MAX_CAPTURED_LINE_BYTES);
+        loop {
+            let read = match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            for byte in &buffer[..read] {
+                if *byte == b'\n' {
+                    if sender
+                        .send(String::from_utf8_lossy(&line).into_owned())
+                        .is_err()
+                    {
+                        return;
+                    }
+                    line.clear();
+                } else if line.len() < MAX_CAPTURED_LINE_BYTES {
+                    line.push(*byte);
+                }
+            }
+        }
+        if !line.is_empty() {
+            let _ = sender.send(String::from_utf8_lossy(&line).into_owned());
+        }
+    })
 }
 
 fn handle_control(

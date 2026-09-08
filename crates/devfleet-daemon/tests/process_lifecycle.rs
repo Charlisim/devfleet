@@ -79,7 +79,7 @@ fn client_reconnects_to_the_same_owned_process_and_stop_preserves_data() {
     );
     let events = request(
         &fixture.socket,
-        DaemonRequest::Events {
+        DaemonRequest::EventsSubscribe {
             environment_id: accepted.environment_id,
             after: Some(0),
         },
@@ -121,6 +121,76 @@ fn client_reconnects_to_the_same_owned_process_and_stop_preserves_data() {
 
     unrelated.kill().expect("unrelated cleanup");
     unrelated.wait().expect("unrelated reaps");
+}
+
+#[test]
+fn bounded_redacted_logs_do_not_block_control_operations() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let secret = "value-that-must-not-reach-disk";
+    let environment = request(
+        &fixture.socket,
+        DaemonRequest::Up(EnvironmentUpRequest {
+            worktree: temporary.path().display().to_string(),
+            profile: "logs".into(),
+            instance: None,
+            trusted: true,
+            process: ProcessSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "i=0; while [ $i -lt 512 ]; do printf 'line-%s\\n' \"$i\"; i=$((i + 1)); done; printf 'token=%s\\n' \"$API_TOKEN\"; exec sleep 60".into(),
+                ],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::from([("API_TOKEN".into(), secret.into())]),
+            },
+        }),
+    )
+    .expect("start accepted");
+    let DaemonResponse::Accepted(accepted) = environment else {
+        panic!("expected accepted operation");
+    };
+
+    let logs = wait_for_logs(&fixture.socket, accepted.environment_id);
+    assert!(logs.lines.len() <= 256);
+    assert!(logs.lines.iter().any(|line| line == "line-511"));
+    assert!(logs.lines.iter().any(|line| line == "token=[REDACTED]"));
+    assert!(logs.lines.iter().all(|line| !line.contains(secret)));
+
+    let started = Instant::now();
+    let status = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: accepted.environment_id,
+        },
+    )
+    .expect("status stays available while logs are captured");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(matches!(status, DaemonResponse::Environment(_)));
+
+    let resumed = request(
+        &fixture.socket,
+        DaemonRequest::LogsTail {
+            environment_id: accepted.environment_id,
+            resource: "process".into(),
+            after: Some(logs.cursor),
+            limit: 256,
+        },
+    )
+    .expect("resume logs");
+    let DaemonResponse::Logs(resumed) = resumed else {
+        panic!("expected logs response");
+    };
+    assert!(resumed.lines.is_empty());
+
+    request(
+        &fixture.socket,
+        DaemonRequest::Stop {
+            environment_id: accepted.environment_id,
+        },
+    )
+    .expect("stop remains available after high-volume logging");
 }
 
 #[test]
@@ -455,6 +525,33 @@ fn wait_for_path(path: &Path) {
         assert!(
             started.elapsed() < TIMEOUT,
             "daemon socket startup timed out"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_logs(socket: &Path, environment_id: uuid::Uuid) -> devfleet_protocol::LogSnapshot {
+    let started = Instant::now();
+    loop {
+        let response = request(
+            socket,
+            DaemonRequest::LogsTail {
+                environment_id,
+                resource: "process".into(),
+                after: None,
+                limit: 256,
+            },
+        )
+        .expect("logs request");
+        let DaemonResponse::Logs(logs) = response else {
+            panic!("expected logs response");
+        };
+        if logs.lines.iter().any(|line| line == "token=[REDACTED]") {
+            return logs;
+        }
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "process logs were not captured"
         );
         thread::sleep(Duration::from_millis(10));
     }

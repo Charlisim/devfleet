@@ -1,12 +1,12 @@
 //! Local daemon: private IPC, persistent state, and supervisor composition.
 
-use devfleet_core::{PlanOptions, compile_manifest, discover_git_worktree};
+use devfleet_core::{LogStore, PlanOptions, compile_manifest, discover_git_worktree};
 use devfleet_protocol::{
     DaemonRequest, DaemonResponse, EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode,
-    EventSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState, OperationAccepted,
-    OperationSnapshot, PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot, ReadinessState,
-    RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest, read_json_line,
-    write_json_line,
+    EventSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, OperationAccepted,
+    OperationSnapshot, PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot, ProcessSpec,
+    ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
+    read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredEnvironment, StoredEvent, StoredLifecycle, StoredOperation, StoredProcess,
@@ -34,6 +34,7 @@ use uuid::Uuid;
 const SOCKET_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 const SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_SOCKET_PATH_BYTES: usize = 96;
+const MAX_RESOURCE_LOG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -135,7 +136,17 @@ impl Daemon {
             DaemonRequest::Events {
                 environment_id,
                 after,
+            }
+            | DaemonRequest::EventsSubscribe {
+                environment_id,
+                after,
             } => self.events(environment_id, after),
+            DaemonRequest::LogsTail {
+                environment_id,
+                resource,
+                after,
+                limit,
+            } => self.logs_tail(environment_id, &resource, after, limit),
             DaemonRequest::PluginList => self.plugin_list(),
             DaemonRequest::PluginInstall { path } => self.plugin_install(Path::new(&path)),
             DaemonRequest::PluginTrust { id } => self.plugin_trust(&id),
@@ -304,10 +315,17 @@ impl Daemon {
             "process",
         )?;
         let control_socket = supervisor_socket_path(environment.id)?;
+        let log_directory = log_directory(&self.config.state_dir, environment.id);
+        prepare_private_dir(&log_directory)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let redactions = known_secret_values(&request.process);
         let start = SupervisorStartRequest {
             environment_id: environment.id,
             operation_id,
             process: request.process,
+            log_directory: log_directory.display().to_string(),
+            log_max_bytes: MAX_RESOURCE_LOG_BYTES,
+            redactions,
         };
         if let Err(error) = self.start_supervisor(&control_socket, &process_plugin, &start) {
             self.state.mark_failed(environment.id)?;
@@ -425,6 +443,37 @@ impl Daemon {
                 .map(event_snapshot)
                 .collect(),
         ))
+    }
+
+    fn logs_tail(
+        &self,
+        environment_id: Uuid,
+        resource: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<DaemonResponse, DaemonError> {
+        self.state
+            .environment(environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        if resource != "process" {
+            return Err(DaemonError::NotFound);
+        }
+        let logs = LogStore::new(
+            log_directory(&self.config.state_dir, environment_id),
+            MAX_RESOURCE_LOG_BYTES,
+            Vec::new(),
+        )
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let tail = logs
+            .tail_from(resource, after, limit)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        Ok(DaemonResponse::Logs(LogSnapshot {
+            environment_id,
+            resource: resource.into(),
+            cursor: tail.cursor,
+            reset: tail.reset,
+            lines: tail.lines,
+        }))
     }
 
     fn emit_event(
@@ -928,6 +977,31 @@ fn supervisor_socket_path(environment_id: Uuid) -> Result<PathBuf, DaemonError> 
     let path = directory.join(format!("s-{environment_id}.sock"));
     ensure_short_socket_path(&path).map_err(|error| DaemonError::Operation(error.to_string()))?;
     Ok(path)
+}
+
+fn log_directory(state_dir: &Path, environment_id: Uuid) -> PathBuf {
+    state_dir.join("logs").join(environment_id.to_string())
+}
+
+fn known_secret_values(process: &ProcessSpec) -> Vec<String> {
+    process
+        .environment
+        .iter()
+        .filter_map(|(name, value)| {
+            let normalized = name.to_ascii_lowercase();
+            let secret_name = [
+                "secret",
+                "token",
+                "password",
+                "credential",
+                "api_key",
+                "apikey",
+            ]
+            .iter()
+            .any(|marker| normalized.contains(marker));
+            (secret_name && !value.is_empty()).then(|| value.clone())
+        })
+        .collect()
 }
 
 fn wait_for_socket(path: &Path) -> Result<(), DaemonError> {
