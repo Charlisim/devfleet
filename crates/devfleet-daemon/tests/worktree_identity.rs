@@ -184,6 +184,7 @@ fn start_daemon(root: &Path) -> DaemonFixture {
         .parent()
         .expect("binary directory")
         .to_owned();
+    let process_plugin = binary_dir.join("devfleet-plugin-process");
     let child = Command::new(binary_dir.join("devfleetd"))
         .args([
             "--serve",
@@ -197,10 +198,7 @@ fn start_daemon(root: &Path) -> DaemonFixture {
                 .to_str()
                 .expect("supervisor UTF-8"),
             "--process-plugin",
-            binary_dir
-                .join("devfleet-plugin-process")
-                .to_str()
-                .expect("plugin UTF-8"),
+            process_plugin.to_str().expect("plugin UTF-8"),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -208,6 +206,20 @@ fn start_daemon(root: &Path) -> DaemonFixture {
         .spawn()
         .expect("daemon starts");
     wait_for_path(&socket);
+    request(
+        &socket,
+        DaemonRequest::PluginInstall {
+            path: process_plugin.display().to_string(),
+        },
+    )
+    .expect("plugin installs");
+    request(
+        &socket,
+        DaemonRequest::PluginTrust {
+            id: "official.process".into(),
+        },
+    )
+    .expect("plugin trust persists");
     DaemonFixture { child, socket }
 }
 

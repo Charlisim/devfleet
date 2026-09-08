@@ -119,6 +119,9 @@ pub enum DaemonRequest {
     Status { environment_id: Uuid },
     List,
     Stop { environment_id: Uuid },
+    PluginList,
+    PluginInstall { path: String },
+    PluginTrust { id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -127,12 +130,27 @@ pub enum DaemonResponse {
     Accepted(OperationAccepted),
     Environment(EnvironmentSnapshot),
     Environments(Vec<EnvironmentSnapshot>),
+    Plugin(PluginSnapshot),
+    Plugins(Vec<PluginSnapshot>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OperationAccepted {
     pub operation_id: Uuid,
     pub environment_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PluginSnapshot {
+    pub id: String,
+    pub path: String,
+    pub platform: String,
+    pub version: String,
+    pub checksum: String,
+    pub protocol: ProtocolVersion,
+    pub plugin_state_version: u32,
+    pub capabilities: Vec<String>,
+    pub trusted: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -182,11 +200,63 @@ pub struct PluginReconcileRequest {
     pub process: ProcessSpec,
 }
 
+/// One versioned SDK call delivered inside a bounded JSON-RPC frame.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PluginCall {
+    pub protocol: ProtocolVersion,
+    pub plugin_state_version: u32,
+    pub operation_id: Uuid,
+    pub action: PluginAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "arguments", rename_all = "snake_case")]
+pub enum PluginAction {
+    Initialize,
+    Validate { configuration: Value },
+    Plan { configuration: Value },
+    Inspect,
+    Reconcile(PluginReconcileRequest),
+    Stop,
+    Destroy,
+    Action { name: String, input: Value },
+    Cancel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostExecutionContext {
+    pub cwd: String,
+    pub environment: BTreeMap<String, String>,
+    pub artifact_root: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "request", content = "arguments", rename_all = "snake_case")]
+pub enum HostRequest {
+    Exec(HostExecRequest),
+    Spawn(HostSpawnRequest),
+    StopProcess { process_group: i32 },
+    WriteArtifact(HostWriteArtifactRequest),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostExecRequest {
+    pub argv: Vec<String>,
+    pub context: HostExecutionContext,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostSpawnRequest {
     pub argv: Vec<String>,
     pub cwd: String,
     pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostWriteArtifactRequest {
+    pub relative_path: String,
+    pub contents: Vec<u8>,
+    pub context: HostExecutionContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

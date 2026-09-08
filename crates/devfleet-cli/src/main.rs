@@ -29,6 +29,20 @@ enum Command {
     Status { environment_id: Uuid },
     List,
     Stop { environment_id: Uuid },
+    Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct PluginArgs {
+    #[command(subcommand)]
+    command: PluginCommand,
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    List,
+    Install { path: PathBuf },
+    Trust { id: String },
 }
 
 #[derive(ClapArgs)]
@@ -92,6 +106,13 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
         Command::Stop { environment_id } => Ok(DaemonRequest::Stop { environment_id }),
+        Command::Plugin(plugin) => match plugin.command {
+            PluginCommand::List => Ok(DaemonRequest::PluginList),
+            PluginCommand::Install { path } => Ok(DaemonRequest::PluginInstall {
+                path: path.canonicalize()?.display().to_string(),
+            }),
+            PluginCommand::Trust { id } => Ok(DaemonRequest::PluginTrust { id }),
+        },
     }
 }
 
@@ -134,6 +155,18 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                     environment.project_id,
                     environment.worktree_id,
                     environment.lifecycle
+                );
+            }
+        }
+        DaemonResponse::Plugin(plugin) => println!(
+            "{} {} {} trusted={}",
+            plugin.id, plugin.version, plugin.checksum, plugin.trusted
+        ),
+        DaemonResponse::Plugins(plugins) => {
+            for plugin in plugins {
+                println!(
+                    "{} {} {} trusted={}",
+                    plugin.id, plugin.version, plugin.checksum, plugin.trusted
                 );
             }
         }

@@ -6,7 +6,7 @@ use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -22,6 +22,8 @@ pub enum StateError {
     InvalidReadiness,
     #[error("stored numeric value is outside the supported range")]
     NumericOutOfRange,
+    #[error("stored JSON is invalid")]
+    Json(#[from] serde_json::Error),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -120,6 +122,20 @@ pub struct VerifiedGitContext {
     pub head: String,
     pub branch: Option<String>,
     pub detached: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredPlugin {
+    pub id: String,
+    pub path: String,
+    pub platform: String,
+    pub version: String,
+    pub checksum: String,
+    pub protocol_major: u16,
+    pub protocol_minor: u16,
+    pub plugin_state_version: u32,
+    pub capabilities: Vec<String>,
+    pub trusted: bool,
 }
 
 pub struct StateStore {
@@ -316,6 +332,102 @@ impl StateStore {
         self.query_environments(None)
     }
 
+    /// Lists installed provider binaries and their independent trust decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read provider metadata.
+    pub fn plugins(&self) -> Result<Vec<StoredPlugin>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, path, platform, version, checksum, protocol_major, protocol_minor,
+                    plugin_state_version, capabilities_json, trusted
+             FROM plugins ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StoredPlugin {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                platform: row.get(2)?,
+                version: row.get(3)?,
+                checksum: row.get(4)?,
+                protocol_major: row.get(5)?,
+                protocol_minor: row.get(6)?,
+                plugin_state_version: row.get(7)?,
+                capabilities: serde_json::from_str(&row.get::<_, String>(8)?)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                trusted: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StateError::from)
+    }
+
+    /// Reads one installed provider by stable descriptor identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read provider metadata.
+    pub fn plugin(&self, id: &str) -> Result<Option<StoredPlugin>, StateError> {
+        Ok(self.plugins()?.into_iter().find(|plugin| plugin.id == id))
+    }
+
+    /// Records an inspected provider without granting execution trust.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist provider metadata.
+    pub fn record_plugin(&mut self, plugin: &StoredPlugin) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO plugins (id, path, platform, version, checksum, protocol_major,
+                                  protocol_minor, plugin_state_version, capabilities_json, trusted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO UPDATE SET path = excluded.path, platform = excluded.platform,
+                 version = excluded.version, checksum = excluded.checksum,
+                 protocol_major = excluded.protocol_major, protocol_minor = excluded.protocol_minor,
+                 plugin_state_version = excluded.plugin_state_version,
+                 capabilities_json = excluded.capabilities_json, trusted = excluded.trusted",
+            params![
+                plugin.id,
+                plugin.path,
+                plugin.platform,
+                plugin.version,
+                plugin.checksum,
+                plugin.protocol_major,
+                plugin.protocol_minor,
+                plugin.plugin_state_version,
+                serde_json::to_string(&plugin.capabilities)?,
+                plugin.trusted,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Changes only the explicit user trust decision for an installed provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the trust decision.
+    pub fn set_plugin_trusted(&mut self, id: &str) -> Result<bool, StateError> {
+        Ok(self
+            .connection
+            .execute("UPDATE plugins SET trusted = 1 WHERE id = ?1", params![id])?
+            == 1)
+    }
+
+    /// Reports whether updates could disturb an active environment operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot inspect environment lifecycle state.
+    pub fn has_active_environments(&self) -> Result<bool, StateError> {
+        let count = self.connection.query_row(
+            "SELECT COUNT(*) FROM environments WHERE lifecycle IN ('starting', 'running')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Updates verified Git context without changing project or worktree identity.
     ///
     /// # Errors
@@ -398,6 +510,7 @@ impl StateStore {
         Ok(environments)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn migrate(&mut self) -> Result<(), StateError> {
         let version = self.schema_version()?;
         if version > CURRENT_SCHEMA_VERSION {
@@ -481,6 +594,25 @@ impl StateStore {
                  UPDATE environments
                  SET common_git_dir = '', git_dir = '', head = '';
                  PRAGMA user_version = 4;
+                 COMMIT;",
+            )?;
+        }
+        if version < 5 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS plugins (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    protocol_major INTEGER NOT NULL,
+                    protocol_minor INTEGER NOT NULL,
+                    plugin_state_version INTEGER NOT NULL,
+                    capabilities_json TEXT NOT NULL,
+                    trusted INTEGER NOT NULL DEFAULT 0
+                 );
+                 PRAGMA user_version = 5;
                  COMMIT;",
             )?;
         }

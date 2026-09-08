@@ -3,8 +3,9 @@
 use devfleet_core::discover_git_worktree;
 use devfleet_protocol::{
     DaemonRequest, DaemonResponse, EnvironmentSnapshot, ErrorCode, JsonRpcRequest, JsonRpcResponse,
-    LifecycleState, OperationAccepted, ProcessSnapshot, ReadinessState, RpcFailure,
-    SupervisorRequest, SupervisorResponse, SupervisorStartRequest, read_json_line, write_json_line,
+    LifecycleState, OperationAccepted, PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot,
+    ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
+    read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredEnvironment, StoredLifecycle, StoredProcess, StoredReadiness,
@@ -12,9 +13,10 @@ use devfleet_state::{
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufReader, Write},
+    io::{BufReader, Read, Write},
     os::unix::{
         fs::{MetadataExt, PermissionsExt},
         net::UnixListener,
@@ -124,6 +126,9 @@ impl Daemon {
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
+            DaemonRequest::PluginList => self.plugin_list(),
+            DaemonRequest::PluginInstall { path } => self.plugin_install(Path::new(&path)),
+            DaemonRequest::PluginTrust { id } => self.plugin_trust(&id),
         }
     }
 
@@ -132,6 +137,7 @@ impl Daemon {
         request: devfleet_protocol::EnvironmentUpRequest,
     ) -> Result<DaemonResponse, DaemonError> {
         validate_up_request(&request)?;
+        let process_plugin = self.trusted_process_plugin()?;
         let git_identity = discover_git_worktree(Path::new(&request.worktree))
             .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
         let git_context = VerifiedGitContext {
@@ -206,7 +212,7 @@ impl Daemon {
             operation_id,
             process: request.process,
         };
-        if let Err(error) = self.start_supervisor(&control_socket, &start) {
+        if let Err(error) = self.start_supervisor(&control_socket, &process_plugin, &start) {
             self.state.mark_failed(environment.id)?;
             return Err(error);
         }
@@ -267,6 +273,7 @@ impl Daemon {
     fn start_supervisor(
         &self,
         control_socket: &Path,
+        process_plugin: &Path,
         request: &SupervisorStartRequest,
     ) -> Result<(), DaemonError> {
         if control_socket.exists() {
@@ -277,7 +284,7 @@ impl Daemon {
             .arg("--control-socket")
             .arg(control_socket)
             .arg("--process-plugin")
-            .arg(&self.config.process_plugin)
+            .arg(process_plugin)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -296,12 +303,112 @@ impl Daemon {
         });
         wait_for_socket(control_socket)
     }
+
+    fn plugin_list(&self) -> Result<DaemonResponse, DaemonError> {
+        Ok(DaemonResponse::Plugins(
+            self.state
+                .plugins()?
+                .into_iter()
+                .map(plugin_snapshot)
+                .collect(),
+        ))
+    }
+
+    fn plugin_install(&mut self, path: &Path) -> Result<DaemonResponse, DaemonError> {
+        let inspected = inspect_plugin(path)?;
+        if let Some(existing) = self.state.plugin(&inspected.id)? {
+            if existing.plugin_state_version != inspected.plugin_state_version {
+                return Err(DaemonError::InvalidConfig(
+                    "plugin state migration is not supported for this provider".into(),
+                ));
+            }
+            if existing.checksum != inspected.checksum && self.state.has_active_environments()? {
+                return Err(DaemonError::Operation(
+                    "plugin updates are blocked while environments are active".into(),
+                ));
+            }
+        }
+        self.state.record_plugin(&inspected)?;
+        self.write_plugin_lockfile()?;
+        Ok(DaemonResponse::Plugin(plugin_snapshot(inspected)))
+    }
+
+    fn plugin_trust(&mut self, id: &str) -> Result<DaemonResponse, DaemonError> {
+        let plugin = self.state.plugin(id)?.ok_or(DaemonError::NotFound)?;
+        self.verify_plugin_lock(&plugin)?;
+        if !self.state.set_plugin_trusted(id)? {
+            return Err(DaemonError::NotFound);
+        }
+        let trusted = self.state.plugin(id)?.ok_or(DaemonError::NotFound)?;
+        self.write_plugin_lockfile()?;
+        Ok(DaemonResponse::Plugin(plugin_snapshot(trusted)))
+    }
+
+    fn trusted_process_plugin(&self) -> Result<PathBuf, DaemonError> {
+        let plugin = self
+            .state
+            .plugin("official.process")?
+            .ok_or(DaemonError::PluginTrustRequired)?;
+        if !plugin.trusted {
+            return Err(DaemonError::PluginTrustRequired);
+        }
+        self.verify_plugin_lock(&plugin)?;
+        let inspected = inspect_plugin(Path::new(&plugin.path))?;
+        if !same_plugin_metadata(&plugin, &inspected)
+            || !inspected
+                .capabilities
+                .iter()
+                .any(|item| item == "process.reconcile")
+        {
+            return Err(DaemonError::InvalidConfig(
+                "installed official.process descriptor or checksum no longer matches its lockfile"
+                    .into(),
+            ));
+        }
+        Ok(PathBuf::from(plugin.path))
+    }
+
+    fn write_plugin_lockfile(&self) -> Result<(), DaemonError> {
+        let lockfile = self.config.state_dir.join("plugins.lock.json");
+        let temporary = self.config.state_dir.join("plugins.lock.json.new");
+        let snapshots: Vec<_> = self
+            .state
+            .plugins()?
+            .into_iter()
+            .map(plugin_snapshot)
+            .collect();
+        let bytes = serde_json::to_vec(&snapshots)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        fs::write(&temporary, bytes).map_err(|error| DaemonError::Operation(error.to_string()))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        fs::rename(temporary, lockfile).map_err(|error| DaemonError::Operation(error.to_string()))
+    }
+
+    fn verify_plugin_lock(&self, plugin: &devfleet_state::StoredPlugin) -> Result<(), DaemonError> {
+        let bytes = fs::read(self.config.state_dir.join("plugins.lock.json"))
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let entries: Vec<PluginSnapshot> = serde_json::from_slice(&bytes)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        if entries
+            .iter()
+            .any(|entry| plugin_matches_snapshot(plugin, entry))
+        {
+            Ok(())
+        } else {
+            Err(DaemonError::InvalidConfig(
+                "installed plugin is absent from the lockfile".into(),
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 enum DaemonError {
     #[error("explicit project trust is required before executing a process")]
     TrustRequired,
+    #[error("explicit plugin trust is required before executing this provider")]
+    PluginTrustRequired,
     #[error("process configuration is invalid: {0}")]
     InvalidConfig(String),
     #[error("environment was not found")]
@@ -317,7 +424,9 @@ enum DaemonError {
 impl From<DaemonError> for RpcFailure {
     fn from(error: DaemonError) -> Self {
         let code = match error {
-            DaemonError::TrustRequired => ErrorCode::PermissionDenied,
+            DaemonError::TrustRequired | DaemonError::PluginTrustRequired => {
+                ErrorCode::PermissionDenied
+            }
             DaemonError::InvalidConfig(_) => ErrorCode::ConfigInvalid,
             DaemonError::NotFound => ErrorCode::ResourceNotFound,
             DaemonError::OwnershipUncertain => ErrorCode::OwnershipUncertain,
@@ -329,6 +438,115 @@ impl From<DaemonError> for RpcFailure {
             retryable: false,
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct PluginDescriptor {
+    id: String,
+    version: String,
+    platform: String,
+    protocol: devfleet_protocol::ProtocolVersion,
+    capabilities: Vec<String>,
+    plugin_state_version: u32,
+}
+
+fn inspect_plugin(path: &Path) -> Result<devfleet_state::StoredPlugin, DaemonError> {
+    let output = Command::new(path)
+        .arg("--descriptor")
+        .output()
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+    if !output.status.success() || output.stdout.len() > devfleet_protocol::MAX_FRAME_BYTES {
+        return Err(DaemonError::InvalidConfig(
+            "plugin descriptor command failed or exceeded the protocol limit".into(),
+        ));
+    }
+    let descriptor: PluginDescriptor = serde_json::from_slice(&output.stdout)
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+    if descriptor.id.is_empty()
+        || descriptor.platform != current_platform()
+        || !PROTOCOL_VERSION.compatible_with(descriptor.protocol)
+    {
+        return Err(DaemonError::InvalidConfig(
+            "plugin descriptor identity, platform, or protocol is incompatible".into(),
+        ));
+    }
+    let mut binary =
+        File::open(path).map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = binary
+            .read(&mut buffer)
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(devfleet_state::StoredPlugin {
+        id: descriptor.id,
+        path: path.display().to_string(),
+        platform: descriptor.platform,
+        version: descriptor.version,
+        checksum: format!("{:x}", digest.finalize()),
+        protocol_major: descriptor.protocol.major,
+        protocol_minor: descriptor.protocol.minor,
+        plugin_state_version: descriptor.plugin_state_version,
+        capabilities: descriptor.capabilities,
+        trusted: false,
+    })
+}
+
+fn plugin_snapshot(plugin: devfleet_state::StoredPlugin) -> PluginSnapshot {
+    PluginSnapshot {
+        id: plugin.id,
+        path: plugin.path,
+        platform: plugin.platform,
+        version: plugin.version,
+        checksum: plugin.checksum,
+        protocol: devfleet_protocol::ProtocolVersion {
+            major: plugin.protocol_major,
+            minor: plugin.protocol_minor,
+        },
+        plugin_state_version: plugin.plugin_state_version,
+        capabilities: plugin.capabilities,
+        trusted: plugin.trusted,
+    }
+}
+
+fn same_plugin_metadata(
+    expected: &devfleet_state::StoredPlugin,
+    observed: &devfleet_state::StoredPlugin,
+) -> bool {
+    expected.id == observed.id
+        && expected.path == observed.path
+        && expected.platform == observed.platform
+        && expected.version == observed.version
+        && expected.checksum == observed.checksum
+        && expected.protocol_major == observed.protocol_major
+        && expected.protocol_minor == observed.protocol_minor
+        && expected.plugin_state_version == observed.plugin_state_version
+        && expected.capabilities == observed.capabilities
+}
+
+fn plugin_matches_snapshot(
+    plugin: &devfleet_state::StoredPlugin,
+    snapshot: &PluginSnapshot,
+) -> bool {
+    snapshot.id == plugin.id
+        && snapshot.path == plugin.path
+        && snapshot.platform == plugin.platform
+        && snapshot.version == plugin.version
+        && snapshot.checksum == plugin.checksum
+        && snapshot.protocol.major == plugin.protocol_major
+        && snapshot.protocol.minor == plugin.protocol_minor
+        && snapshot.plugin_state_version == plugin.plugin_state_version
+        && snapshot.capabilities == plugin.capabilities
+        && snapshot.trusted == plugin.trusted
+}
+
+fn current_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 fn validate_up_request(

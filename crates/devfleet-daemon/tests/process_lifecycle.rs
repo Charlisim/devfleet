@@ -19,6 +19,7 @@ struct DaemonFixture {
     child: Child,
     state_dir: PathBuf,
     socket: PathBuf,
+    process_plugin: PathBuf,
 }
 
 impl Drop for DaemonFixture {
@@ -138,6 +139,46 @@ fn untrusted_process_never_reaches_the_supervisor() {
 }
 
 #[test]
+fn trusted_project_cannot_execute_an_untrusted_plugin() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon_with_plugin_trust(temporary.path(), false);
+    let installed = request(
+        &fixture.socket,
+        DaemonRequest::PluginInstall {
+            path: fixture.process_plugin.display().to_string(),
+        },
+    )
+    .expect("plugin installs without trust");
+    let DaemonResponse::Plugin(installed) = installed else {
+        panic!("expected installed plugin");
+    };
+    assert!(!installed.trusted);
+    let result = request(
+        &fixture.socket,
+        DaemonRequest::Up(EnvironmentUpRequest {
+            worktree: temporary.path().display().to_string(),
+            profile: "process".into(),
+            instance: None,
+            trusted: true,
+            process: ProcessSpec {
+                argv: vec!["/bin/sleep".into(), "60".into()],
+                cwd: temporary.path().display().to_string(),
+                environment: BTreeMap::new(),
+            },
+        }),
+    );
+    assert!(result.is_err());
+    assert!(
+        devfleet_state::StateStore::open(&fixture.state_dir.join("state.sqlite3"))
+            .expect("state opens")
+            .environments()
+            .expect("state lists")
+            .is_empty()
+    );
+}
+
+#[test]
 fn immediately_exited_process_is_retained_as_failed() {
     let temporary = TempDir::new().expect("temporary directory");
     initialize_git_repository(temporary.path());
@@ -178,12 +219,17 @@ fn immediately_exited_process_is_retained_as_failed() {
 }
 
 fn start_daemon(root: &Path) -> DaemonFixture {
+    start_daemon_with_plugin_trust(root, true)
+}
+
+fn start_daemon_with_plugin_trust(root: &Path, trust_plugin: bool) -> DaemonFixture {
     let socket = root.join("d.sock");
     let state_dir = root.join("state");
     let binary_dir = PathBuf::from(env!("CARGO_BIN_EXE_devfleetd"))
         .parent()
         .expect("binary directory")
         .to_owned();
+    let process_plugin = binary_dir.join("devfleet-plugin-process");
     let child = Command::new(binary_dir.join("devfleetd"))
         .args([
             "--serve",
@@ -197,10 +243,7 @@ fn start_daemon(root: &Path) -> DaemonFixture {
                 .to_str()
                 .expect("supervisor UTF-8"),
             "--process-plugin",
-            binary_dir
-                .join("devfleet-plugin-process")
-                .to_str()
-                .expect("plugin UTF-8"),
+            process_plugin.to_str().expect("plugin UTF-8"),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -208,10 +251,27 @@ fn start_daemon(root: &Path) -> DaemonFixture {
         .spawn()
         .expect("daemon starts");
     wait_for_path(&socket);
+    if trust_plugin {
+        request(
+            &socket,
+            DaemonRequest::PluginInstall {
+                path: process_plugin.display().to_string(),
+            },
+        )
+        .expect("plugin installs");
+        request(
+            &socket,
+            DaemonRequest::PluginTrust {
+                id: "official.process".into(),
+            },
+        )
+        .expect("plugin trust persists");
+    }
     DaemonFixture {
         child,
         state_dir,
         socket,
+        process_plugin,
     }
 }
 
