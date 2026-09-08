@@ -81,7 +81,7 @@ install -m 644 rust-toolchain.toml "$package/share/devfleet/rust-toolchain.toml"
 
 (
   cd "$package"
-  find bin plugins share -type f -print | LC_ALL=C sort | xargs /usr/bin/shasum -a 256
+  find bin plugins share manifest.json plugins.lock.json -type f -print | LC_ALL=C sort | xargs /usr/bin/shasum -a 256
 ) >"$package/SHA256SUMS"
 
 mkdir -p "$output"
