@@ -1,0 +1,200 @@
+[
+  {
+    "binary_sha256": "3a60feb6c146c82d205712cc63b2a4b618d452cf9f1bc4c060e6b213697dd282",
+    "environment": "A",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "f851d935239d652f6ee928fc60d461e5018cfb926cdf291971058da4a042590d",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "initial",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "A",
+      "build_id": "cb236529bf369eb39148f47229ad986f1ab580e0853986215569e7857cf92536",
+      "bundle_environment": "A",
+      "native_environment": "A",
+      "nonce": "9FE4594A-6A51-405B-B278-8CB5F86E4119",
+      "revision": "initial"
+    },
+    "revision_sha256": "a852e3dd74341dce2a76166fba57b008c6099c4b26a26aee8574249a115d59dd",
+    "timestamp_unix": 1788836359,
+    "udid": "84A38E73-7152-48DE-83D1-21458329D3CD",
+    "verdict": "IDENTITY_VERIFIED",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/A"
+  },
+  {
+    "binary_sha256": "8bb00cf14fd9e0c4ab14464482063ba2e646ed057305efc978eea9a8a2952c36",
+    "environment": "B",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "08d8e4123d285c140f8607a7c86462a2fb6d1c6f501bd4017c0e8a73a934c0c5",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "initial",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "B",
+      "build_id": "67fb860842f007c8e7a230a6d8e89725694e600a59501797457fa7b3a04da74c",
+      "bundle_environment": "B",
+      "native_environment": "B",
+      "nonce": "DFCEBD0D-C4BC-4BA3-A4DB-4853091DC74D",
+      "revision": "initial"
+    },
+    "revision_sha256": "a852e3dd74341dce2a76166fba57b008c6099c4b26a26aee8574249a115d59dd",
+    "timestamp_unix": 1788836368,
+    "udid": "810A4C64-2334-4FD5-A2B7-8DBD8B5EB2CE",
+    "verdict": "IDENTITY_VERIFIED",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/B"
+  },
+  {
+    "binary_sha256": "3a60feb6c146c82d205712cc63b2a4b618d452cf9f1bc4c060e6b213697dd282",
+    "environment": "A",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "f851d935239d652f6ee928fc60d461e5018cfb926cdf291971058da4a042590d",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "js-edit",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "A",
+      "build_id": "cb236529bf369eb39148f47229ad986f1ab580e0853986215569e7857cf92536",
+      "bundle_environment": "A",
+      "native_environment": "A",
+      "nonce": "EE5178F3-802D-48B1-B25B-D3F8919B3165",
+      "revision": "edited-A"
+    },
+    "revision_sha256": "df26d056f9c485923acb64ebe19430131264b0e260182fb5ee6dfd1ab5f69d65",
+    "timestamp_unix": 1788836369,
+    "udid": "84A38E73-7152-48DE-83D1-21458329D3CD",
+    "verdict": "IDENTITY_VERIFIED",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/A"
+  },
+  {
+    "binary_sha256": "8bb00cf14fd9e0c4ab14464482063ba2e646ed057305efc978eea9a8a2952c36",
+    "environment": "B",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "08d8e4123d285c140f8607a7c86462a2fb6d1c6f501bd4017c0e8a73a934c0c5",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "js-unchanged",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "B",
+      "build_id": "67fb860842f007c8e7a230a6d8e89725694e600a59501797457fa7b3a04da74c",
+      "bundle_environment": "B",
+      "native_environment": "B",
+      "nonce": "39481BC2-3B2B-4E40-B0D3-A0E04A149DFE",
+      "revision": "initial"
+    },
+    "revision_sha256": "a852e3dd74341dce2a76166fba57b008c6099c4b26a26aee8574249a115d59dd",
+    "timestamp_unix": 1788836370,
+    "udid": "810A4C64-2334-4FD5-A2B7-8DBD8B5EB2CE",
+    "verdict": "IDENTITY_VERIFIED",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/B"
+  },
+  {
+    "binary_sha256": "3a60feb6c146c82d205712cc63b2a4b618d452cf9f1bc4c060e6b213697dd282",
+    "environment": "A",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "aa4f9d161a459564fa5150b8ebe2bbcd7a778d0efa2ea6273af1622f681d1d60",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "endpoint-without-build",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "A",
+      "build_id": "cb236529bf369eb39148f47229ad986f1ab580e0853986215569e7857cf92536",
+      "bundle_environment": "A",
+      "native_environment": "A",
+      "nonce": "798BF73E-8448-4D50-BD4A-A054CC9D9377",
+      "revision": "edited-A"
+    },
+    "revision_sha256": "df26d056f9c485923acb64ebe19430131264b0e260182fb5ee6dfd1ab5f69d65",
+    "timestamp_unix": 1788836371,
+    "udid": "84A38E73-7152-48DE-83D1-21458329D3CD",
+    "verdict": "IDENTITY_VERIFIED",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/A"
+  },
+  {
+    "binary_sha256": "cc6f62798fba3a8fc6df89ebc294a2101d5337113d77494677443ab7c29d4d42",
+    "environment": "A",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "aa4f9d161a459564fa5150b8ebe2bbcd7a778d0efa2ea6273af1622f681d1d60",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "cross-backend",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "B",
+      "build_id": "89274d2688ea90cd272c9b0fe297e55ea2b1dab758adf2eb9aa6b707e8a98b34",
+      "bundle_environment": "A",
+      "native_environment": "A",
+      "nonce": "8DB68050-C1E1-4409-AD8D-6BF76E70FA99",
+      "revision": "edited-A"
+    },
+    "revision_sha256": "df26d056f9c485923acb64ebe19430131264b0e260182fb5ee6dfd1ab5f69d65",
+    "timestamp_unix": 1788836379,
+    "udid": "84A38E73-7152-48DE-83D1-21458329D3CD",
+    "verdict": "IDENTITY_MISMATCH",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/A"
+  },
+  {
+    "binary_sha256": "b06b32994e2b7b27507366201cc2ca3ae773cee175d3e398cb42bc9c278705c0",
+    "environment": "A",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "4ad602231d167fb96e0140fefb78995c97e5bcd7c78ecec556c8767b47dfcb41",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "cross-metro",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "A",
+      "build_id": "dbd4e3520a659b33136460ac7a50d612dc4083ce710e1ff6d380974b5c025d7f",
+      "bundle_environment": "B",
+      "native_environment": "A",
+      "nonce": "9394CF7B-0AAA-4EC7-84D3-19172D2D97ED",
+      "revision": "initial"
+    },
+    "revision_sha256": "df26d056f9c485923acb64ebe19430131264b0e260182fb5ee6dfd1ab5f69d65",
+    "timestamp_unix": 1788836385,
+    "udid": "84A38E73-7152-48DE-83D1-21458329D3CD",
+    "verdict": "IDENTITY_MISMATCH",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/A"
+  },
+  {
+    "binary_sha256": "3a60feb6c146c82d205712cc63b2a4b618d452cf9f1bc4c060e6b213697dd282",
+    "environment": "A",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "f851d935239d652f6ee928fc60d461e5018cfb926cdf291971058da4a042590d",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "restored",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "A",
+      "build_id": "cb236529bf369eb39148f47229ad986f1ab580e0853986215569e7857cf92536",
+      "bundle_environment": "A",
+      "native_environment": "A",
+      "nonce": "BFB1E30A-182D-4961-9D40-90D81008B816",
+      "revision": "edited-A"
+    },
+    "revision_sha256": "df26d056f9c485923acb64ebe19430131264b0e260182fb5ee6dfd1ab5f69d65",
+    "timestamp_unix": 1788836391,
+    "udid": "84A38E73-7152-48DE-83D1-21458329D3CD",
+    "verdict": "IDENTITY_VERIFIED",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/A"
+  },
+  {
+    "binary_sha256": "8bb00cf14fd9e0c4ab14464482063ba2e646ed057305efc978eea9a8a2952c36",
+    "environment": "B",
+    "head": "7ebfd5d70189af88e9a7b73af5adbbb6d65ae06d",
+    "native_source_sha256": "08d8e4123d285c140f8607a7c86462a2fb6d1c6f501bd4017c0e8a73a934c0c5",
+    "npm_lock_sha256": "6aa674f1f1c30415239f267320f91820b4f4f09fceb16ac2518d5df0ab5c910c",
+    "phase": "final-unchanged",
+    "pod_lock_sha256": "d4222096b0426639e26e15f2471aec55eac8eb55284e728baf35bc1a39caf4df",
+    "report": {
+      "backend_environment": "B",
+      "build_id": "67fb860842f007c8e7a230a6d8e89725694e600a59501797457fa7b3a04da74c",
+      "bundle_environment": "B",
+      "native_environment": "B",
+      "nonce": "B124F40C-7F30-40B1-9596-8EFAEEA39EA8",
+      "revision": "initial"
+    },
+    "revision_sha256": "a852e3dd74341dce2a76166fba57b008c6099c4b26a26aee8574249a115d59dd",
+    "timestamp_unix": 1788836392,
+    "udid": "810A4C64-2334-4FD5-A2B7-8DBD8B5EB2CE",
+    "verdict": "IDENTITY_VERIFIED",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/B"
+  }
+]

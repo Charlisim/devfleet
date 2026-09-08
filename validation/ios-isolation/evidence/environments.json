@@ -1,0 +1,18 @@
+[
+  {
+    "id": "A",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/A",
+    "udid": "84A38E73-7152-48DE-83D1-21458329D3CD",
+    "metro": 18081,
+    "backend": 19081,
+    "report": 19181
+  },
+  {
+    "id": "B",
+    "worktree": "/private/tmp/devfleet-ios-proof-2/B",
+    "udid": "810A4C64-2334-4FD5-A2B7-8DBD8B5EB2CE",
+    "metro": 18082,
+    "backend": 19082,
+    "report": 19182
+  }
+]

@@ -1,0 +1,12 @@
+{
+  "architecture": "arm64",
+  "elapsed_seconds": 40,
+  "macos": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83",
+  "node": "v26.7.0",
+  "passed": true,
+  "react_native": "0.87.1",
+  "runtime": "com.apple.CoreSimulator.SimRuntime.iOS-26-4",
+  "rust": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Homebrew)",
+  "status": "passed",
+  "xcode": "Xcode 26.4.1\nBuild version 17E202"
+}

@@ -4,7 +4,7 @@ Bounded experiment for [issue #1](https://github.com/Charlisim/devfleet/issues/1
 
 ## Prerequisites and reproduction
 
-The target matrix is macOS 26.6.2 (25G83), Apple Silicon arm64, Xcode 26.4.1 (17E202), iOS Simulator 26.4.1 (23E254a; runtime identifier iOS-26-4), React Native 0.87.1 and Community CLI 20.2.0. Use Node 24.20.0, Rust 1.98.0, Ruby 3.3.5 and CocoaPods 1.16.2. Confirm `pod --version` succeeds in the shell that starts the fixture. On the measured host, RVM CocoaPods worked; the Homebrew CocoaPods executable failed with a missing `nkf` dependency. React Native is pinned in `app/package-lock.json`; CocoaPods dependencies have their own lockfile. Install the specified simulator runtime explicitly before starting. No runtime downloads, personal simulator adoption, or global cache resets occur.
+The target matrix is macOS 26.6.2 (25G83), Apple Silicon arm64, Xcode 26.4.1 (17E202), iOS Simulator 26.4.1 (23E254a; runtime identifier iOS-26-4), React Native 0.87.1 and Community CLI 20.2.0. Use Node 26.7.0, Rust 1.98.0, Ruby 3.3.5 and CocoaPods 1.16.2. Confirm `pod --version` succeeds in the shell that starts the fixture. On the measured host, RVM CocoaPods worked; the Homebrew CocoaPods executable failed with a missing `nkf` dependency. React Native is pinned in `app/package-lock.json`; CocoaPods dependencies have their own lockfile. Install the specified simulator runtime explicitly before starting. No runtime downloads, personal simulator adoption, or global cache resets occur.
 
 From the repository root, with `cargo`, `rustc`, `node`, `npm`, `pod`, `git`, `xcodebuild`, and `xcrun` on PATH:
 
