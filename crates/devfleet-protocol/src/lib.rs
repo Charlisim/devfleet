@@ -98,6 +98,7 @@ pub enum ErrorCode {
     OwnershipUncertain,
     DeviceUnavailable,
     CapabilityUnsupported,
+    ResourceBudgetExceeded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -153,6 +154,101 @@ pub struct ComposeDestroyRequest {
     pub project_name: String,
     pub files: Vec<String>,
     pub purge_data: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulingPriority {
+    Interactive,
+    Background,
+    Maintenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "resource", content = "arguments", rename_all = "snake_case")]
+pub enum ScheduledResource {
+    NativeBuild,
+    DeviceBoot,
+    Preparation,
+    MetroWorkers { workers: u16 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerConfig {
+    pub native_build_limit: u16,
+    pub device_boot_limit: u16,
+    pub preparation_limit: u16,
+    pub metro_worker_limit: u16,
+    pub memory_limit_bytes: u64,
+    pub memory_reserve_bytes: u64,
+    pub aging_interval_ms: u64,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            native_build_limit: 2,
+            device_boot_limit: 2,
+            preparation_limit: 2,
+            metro_worker_limit: 8,
+            memory_limit_bytes: 8 * 1024 * 1024 * 1024,
+            memory_reserve_bytes: 512 * 1024 * 1024,
+            aging_interval_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulingRequest {
+    pub environment_id: Uuid,
+    pub project_id: Uuid,
+    pub resource: ScheduledResource,
+    pub priority: SchedulingPriority,
+    pub focused: bool,
+    pub estimated_memory_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledJobState {
+    Queued,
+    Running,
+    Cancelled,
+    ControlLost,
+    Completed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledJobSnapshot {
+    pub job_id: Uuid,
+    pub environment_id: Uuid,
+    pub project_id: Uuid,
+    pub resource: ScheduledResource,
+    pub priority: SchedulingPriority,
+    pub focused: bool,
+    pub state: ScheduledJobState,
+    pub queued_reason: Option<String>,
+    pub estimated_memory_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ResourcePressureSnapshot {
+    pub measured_memory_bytes: Option<u64>,
+    pub estimated_active_memory_bytes: u64,
+    pub estimated_queued_memory_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub memory_reserve_bytes: u64,
+    pub native_builds_active: u16,
+    pub device_boots_active: u16,
+    pub preparations_active: u16,
+    pub metro_workers_active: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerSnapshot {
+    pub config: SchedulerConfig,
+    pub pressure: ResourcePressureSnapshot,
+    pub jobs: Vec<ScheduledJobSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -472,6 +568,11 @@ pub enum DaemonRequest {
     },
     DeviceCapture(DeviceCaptureRequest),
     Destroy(DestroyRequest),
+    SchedulerConfigure(SchedulerConfig),
+    SchedulerStatus,
+    SchedulerFocus {
+        environment_id: Uuid,
+    },
     Status {
         environment_id: Uuid,
     },
@@ -530,6 +631,7 @@ pub enum DaemonResponse {
     IdentityVerification(IdentityVerificationSnapshot),
     Artifact(ArtifactSnapshot),
     Destroy(DestroySnapshot),
+    Scheduler(SchedulerSnapshot),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -648,6 +750,7 @@ pub struct EnvironmentSnapshot {
     pub bindings: Vec<BindingSnapshot>,
     pub ios_simulator: Option<IosSimulatorSnapshot>,
     pub ios_app: Option<IosAppSnapshot>,
+    pub scheduler: SchedulerSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

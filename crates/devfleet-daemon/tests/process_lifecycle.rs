@@ -3,7 +3,8 @@ use devfleet_protocol::{
     BindingApplyRequest, BindingIntegration, BindingInvalidation, BindingPhase, DaemonRequest,
     DaemonResponse, DestroyAuthorization, DestroyRequest, DestroyTargetStatus,
     EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest, InitializationTask,
-    InitializationTaskKind, LifecycleState, ProcessSpec, ReadinessState, TaskRerunPolicy,
+    InitializationTaskKind, LifecycleState, ProcessSpec, ReadinessState, SchedulerConfig,
+    TaskRerunPolicy,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::{
@@ -30,6 +31,62 @@ impl Drop for DaemonFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn scheduler_configures_host_budgets_and_exposes_focus_in_events() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let environment = up_environment(&fixture.socket, temporary.path(), "scheduler");
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::SchedulerConfigure(SchedulerConfig {
+            native_build_limit: 1,
+            device_boot_limit: 2,
+            preparation_limit: 3,
+            metro_worker_limit: 4,
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            memory_reserve_bytes: 256 * 1024 * 1024,
+            aging_interval_ms: 15_000,
+        }),
+    )
+    .expect("scheduler configures");
+    let DaemonResponse::Scheduler(scheduler) = response else {
+        panic!("expected scheduler response");
+    };
+    assert_eq!(scheduler.config.native_build_limit, 1);
+    assert_eq!(scheduler.config.preparation_limit, 3);
+    let response = request(
+        &fixture.socket,
+        DaemonRequest::SchedulerFocus {
+            environment_id: environment,
+        },
+    )
+    .expect("scheduler focuses environment");
+    assert!(matches!(response, DaemonResponse::Scheduler(_)));
+    let DaemonResponse::Environment(status) = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: environment,
+        },
+    )
+    .expect("status") else {
+        panic!("expected status");
+    };
+    assert_eq!(status.scheduler.config.metro_worker_limit, 4);
+    let DaemonResponse::Events(events) = request(
+        &fixture.socket,
+        DaemonRequest::Events {
+            environment_id: environment,
+            after: None,
+        },
+    )
+    .expect("events") else {
+        panic!("expected events");
+    };
+    assert!(events.iter().any(|event| event.kind == "scheduler_focus"));
+    stop(&fixture.socket, environment);
 }
 
 #[test]

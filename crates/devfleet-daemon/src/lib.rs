@@ -1,9 +1,9 @@
 //! Local daemon: private IPC, persistent state, and supervisor composition.
 
 use devfleet_core::{
-    BindingIntegration as CoreBindingIntegration, BindingPhase as CoreBindingPhase, Invalidation,
-    PlanOptions, compile_manifest, discover_git_worktree, metro_adapter, render_metro_config,
-    resolve_bindings,
+    BindingIntegration as CoreBindingIntegration, BindingPhase as CoreBindingPhase, HostScheduler,
+    Invalidation, PlanOptions, SchedulerError, compile_manifest, discover_git_worktree,
+    metro_adapter, render_metro_config, resolve_bindings,
 };
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
@@ -20,9 +20,10 @@ use devfleet_protocol::{
     MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
     PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
     PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ReactNativeIdentityHook,
-    ReadinessState, RpcFailure, SupervisorIdentityVerificationRequest, SupervisorRequest,
-    SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin,
-    VerificationMode, read_json_line, write_json_line,
+    ReadinessState, RpcFailure, ScheduledResource, SchedulingPriority, SchedulingRequest,
+    SupervisorIdentityVerificationRequest, SupervisorRequest, SupervisorResponse,
+    SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, VerificationMode, read_json_line,
+    write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredArtifact, StoredBinding, StoredComposeResource, StoredEndpoint,
@@ -55,6 +56,10 @@ const SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const SUPERVISOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SOCKET_PATH_BYTES: usize = 96;
 const MAX_RESOURCE_LOG_BYTES: u64 = 1024 * 1024;
+const NATIVE_BUILD_MEMORY_ESTIMATE: u64 = 2 * 1024 * 1024 * 1024;
+const DEVICE_BOOT_MEMORY_ESTIMATE: u64 = 512 * 1024 * 1024;
+const PREPARATION_MEMORY_ESTIMATE: u64 = 1024 * 1024 * 1024;
+const METRO_WORKER_MEMORY_ESTIMATE: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -91,7 +96,11 @@ pub fn run(config: DaemonConfig) -> anyhow::Result<()> {
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
     let mut state = StateStore::open(&config.state_dir.join("state.sqlite3"))?;
     reconcile_supervisors(&mut state)?;
-    let mut daemon = Daemon { config, state };
+    let mut daemon = Daemon {
+        config,
+        state,
+        scheduler: HostScheduler::default(),
+    };
 
     loop {
         let (stream, _) = listener.accept()?;
@@ -105,6 +114,7 @@ pub fn run(config: DaemonConfig) -> anyhow::Result<()> {
 struct Daemon {
     config: DaemonConfig,
     state: StateStore,
+    scheduler: HostScheduler,
 }
 
 #[derive(serde::Deserialize)]
@@ -145,6 +155,7 @@ struct SnapshotInputs {
     app: Option<StoredIosApp>,
     identity: Option<StoredIdentityVerification>,
     metro_ready: bool,
+    scheduler: devfleet_protocol::SchedulerSnapshot,
 }
 
 impl Daemon {
@@ -203,6 +214,13 @@ impl Daemon {
             }
             DaemonRequest::DeviceCapture(request) => self.device_capture(&request),
             DaemonRequest::Destroy(request) => self.destroy(&request),
+            DaemonRequest::SchedulerConfigure(config) => self.scheduler_configure(config),
+            DaemonRequest::SchedulerStatus => {
+                Ok(DaemonResponse::Scheduler(self.scheduler.snapshot()))
+            }
+            DaemonRequest::SchedulerFocus { environment_id } => {
+                self.scheduler_focus(environment_id)
+            }
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -600,6 +618,23 @@ impl Daemon {
                 "Metro startup returned an unexpected response".into(),
             ));
         };
+        let environment = self
+            .state
+            .environment(accepted.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let estimated_memory_bytes = u64::from(request.max_workers)
+            .checked_mul(METRO_WORKER_MEMORY_ESTIMATE)
+            .ok_or_else(|| DaemonError::InvalidConfig("Metro worker estimate overflow".into()))?;
+        if let Err(error) = self.begin_scheduled_work(
+            &environment,
+            ScheduledResource::MetroWorkers {
+                workers: request.max_workers,
+            },
+            estimated_memory_bytes,
+        ) {
+            let _ = self.stop(accepted.environment_id);
+            return Err(error);
+        }
         if !wait_for_metro_identity(request.port, &expected_identity) {
             let _ = self.stop(accepted.environment_id);
             return Err(DaemonError::Operation(
@@ -968,7 +1003,12 @@ impl Daemon {
                 Some(operation_id),
                 "preparation_task_running",
             )?;
-            let response = request_supervisor(
+            let scheduler_job = self.begin_scheduled_work(
+                &environment,
+                ScheduledResource::Preparation,
+                PREPARATION_MEMORY_ESTIMATE,
+            )?;
+            let response = match request_supervisor(
                 Path::new(&process.supervisor_socket),
                 SupervisorRequest::RunPluginTask {
                     operation_id,
@@ -982,15 +1022,13 @@ impl Daemon {
                     },
                     timeout_seconds: Some(request.timeout_seconds),
                 },
-            )
-            .map_err(|error| match error {
-                DaemonError::Operation(message)
-                    if message.contains("requested plugin capability is not authorized") =>
-                {
-                    DaemonError::CapabilityUnsupported(capability.into())
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.finish_scheduled_work(&environment, scheduler_job)?;
+                    return Err(map_react_native_capability(error, capability));
                 }
-                error => error,
-            })?;
+            };
             let diagnostic = match response {
                 SupervisorResponse::TaskOutput { stdout, stderr } => {
                     self.append_preparation_log(environment.id, name, &stdout, &stderr)?;
@@ -1009,6 +1047,7 @@ impl Daemon {
                     Some("supervisor returned an identity verification response")
                 }
             };
+            self.finish_scheduled_work(&environment, scheduler_job)?;
             self.state
                 .finish_preparation_task(environment.id, name, diagnostic)?;
             self.emit_event(
@@ -1121,18 +1160,36 @@ impl Daemon {
             .find(|candidate| candidate.udid.eq_ignore_ascii_case(&udid))
             .filter(|candidate| candidate.available)
             .ok_or_else(|| DaemonError::DeviceUnavailable(udid.clone()))?;
-        if present.state != "Booted" {
+        if present.state == "Booted" {
             Self::run_ios_task(
                 &process,
                 "device.boot",
-                serde_json::json!({"udid": udid, "step": "start"}),
+                serde_json::json!({"udid": udid, "step": "wait"}),
             )?;
+        } else {
+            let scheduler_job = self.begin_scheduled_work(
+                &environment,
+                ScheduledResource::DeviceBoot,
+                DEVICE_BOOT_MEMORY_ESTIMATE,
+            )?;
+            if let Err(error) = Self::run_ios_task(
+                &process,
+                "device.boot",
+                serde_json::json!({"udid": udid, "step": "start"}),
+            ) {
+                self.finish_scheduled_work(&environment, scheduler_job)?;
+                return Err(error);
+            }
+            if let Err(error) = Self::run_ios_task(
+                &process,
+                "device.boot",
+                serde_json::json!({"udid": udid, "step": "wait"}),
+            ) {
+                self.finish_scheduled_work(&environment, scheduler_job)?;
+                return Err(error);
+            }
+            self.finish_scheduled_work(&environment, scheduler_job)?;
         }
-        Self::run_ios_task(
-            &process,
-            "device.boot",
-            serde_json::json!({"udid": udid, "step": "wait"}),
-        )?;
         self.state.set_ios_lifecycle(environment.id, "booted")?;
         self.emit_event(
             environment.id,
@@ -1296,6 +1353,11 @@ impl Daemon {
             return Ok(DaemonResponse::IosApp(ios_app_snapshot(app)));
         }
         let operation_id = Uuid::now_v7();
+        let scheduler_job = self.begin_scheduled_work(
+            &environment,
+            ScheduledResource::NativeBuild,
+            NATIVE_BUILD_MEMORY_ESTIMATE,
+        )?;
         self.emit_event(
             environment.id,
             environment.generation,
@@ -1328,6 +1390,7 @@ impl Daemon {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
+                self.finish_scheduled_work(&environment, scheduler_job)?;
                 let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
                 let _ = self.mark_identity_unverified(identity.as_ref());
                 return Err(map_react_native_capability(error, "app.run_ios"));
@@ -1338,6 +1401,7 @@ impl Daemon {
                 self.append_preparation_log(environment.id, "ios-app", &stdout, &stderr)?;
             }
             SupervisorResponse::TaskFailed { stdout, stderr } => {
+                self.finish_scheduled_work(&environment, scheduler_job)?;
                 self.append_preparation_log(environment.id, "ios-app", &stdout, &stderr)?;
                 let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
                 let _ = self.mark_identity_unverified(identity.as_ref());
@@ -1347,6 +1411,7 @@ impl Daemon {
                 ));
             }
             SupervisorResponse::TaskTimedOut => {
+                self.finish_scheduled_work(&environment, scheduler_job)?;
                 let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
                 let _ = self.mark_identity_unverified(identity.as_ref());
                 return Err(DaemonError::Operation(
@@ -1356,6 +1421,7 @@ impl Daemon {
             SupervisorResponse::TaskCompleted
             | SupervisorResponse::Process(_)
             | SupervisorResponse::IdentityVerification(_) => {
+                self.finish_scheduled_work(&environment, scheduler_job)?;
                 let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
                 let _ = self.mark_identity_unverified(identity.as_ref());
                 return Err(DaemonError::Operation(
@@ -1373,6 +1439,7 @@ impl Daemon {
             launched: true,
         };
         if let Err(error) = self.state.record_ios_app(&app) {
+            self.finish_scheduled_work(&environment, scheduler_job)?;
             let _ = Self::cancel_launch_identity_verification(&process, identity.is_some());
             let _ = self.mark_identity_unverified(identity.as_ref());
             return Err(error.into());
@@ -1380,6 +1447,7 @@ impl Daemon {
         if request.verification == VerificationMode::Transport {
             self.record_transport_verification(environment.id, environment.generation)?;
         }
+        self.finish_scheduled_work(&environment, scheduler_job)?;
         self.emit_event(
             environment.id,
             environment.generation,
@@ -1872,12 +1940,14 @@ impl Daemon {
                 app,
                 identity,
                 metro_ready,
+                scheduler: self.scheduler.snapshot(),
             },
         )))
     }
 
     fn list(&self) -> Result<DaemonResponse, DaemonError> {
         let environments = self.state.environments()?;
+        let scheduler = self.scheduler.snapshot();
         let snapshots = environments
             .into_iter()
             .map(|environment| {
@@ -1898,11 +1968,125 @@ impl Daemon {
                         app,
                         identity,
                         metro_ready,
+                        scheduler: scheduler.clone(),
                     },
                 ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DaemonResponse::Environments(snapshots))
+    }
+
+    fn scheduler_configure(
+        &mut self,
+        config: devfleet_protocol::SchedulerConfig,
+    ) -> Result<DaemonResponse, DaemonError> {
+        self.scheduler
+            .configure(config)
+            .map_err(DaemonError::Scheduler)?;
+        Ok(DaemonResponse::Scheduler(self.scheduler.snapshot()))
+    }
+
+    fn scheduler_focus(&mut self, environment_id: Uuid) -> Result<DaemonResponse, DaemonError> {
+        let environment = self
+            .state
+            .environment(environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        self.scheduler.focus(environment.id);
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            "scheduler_focus",
+        )?;
+        Ok(DaemonResponse::Scheduler(self.scheduler.snapshot()))
+    }
+
+    fn begin_scheduled_work(
+        &mut self,
+        environment: &StoredEnvironment,
+        resource: ScheduledResource,
+        estimated_memory_bytes: u64,
+    ) -> Result<Uuid, DaemonError> {
+        let job_id = self.scheduler.enqueue(
+            SchedulingRequest {
+                environment_id: environment.id,
+                project_id: environment.project_id,
+                resource,
+                priority: SchedulingPriority::Interactive,
+                focused: false,
+                estimated_memory_bytes,
+            },
+            unix_now_ms()?,
+        )?;
+        self.emit_scheduler_event(environment, "scheduler_queued", job_id)?;
+        let outcome = match self.scheduler.admit_next(unix_now_ms()?) {
+            Ok(Some(admitted)) if admitted == job_id => {
+                self.emit_scheduler_event(environment, "scheduler_admitted", job_id)?;
+                Ok(job_id)
+            }
+            Ok(Some(_)) => Err(DaemonError::Operation(
+                "a previously queued operation must be resumed by its controller".into(),
+            )),
+            Ok(None) => Err(DaemonError::Scheduler(SchedulerError::ResourceUnavailable(
+                "host resource slots are exhausted".into(),
+            ))),
+            Err(error) => Err(DaemonError::Scheduler(error)),
+        };
+        if outcome.is_err() {
+            self.scheduler.cancel(job_id)?;
+            self.emit_scheduler_event(environment, "scheduler_cancelled", job_id)?;
+        }
+        outcome
+    }
+
+    fn finish_scheduled_work(
+        &mut self,
+        environment: &StoredEnvironment,
+        job_id: Uuid,
+    ) -> Result<(), DaemonError> {
+        self.scheduler.complete(job_id)?;
+        self.emit_scheduler_event(environment, "scheduler_completed", job_id)
+    }
+
+    fn release_scheduled_work(
+        &mut self,
+        environment: &StoredEnvironment,
+    ) -> Result<(), DaemonError> {
+        for job_id in self.scheduler.complete_environment(environment.id) {
+            self.emit_scheduler_event(environment, "scheduler_released", job_id)?;
+        }
+        Ok(())
+    }
+
+    fn emit_scheduler_event(
+        &mut self,
+        environment: &StoredEnvironment,
+        kind: &str,
+        job_id: Uuid,
+    ) -> Result<(), DaemonError> {
+        let scheduler = self.scheduler.snapshot();
+        let job = scheduler
+            .jobs
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .ok_or(DaemonError::Scheduler(SchedulerError::NotFound))?;
+        self.state.append_event(&StoredEvent {
+            sequence: 0,
+            id: Uuid::now_v7(),
+            timestamp_unix_ms: u128::from(unix_now_ms()?),
+            environment_id: environment.id,
+            resource_id: Some(format!("scheduler:{job_id}")),
+            generation: environment.generation,
+            operation_id: None,
+            kind: kind.into(),
+            payload: serde_json::json!({
+                "priority": job.priority,
+                "resource": job.resource,
+                "queued_reason": job.queued_reason,
+                "pressure": scheduler.pressure,
+            }),
+        })?;
+        Ok(())
     }
 
     fn metro_ready(&self, worktree_id: Uuid) -> Result<bool, DaemonError> {
@@ -1924,7 +2108,10 @@ impl Daemon {
             .state
             .environment(environment_id)?
             .ok_or(DaemonError::NotFound)?;
-        let process = environment.process.ok_or(DaemonError::OwnershipUncertain)?;
+        let process = environment
+            .process
+            .as_ref()
+            .ok_or(DaemonError::OwnershipUncertain)?;
         let response = request_supervisor(
             Path::new(&process.supervisor_socket),
             SupervisorRequest::Stop,
@@ -1937,6 +2124,7 @@ impl Daemon {
         }
         self.state.mark_stopped(environment_id)?;
         remove_supervisor_socket(&process.supervisor_socket)?;
+        self.release_scheduled_work(&environment)?;
         self.emit_event(environment_id, environment.generation, None, "stopped")?;
         self.status(environment_id)
     }
@@ -2206,6 +2394,7 @@ impl Daemon {
                 DestroyTargetStatus::Destroyed,
             );
         }
+        self.release_scheduled_work(&environment)?;
         self.state.mark_destroyed(environment.id)?;
         self.emit_event(environment.id, environment.generation, None, "destroyed")?;
         Ok(DaemonResponse::Destroy(DestroySnapshot {
@@ -2262,7 +2451,7 @@ impl Daemon {
             .request_operation_cancel(operation_id)?
             .ok_or(DaemonError::NotFound)?;
         if let Some(environment) = self.state.environment(operation.environment_id)?
-            && let Some(process) = environment.process
+            && let Some(process) = environment.process.as_ref()
         {
             let response = request_supervisor(
                 Path::new(&process.supervisor_socket),
@@ -2276,6 +2465,7 @@ impl Daemon {
             }
             self.state.mark_stopped(operation.environment_id)?;
             remove_supervisor_socket(&process.supervisor_socket)?;
+            self.release_scheduled_work(&environment)?;
         }
         self.state
             .mark_operation_cancelled(operation_id, "reaped")?;
@@ -2562,6 +2752,8 @@ enum DaemonError {
     #[error("operation failed: {0}")]
     Operation(String),
     #[error(transparent)]
+    Scheduler(#[from] SchedulerError),
+    #[error(transparent)]
     State(#[from] devfleet_state::StateError),
 }
 
@@ -2571,13 +2763,16 @@ impl From<DaemonError> for RpcFailure {
             DaemonError::TrustRequired | DaemonError::PluginTrustRequired => {
                 ErrorCode::PermissionDenied
             }
-            DaemonError::InvalidConfig(_) => ErrorCode::ConfigInvalid,
             DaemonError::NotFound => ErrorCode::ResourceNotFound,
             DaemonError::OwnershipUncertain | DaemonError::OwnershipUncertainPartial(_) => {
                 ErrorCode::OwnershipUncertain
             }
             DaemonError::DeviceUnavailable(_) => ErrorCode::DeviceUnavailable,
             DaemonError::CapabilityUnsupported(_) => ErrorCode::CapabilityUnsupported,
+            DaemonError::Scheduler(SchedulerError::ResourceBudgetExceeded { .. }) => {
+                ErrorCode::ResourceBudgetExceeded
+            }
+            DaemonError::InvalidConfig(_) | DaemonError::Scheduler(_) => ErrorCode::ConfigInvalid,
             DaemonError::State(devfleet_state::StateError::CursorExpired) => {
                 ErrorCode::CursorExpired
             }
@@ -3395,6 +3590,7 @@ fn snapshot(environment: StoredEnvironment, inputs: SnapshotInputs) -> Environme
         app,
         identity,
         metro_ready,
+        scheduler,
     } = inputs;
     let lifecycle = match environment.lifecycle {
         StoredLifecycle::Starting => LifecycleState::Starting,
@@ -3484,6 +3680,7 @@ fn snapshot(environment: StoredEnvironment, inputs: SnapshotInputs) -> Environme
         bindings: bindings.into_iter().map(binding_snapshot).collect(),
         ios_simulator: ios.and_then(|device| ios_snapshot(device).ok()),
         ios_app: app.map(ios_app_snapshot),
+        scheduler,
     }
 }
 
@@ -3543,6 +3740,15 @@ fn environment_key(
         "{project_fingerprint}|{worktree_fingerprint}|{profile}|{}",
         instance.unwrap_or_default()
     )
+}
+
+fn unix_now_ms() -> Result<u64, DaemonError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| DaemonError::Operation(error.to_string()))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| DaemonError::Operation("clock exceeds supported range".into()))
 }
 
 fn stored_process(process: &ProcessSnapshot) -> StoredProcess {

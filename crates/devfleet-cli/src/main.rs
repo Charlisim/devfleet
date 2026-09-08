@@ -7,7 +7,7 @@ use devfleet_protocol::{
     InitializationRunRequest, InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest,
     IosSimulatorAction, IosSimulatorActionRequest, MetroUpRequest,
     PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec,
-    SmokeResponse, SmokeStatus, VerificationMode,
+    SchedulerConfig, SmokeResponse, SmokeStatus, VerificationMode,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -41,6 +41,7 @@ enum Command {
     List,
     Stop { environment_id: Uuid },
     Destroy(DestroyArgs),
+    Scheduler(SchedulerArgs),
     Operation(OperationArgs),
     Events(EventsArgs),
     Logs(LogsArgs),
@@ -350,6 +351,36 @@ struct DestroyArgs {
     purge_data: bool,
     #[arg(long)]
     purge_artifacts: bool,
+}
+
+#[derive(ClapArgs)]
+struct SchedulerArgs {
+    #[command(subcommand)]
+    command: SchedulerCommand,
+}
+
+#[derive(Subcommand)]
+enum SchedulerCommand {
+    Status,
+    Focus {
+        environment_id: Uuid,
+    },
+    Configure {
+        #[arg(long, default_value_t = 2)]
+        native_builds: u16,
+        #[arg(long, default_value_t = 2)]
+        device_boots: u16,
+        #[arg(long, default_value_t = 2)]
+        preparations: u16,
+        #[arg(long, default_value_t = 8)]
+        metro_workers: u16,
+        #[arg(long, default_value_t = 8_192)]
+        memory_mib: u64,
+        #[arg(long, default_value_t = 512)]
+        reserve_mib: u64,
+        #[arg(long, default_value_t = 30)]
+        aging_seconds: u64,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -675,6 +706,35 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 purge_artifacts: destroy.purge_artifacts,
             }))
         }
+        Command::Scheduler(scheduler) => match scheduler.command {
+            SchedulerCommand::Status => Ok(DaemonRequest::SchedulerStatus),
+            SchedulerCommand::Focus { environment_id } => {
+                Ok(DaemonRequest::SchedulerFocus { environment_id })
+            }
+            SchedulerCommand::Configure {
+                native_builds,
+                device_boots,
+                preparations,
+                metro_workers,
+                memory_mib,
+                reserve_mib,
+                aging_seconds,
+            } => Ok(DaemonRequest::SchedulerConfigure(SchedulerConfig {
+                native_build_limit: native_builds,
+                device_boot_limit: device_boots,
+                preparation_limit: preparations,
+                metro_worker_limit: metro_workers,
+                memory_limit_bytes: memory_mib
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| anyhow::anyhow!("--memory-mib exceeds supported range"))?,
+                memory_reserve_bytes: reserve_mib
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| anyhow::anyhow!("--reserve-mib exceeds supported range"))?,
+                aging_interval_ms: aging_seconds
+                    .checked_mul(1_000)
+                    .ok_or_else(|| anyhow::anyhow!("--aging-seconds exceeds supported range"))?,
+            })),
+        },
         Command::Operation(operation) => match operation.command {
             OperationCommand::Get { operation_id } => {
                 Ok(DaemonRequest::OperationGet { operation_id })
@@ -950,6 +1010,29 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
             }
             for purged in &destroy.purged {
                 println!("purged {purged}");
+            }
+        }
+        DaemonResponse::Scheduler(scheduler) => {
+            println!(
+                "scheduler native={} boots={} preparation={} metro_workers={} memory={}/{}",
+                scheduler.pressure.native_builds_active,
+                scheduler.pressure.device_boots_active,
+                scheduler.pressure.preparations_active,
+                scheduler.pressure.metro_workers_active,
+                scheduler.pressure.estimated_active_memory_bytes,
+                scheduler.pressure.memory_limit_bytes
+            );
+            for job in &scheduler.jobs {
+                println!(
+                    "{} {} {:?} {:?}{}",
+                    job.job_id,
+                    job.environment_id,
+                    job.priority,
+                    job.state,
+                    job.queued_reason
+                        .as_deref()
+                        .map_or_else(String::new, |reason| format!(" reason={reason}"))
+                );
             }
         }
     }

@@ -17,6 +17,7 @@ pub mod logs;
 pub mod metro;
 pub mod plan;
 pub mod ports;
+pub mod scheduler;
 
 pub use bindings::{
     BindingContract, BindingError, BindingIntegration, BindingPhase, Invalidation, resolve_bindings,
@@ -34,6 +35,7 @@ pub use plan::{
     compile_manifest,
 };
 pub use ports::{EndpointUrls, PortBlock, PortError, PortRange, ReservedPorts, retry_handoff};
+pub use scheduler::{HostScheduler, SchedulerError};
 
 macro_rules! id_type {
     ($name:ident) => {

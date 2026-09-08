@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 devfleet-logging = { path = "../devfleet-logging" }
+devfleet-protocol = { path = "../devfleet-protocol" }
 serde.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
