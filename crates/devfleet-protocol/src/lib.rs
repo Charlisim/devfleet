@@ -201,6 +201,23 @@ pub struct IosSimulatorActionRequest {
     pub action: IosSimulatorAction,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IosAppRunRequest {
+    pub environment_id: Uuid,
+    pub bundle_id: String,
+    pub scheme: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IosAppSnapshot {
+    pub environment_id: Uuid,
+    pub bundle_id: String,
+    pub udid: String,
+    pub metro_port: u16,
+    pub derived_data: String,
+    pub launched: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IosSimulatorAction {
@@ -320,6 +337,7 @@ pub enum DaemonRequest {
     BindingApply(BindingApplyRequest),
     IosSimulatorAcquire(IosSimulatorAcquireRequest),
     IosSimulatorAction(IosSimulatorActionRequest),
+    IosAppRun(IosAppRunRequest),
     Status {
         environment_id: Uuid,
     },
@@ -374,6 +392,7 @@ pub enum DaemonResponse {
     PreparationTasks(Vec<PreparationTaskSnapshot>),
     Bindings(Vec<BindingSnapshot>),
     IosSimulator(IosSimulatorSnapshot),
+    IosApp(IosAppSnapshot),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -465,6 +484,7 @@ pub struct EnvironmentSnapshot {
     pub preparation_tasks: Vec<PreparationTaskSnapshot>,
     pub bindings: Vec<BindingSnapshot>,
     pub ios_simulator: Option<IosSimulatorSnapshot>,
+    pub ios_app: Option<IosAppSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -566,6 +586,16 @@ pub struct MetroUpRequest {
     pub port: u16,
     pub max_workers: u16,
     pub binding_integration: BindingIntegration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReactNativeIosRunRequest {
+    pub worktree: String,
+    pub udid: String,
+    pub metro_port: u16,
+    pub derived_data: String,
+    pub bundle_id: String,
+    pub scheme: Option<String>,
 }
 
 /// One versioned SDK call delivered inside a bounded JSON-RPC frame.

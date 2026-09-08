@@ -3,9 +3,9 @@ use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
     DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
-    InitializationTask, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
-    MetroUpRequest, PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest,
-    ProcessSpec, SmokeResponse, SmokeStatus,
+    InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest, IosSimulatorAction,
+    IosSimulatorActionRequest, MetroUpRequest, PREPARATION_DEFAULT_TIMEOUT_SECONDS,
+    PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -71,6 +71,13 @@ struct IosArgs {
 
 #[derive(Subcommand)]
 enum IosCommand {
+    Run {
+        environment_id: Uuid,
+        #[arg(long)]
+        bundle_id: String,
+        #[arg(long)]
+        scheme: Option<String>,
+    },
     Acquire {
         environment_id: Uuid,
         #[arg(long)]
@@ -504,6 +511,15 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
             }
         },
         Command::Ios(ios) => match ios.command {
+            IosCommand::Run {
+                environment_id,
+                bundle_id,
+                scheme,
+            } => Ok(DaemonRequest::IosAppRun(IosAppRunRequest {
+                environment_id,
+                bundle_id,
+                scheme,
+            })),
             IosCommand::Acquire {
                 environment_id,
                 runtime,
@@ -771,6 +787,10 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
         DaemonResponse::IosSimulator(simulator) => println!(
             "{} {} {:?}",
             simulator.udid, simulator.runtime, simulator.lifecycle
+        ),
+        DaemonResponse::IosApp(app) => println!(
+            "{} {} metro={} launched={}",
+            app.bundle_id, app.udid, app.metro_port, app.launched
         ),
     }
     Ok(())

@@ -11,18 +11,18 @@ use devfleet_protocol::{
     ComposeReconcileRequest, ComposeUpRequest, DaemonRequest, DaemonResponse, EndpointSnapshot,
     EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot,
     InitializationRunRequest, InitializationTask, InitializationTaskKind,
-    InitializationTaskSnapshot, InitializationTaskStatus, IosSimulatorAcquireRequest,
-    IosSimulatorAction, IosSimulatorActionRequest, IosSimulatorLifecycle, IosSimulatorSnapshot,
-    JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
-    MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
-    PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
-    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ReadinessState, RpcFailure,
-    SupervisorRequest, SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy,
-    TrustedTaskPlugin, read_json_line, write_json_line,
+    InitializationTaskSnapshot, InitializationTaskStatus, IosAppRunRequest, IosAppSnapshot,
+    IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
+    IosSimulatorLifecycle, IosSimulatorSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState,
+    LogSnapshot, MetroReconcileRequest, MetroUpRequest, OperationAccepted, OperationSnapshot,
+    PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot, PreparationRunRequest,
+    PreparationTaskKind, PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot,
+    ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
+    TaskRerunPolicy, TrustedTaskPlugin, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
-    StoredInitializationTask, StoredIosDevice, StoredLifecycle, StoredOperation,
+    StoredInitializationTask, StoredIosApp, StoredIosDevice, StoredLifecycle, StoredOperation,
     StoredPreparationTask, StoredProcess, StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
@@ -162,6 +162,7 @@ impl Daemon {
             DaemonRequest::BindingApply(request) => self.apply_bindings(request),
             DaemonRequest::IosSimulatorAcquire(request) => self.ios_simulator_acquire(&request),
             DaemonRequest::IosSimulatorAction(request) => self.ios_simulator_action(&request),
+            DaemonRequest::IosAppRun(request) => self.ios_app_run(&request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -1133,6 +1134,128 @@ impl Daemon {
         Ok(DaemonResponse::IosSimulator(ios_snapshot(device)?))
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn ios_app_run(&mut self, request: &IosAppRunRequest) -> Result<DaemonResponse, DaemonError> {
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment
+            .process
+            .clone()
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        if environment.lifecycle != StoredLifecycle::Running {
+            return Err(DaemonError::Operation(
+                "iOS app launch requires a running owned environment".into(),
+            ));
+        }
+        let device = self
+            .state
+            .ios_device(environment.id)?
+            .filter(|device| device.lifecycle == "booted")
+            .ok_or_else(|| {
+                DaemonError::DeviceUnavailable("environment has no booted owned simulator".into())
+            })?;
+        let udid = device.udid.ok_or(DaemonError::OwnershipUncertain)?;
+        let metro = self
+            .state
+            .environments()?
+            .into_iter()
+            .filter(|candidate| {
+                candidate.worktree_id == environment.worktree_id
+                    && candidate.lifecycle == StoredLifecycle::Running
+            })
+            .flat_map(|candidate| candidate.endpoints)
+            .filter(|endpoint| endpoint.name == "metro" && endpoint.healthy)
+            .collect::<Vec<_>>();
+        if metro.len() != 1 {
+            return Err(DaemonError::Operation(
+                "iOS app launch requires exactly one healthy Metro endpoint for this worktree"
+                    .into(),
+            ));
+        }
+        let metro_port = endpoint_port(&metro[0].device_url)?;
+        let derived_data = self
+            .config
+            .state_dir
+            .join("ios-builds")
+            .join(environment.id.to_string())
+            .join("DerivedData");
+        prepare_private_dir(&derived_data)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let native_fingerprint = native_build_fingerprint(
+            Path::new(&environment.worktree),
+            metro_port,
+            request.scheme.as_deref(),
+        )?;
+        let operation_id = Uuid::now_v7();
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            Some(operation_id),
+            "ios_app_launch_running",
+        )?;
+        let response = request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::RunPluginTask {
+                operation_id,
+                plugin_id: "official.react-native".into(),
+                action: PluginAction::Action {
+                    name: "app.run_ios".into(),
+                    input: serde_json::json!({
+                        "worktree": environment.worktree,
+                        "udid": udid,
+                        "metro_port": metro_port,
+                        "derived_data": derived_data,
+                        "bundle_id": request.bundle_id,
+                        "scheme": request.scheme,
+                    }),
+                },
+                timeout_seconds: Some(1_800),
+            },
+        )
+        .map_err(|error| map_react_native_capability(error, "app.run_ios"))?;
+        match response {
+            SupervisorResponse::TaskOutput { stdout, stderr } => {
+                self.append_preparation_log(environment.id, "ios-app", &stdout, &stderr)?;
+            }
+            SupervisorResponse::TaskFailed { stdout, stderr } => {
+                self.append_preparation_log(environment.id, "ios-app", &stdout, &stderr)?;
+                return Err(DaemonError::Operation(
+                    "iOS app build, install, or launch failed; inspect preparation-ios-app logs"
+                        .into(),
+                ));
+            }
+            SupervisorResponse::TaskTimedOut => {
+                return Err(DaemonError::Operation(
+                    "iOS app build deadline exceeded; inspect before retrying".into(),
+                ));
+            }
+            SupervisorResponse::TaskCompleted | SupervisorResponse::Process(_) => {
+                return Err(DaemonError::Operation(
+                    "supervisor returned an invalid iOS app response".into(),
+                ));
+            }
+        }
+        let app = StoredIosApp {
+            environment_id: environment.id,
+            bundle_id: request.bundle_id.clone(),
+            udid,
+            metro_port,
+            derived_data: derived_data.display().to_string(),
+            native_fingerprint,
+            launched: true,
+        };
+        self.state.record_ios_app(&app)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            Some(operation_id),
+            "app_launched",
+        )?;
+        Ok(DaemonResponse::IosApp(ios_app_snapshot(app)))
+    }
+
     fn ios_discovery(plugin: &Path) -> Result<IosDiscovery, DaemonError> {
         let value = Self::plugin_action(plugin, "device.discover", serde_json::json!({}))?;
         serde_json::from_value(value).map_err(|_| {
@@ -1252,12 +1375,14 @@ impl Daemon {
         let preparation = self.state.preparation_tasks(environment_id)?;
         let bindings = self.state.bindings(environment_id)?;
         let ios = self.state.ios_device(environment_id)?;
+        let app = self.state.ios_app(environment_id)?;
         Ok(DaemonResponse::Environment(snapshot(
             environment,
             tasks,
             preparation,
             bindings,
             ios,
+            app,
         )))
     }
 
@@ -1271,7 +1396,15 @@ impl Daemon {
                 let preparation = self.state.preparation_tasks(environment.id)?;
                 let bindings = self.state.bindings(environment.id)?;
                 let ios = self.state.ios_device(environment.id)?;
-                Ok::<_, DaemonError>(snapshot(environment, tasks, preparation, bindings, ios))
+                let app = self.state.ios_app(environment.id)?;
+                Ok::<_, DaemonError>(snapshot(
+                    environment,
+                    tasks,
+                    preparation,
+                    bindings,
+                    ios,
+                    app,
+                ))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DaemonResponse::Environments(environments))
@@ -2084,12 +2217,115 @@ fn preparation_fingerprint(
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn native_build_fingerprint(
+    worktree: &Path,
+    metro_port: u16,
+    scheme: Option<&str>,
+) -> Result<String, DaemonError> {
+    let mut files = Vec::new();
+    collect_native_inputs(&worktree.join("ios"), worktree, &mut files)?;
+    for lockfile in ["package-lock.json", "ios/Podfile.lock"] {
+        let path = worktree.join(lockfile);
+        if path.is_file() && !files.contains(&path) {
+            files.push(path);
+        }
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"metro_port=");
+    digest.update(metro_port.to_string().as_bytes());
+    digest.update(b"scheme=");
+    digest.update(scheme.unwrap_or_default().as_bytes());
+    for path in files {
+        let relative = path.strip_prefix(worktree).map_err(|_| {
+            DaemonError::InvalidConfig("native input escaped its selected worktree".into())
+        })?;
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update(fs::read(path).map_err(|error| DaemonError::Operation(error.to_string()))?);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn collect_native_inputs(
+    directory: &Path,
+    worktree: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), DaemonError> {
+    let metadata = directory
+        .symlink_metadata()
+        .map_err(|_| DaemonError::InvalidConfig("iOS native directory is required".into()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DaemonError::InvalidConfig(
+            "iOS native inputs may not traverse a symlink".into(),
+        ));
+    }
+    for entry in
+        fs::read_dir(directory).map_err(|error| DaemonError::Operation(error.to_string()))?
+    {
+        let entry = entry.map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let path = entry.path();
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(DaemonError::InvalidConfig(
+                "iOS native inputs may not traverse a symlink".into(),
+            ));
+        }
+        if metadata.is_dir() {
+            let relative = path.strip_prefix(worktree).map_err(|_| {
+                DaemonError::InvalidConfig("native input escaped its selected worktree".into())
+            })?;
+            if relative.starts_with("ios/Pods") || relative.starts_with("ios/build") {
+                continue;
+            }
+            collect_native_inputs(&path, worktree, files)?;
+        } else if metadata.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(())
+}
+
+fn endpoint_port(url: &str) -> Result<u16, DaemonError> {
+    url.rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| {
+            DaemonError::InvalidConfig("resolved Metro endpoint has no valid port".into())
+        })
+}
+
+fn map_react_native_capability(error: DaemonError, capability: &str) -> DaemonError {
+    match error {
+        DaemonError::Operation(message)
+            if message.contains("requested plugin capability is not authorized")
+                || message.contains("CAPABILITY_UNSUPPORTED:") =>
+        {
+            DaemonError::CapabilityUnsupported(capability.into())
+        }
+        error => error,
+    }
+}
+
+fn ios_app_snapshot(app: StoredIosApp) -> IosAppSnapshot {
+    IosAppSnapshot {
+        environment_id: app.environment_id,
+        bundle_id: app.bundle_id,
+        udid: app.udid,
+        metro_port: app.metro_port,
+        derived_data: app.derived_data,
+        launched: app.launched,
+    }
+}
+
 fn snapshot(
     environment: StoredEnvironment,
     tasks: Vec<StoredInitializationTask>,
     preparation: Vec<StoredPreparationTask>,
     bindings: Vec<StoredBinding>,
     ios: Option<StoredIosDevice>,
+    app: Option<StoredIosApp>,
 ) -> EnvironmentSnapshot {
     let lifecycle = match environment.lifecycle {
         StoredLifecycle::Starting => LifecycleState::Starting,
@@ -2150,6 +2386,7 @@ fn snapshot(
             .collect(),
         bindings: bindings.into_iter().map(binding_snapshot).collect(),
         ios_simulator: ios.and_then(|device| ios_snapshot(device).ok()),
+        ios_app: app.map(ios_app_snapshot),
     }
 }
 

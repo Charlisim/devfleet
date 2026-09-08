@@ -1,12 +1,12 @@
 //! Versioned SQLite storage. Domain orchestration remains in the daemon/core.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 14;
+pub const CURRENT_SCHEMA_VERSION: i64 = 15;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -180,6 +180,17 @@ pub struct StoredPreparationTask {
     pub attempts: u64,
     pub status: String,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredIosApp {
+    pub environment_id: Uuid,
+    pub bundle_id: String,
+    pub udid: String,
+    pub metro_port: u16,
+    pub derived_data: String,
+    pub native_fingerprint: String,
+    pub launched: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -616,6 +627,35 @@ impl StateStore {
         diagnostic: Option<&str>,
     ) -> Result<(), StateError> {
         self.connection.execute("UPDATE preparation_tasks SET status = CASE WHEN ?3 IS NULL THEN 'completed' ELSE 'failed' END, diagnostic = ?3 WHERE environment_id = ?1 AND kind = ?2", params![environment_id.to_string(), kind, diagnostic])?;
+        Ok(())
+    }
+
+    /// Reads the last owned iOS app installation for one environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot query the installation record.
+    pub fn ios_app(&self, environment_id: Uuid) -> Result<Option<StoredIosApp>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT environment_id, bundle_id, udid, metro_port, derived_data, native_fingerprint, launched FROM ios_apps WHERE environment_id = ?1",
+                params![environment_id.to_string()],
+                stored_ios_app,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Persists an exact iOS app installation after the provider launches it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the installation record.
+    pub fn record_ios_app(&mut self, app: &StoredIosApp) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO ios_apps (environment_id, bundle_id, udid, metro_port, derived_data, native_fingerprint, launched) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(environment_id) DO UPDATE SET bundle_id = excluded.bundle_id, udid = excluded.udid, metro_port = excluded.metro_port, derived_data = excluded.derived_data, native_fingerprint = excluded.native_fingerprint, launched = excluded.launched",
+            params![app.environment_id.to_string(), app.bundle_id, app.udid, i64::from(app.metro_port), app.derived_data, app.native_fingerprint, app.launched],
+        )?;
         Ok(())
     }
 
@@ -1473,6 +1513,9 @@ impl StateStore {
         if version < 14 {
             self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS preparation_tasks (environment_id TEXT NOT NULL REFERENCES environments(id), kind TEXT NOT NULL, fingerprint TEXT NOT NULL, attempts INTEGER NOT NULL, status TEXT NOT NULL, diagnostic TEXT, PRIMARY KEY (environment_id, kind)); PRAGMA user_version = 14; COMMIT;")?;
         }
+        if version < 15 {
+            self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS ios_apps (environment_id TEXT PRIMARY KEY REFERENCES environments(id), bundle_id TEXT NOT NULL, udid TEXT NOT NULL UNIQUE, metro_port INTEGER NOT NULL, derived_data TEXT NOT NULL, native_fingerprint TEXT NOT NULL, launched INTEGER NOT NULL); PRAGMA user_version = 15; COMMIT;")?;
+        }
         Ok(())
     }
 }
@@ -1514,6 +1557,22 @@ fn stored_preparation_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPr
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, attempts))?,
         status: row.get(4)?,
         diagnostic: row.get(5)?,
+    })
+}
+
+fn stored_ios_app(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIosApp> {
+    let metro_port: i64 = row.get(3)?;
+    Ok(StoredIosApp {
+        environment_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        bundle_id: row.get(1)?,
+        udid: row.get(2)?,
+        metro_port: metro_port
+            .try_into()
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, metro_port))?,
+        derived_data: row.get(4)?,
+        native_fingerprint: row.get(5)?,
+        launched: row.get(6)?,
     })
 }
 
@@ -1880,6 +1939,33 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].fingerprint, "lockfile-a");
         assert_eq!(retained[0].status, "completed");
+    }
+
+    #[test]
+    fn retains_an_ios_app_installation_per_environment() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let environment = environment();
+        store
+            .record_start_intent(&environment, Uuid::now_v7())
+            .expect("environment persists");
+        store
+            .record_ios_app(&StoredIosApp {
+                environment_id: environment.id,
+                bundle_id: "com.example.app".into(),
+                udid: "0186D916-7A5C-4E31-8590-C2F502FA2288".into(),
+                metro_port: 21_001,
+                derived_data: "/private/derived-data".into(),
+                native_fingerprint: "native-a".into(),
+                launched: true,
+            })
+            .expect("app persists");
+        let app = store
+            .ios_app(environment.id)
+            .expect("app reads")
+            .expect("app exists");
+        assert_eq!(app.bundle_id, "com.example.app");
+        assert_eq!(app.metro_port, 21_001);
+        assert!(app.launched);
     }
 
     #[test]
