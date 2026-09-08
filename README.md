@@ -63,6 +63,50 @@ environment, operation and process identity in SQLite. Local peer UID checks,
 frames protect this bounded slice. Plugins are trusted native code; these
 controls are not an OS sandbox.
 
+## Declarative preview
+
+`plan` reads a schema-versioned `devfleet.toml`, optionally applies a local
+override and explicit operation values, then validates the graph without
+contacting a provider or creating a child process. Provider descriptors must be
+installed, but planning does not require plugin execution trust. Secret values
+are never accepted by this command: use only `--secret-ref NAME` to prove that
+a required reference can be supplied later.
+
+```toml
+schema_version = 1
+
+[ports]
+api = 4010
+
+[profiles.process]
+resources = ["api"]
+
+[resources.api]
+provider = "official.process"
+
+[resources.api.config]
+port = "${{ ports.api }}"
+token = "${{ secrets.API_TOKEN }}"
+
+[resources.api.config_schema]
+required = ["port", "token"]
+
+[resources.api.config_schema.types]
+port = "integer"
+```
+
+```sh
+devfleet --socket /tmp/df-$(id -u)/daemon.sock --json plan \
+  --worktree "$PWD" --profile process --secret-ref API_TOKEN
+```
+
+An entire expression retains its resolved JSON type; an expression embedded in
+text is rendered as a string. `depends_on`, `readiness_depends_on`, runtime
+output expressions (`resources.<id>.outputs.<name>`) and reserved endpoint
+expressions (`endpoints.<id>.<name>`) appear as distinct dependency edges. The
+daemon stores only the redacted effective configuration and advances its plan
+generation when that snapshot changes.
+
 ## Component boundaries
 
 `devfleet-core` holds provider-neutral domain and planning types. It contains no

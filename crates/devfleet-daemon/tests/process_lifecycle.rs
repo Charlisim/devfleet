@@ -1,7 +1,7 @@
 use devfleet_cli::request;
 use devfleet_protocol::{
-    DaemonRequest, DaemonResponse, EnvironmentUpRequest, LifecycleState, ProcessSpec,
-    ReadinessState,
+    DaemonRequest, DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, LifecycleState,
+    ProcessSpec, ReadinessState,
 };
 use std::{
     collections::BTreeMap,
@@ -215,6 +215,104 @@ fn immediately_exited_process_is_retained_as_failed() {
             .expect("process retained")
             .readiness,
         devfleet_state::StoredReadiness::ProcessStopped
+    );
+}
+
+#[test]
+fn plan_is_side_effect_free_and_invalid_manifests_cannot_spawn_a_process() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let marker = temporary.path().join("plan-must-not-spawn");
+    let manifest = temporary.path().join("devfleet.toml");
+    fs::write(
+        &manifest,
+        format!(
+            r#"schema_version = 1
+[profiles.process]
+resources = ["fixture"]
+[resources.fixture]
+provider = "official.process"
+[resources.fixture.config]
+argv = ["/bin/sh", "-c", "touch {}"]
+token = "${{{{ secrets.API_TOKEN }}}}"
+"#,
+            marker.display()
+        ),
+    )
+    .expect("manifest writes");
+    let request_plan = || EnvironmentPlanRequest {
+        worktree: temporary.path().display().to_string(),
+        profile: "process".into(),
+        manifest: manifest.display().to_string(),
+        local_override: None,
+        secret_references: vec!["API_TOKEN".into()],
+        operation_overrides: BTreeMap::new(),
+        runtime_outputs: BTreeMap::new(),
+        planning_endpoints: BTreeMap::new(),
+    };
+    let first =
+        request(&fixture.socket, DaemonRequest::Plan(request_plan())).expect("plan succeeds");
+    let DaemonResponse::Plan(first) = first else {
+        panic!("expected plan response");
+    };
+    let repeated =
+        request(&fixture.socket, DaemonRequest::Plan(request_plan())).expect("plan repeats");
+    let DaemonResponse::Plan(repeated) = repeated else {
+        panic!("expected plan response");
+    };
+    assert_eq!(first.generation, repeated.generation);
+    assert!(!marker.exists());
+
+    fs::write(
+        &manifest,
+        format!(
+            r#"schema_version = 1
+[profiles.process]
+resources = ["fixture"]
+[resources.fixture]
+provider = "official.process"
+[resources.fixture.config]
+argv = ["/bin/sh", "-c", "touch {}"]
+token = "${{{{ secrets.API_TOKEN }}}}"
+revision = 2
+"#,
+            marker.display()
+        ),
+    )
+    .expect("changed manifest writes");
+    let changed =
+        request(&fixture.socket, DaemonRequest::Plan(request_plan())).expect("plan changes");
+    let DaemonResponse::Plan(changed) = changed else {
+        panic!("expected plan response");
+    };
+    assert_eq!(changed.generation, first.generation + 1);
+    assert!(!marker.exists());
+
+    fs::write(
+        &manifest,
+        format!(
+            r#"schema_version = 1
+[profiles.process]
+resources = ["fixture"]
+[resources.fixture]
+provider = "official.process"
+[resources.fixture.config]
+argv = ["/bin/sh", "-c", "touch {}"]
+invalid = "${{{{ unrecognized.token }}}}"
+"#,
+            marker.display()
+        ),
+    )
+    .expect("invalid manifest writes");
+    assert!(request(&fixture.socket, DaemonRequest::Plan(request_plan())).is_err());
+    assert!(!marker.exists());
+    assert!(
+        devfleet_state::StateStore::open(&fixture.state_dir.join("state.sqlite3"))
+            .expect("state opens")
+            .environments()
+            .expect("environments list")
+            .is_empty()
     );
 }
 

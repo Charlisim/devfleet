@@ -112,9 +112,24 @@ pub struct EnvironmentUpRequest {
     pub process: ProcessSpec,
 }
 
+/// Inputs for a side-effect-free declarative plan preview. Secret values are
+/// intentionally absent: callers may only declare a reference as available.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentPlanRequest {
+    pub worktree: String,
+    pub profile: String,
+    pub manifest: String,
+    pub local_override: Option<String>,
+    pub secret_references: Vec<String>,
+    pub operation_overrides: BTreeMap<String, Value>,
+    pub runtime_outputs: BTreeMap<String, Value>,
+    pub planning_endpoints: BTreeMap<String, Value>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", content = "arguments", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    Plan(EnvironmentPlanRequest),
     Up(EnvironmentUpRequest),
     Status { environment_id: Uuid },
     List,
@@ -127,11 +142,20 @@ pub enum DaemonRequest {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    Plan(EnvironmentPlanSnapshot),
     Accepted(OperationAccepted),
     Environment(EnvironmentSnapshot),
     Environments(Vec<EnvironmentSnapshot>),
     Plugin(PluginSnapshot),
     Plugins(Vec<PluginSnapshot>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentPlanSnapshot {
+    pub worktree: String,
+    pub profile: String,
+    pub generation: u64,
+    pub effective_configuration: Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

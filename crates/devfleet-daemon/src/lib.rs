@@ -1,11 +1,11 @@
 //! Local daemon: private IPC, persistent state, and supervisor composition.
 
-use devfleet_core::discover_git_worktree;
+use devfleet_core::{PlanOptions, compile_manifest, discover_git_worktree};
 use devfleet_protocol::{
-    DaemonRequest, DaemonResponse, EnvironmentSnapshot, ErrorCode, JsonRpcRequest, JsonRpcResponse,
-    LifecycleState, OperationAccepted, PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot,
-    ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
-    read_json_line, write_json_line,
+    DaemonRequest, DaemonResponse, EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode,
+    JsonRpcRequest, JsonRpcResponse, LifecycleState, OperationAccepted, PROTOCOL_VERSION,
+    PluginSnapshot, ProcessSnapshot, ReadinessState, RpcFailure, SupervisorRequest,
+    SupervisorResponse, SupervisorStartRequest, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredEnvironment, StoredLifecycle, StoredProcess, StoredReadiness,
@@ -15,6 +15,7 @@ use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{BufReader, Read, Write},
     os::unix::{
@@ -122,6 +123,7 @@ impl Daemon {
 
     fn handle(&mut self, request: DaemonRequest) -> Result<DaemonResponse, DaemonError> {
         match request {
+            DaemonRequest::Plan(request) => self.plan(request),
             DaemonRequest::Up(request) => self.up(request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
@@ -130,6 +132,77 @@ impl Daemon {
             DaemonRequest::PluginInstall { path } => self.plugin_install(Path::new(&path)),
             DaemonRequest::PluginTrust { id } => self.plugin_trust(&id),
         }
+    }
+
+    fn plan(
+        &mut self,
+        request: devfleet_protocol::EnvironmentPlanRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        if request.profile.is_empty() {
+            return Err(DaemonError::InvalidConfig("profile is required".into()));
+        }
+        let git_identity = discover_git_worktree(Path::new(&request.worktree))
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let manifest = canonical_plan_path(&request.manifest, &git_identity.checkout)?;
+        let local_override = request
+            .local_override
+            .as_deref()
+            .map(|path| canonical_plan_path(path, &git_identity.checkout))
+            .transpose()?;
+        let known_providers = self
+            .state
+            .plugins()?
+            .into_iter()
+            .map(|plugin| plugin.id)
+            .collect();
+        let environment_key = environment_key(
+            &git_identity.project_fingerprint,
+            &git_identity.worktree_fingerprint,
+            &request.profile,
+            None,
+        );
+        let environment = BTreeMap::from([
+            ("id".into(), serde_json::json!(environment_key)),
+            (
+                "state_dir".into(),
+                serde_json::json!(self.config.state_dir.display().to_string()),
+            ),
+            (
+                "generation".into(),
+                serde_json::json!("${{ environment.generation }}"),
+            ),
+        ]);
+        let options = PlanOptions {
+            known_providers,
+            available_secret_references: request
+                .secret_references
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            runtime_outputs: request.runtime_outputs,
+            planning_endpoints: request.planning_endpoints,
+            operation_overrides: request.operation_overrides,
+            environment,
+        };
+        let plan = compile_manifest(
+            &manifest,
+            local_override.as_deref(),
+            &request.profile,
+            &options,
+        )
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let stored = self.state.record_effective_plan(
+            &git_identity.project_fingerprint,
+            &git_identity.worktree_fingerprint,
+            &git_identity.checkout.display().to_string(),
+            &request.profile,
+            &plan.effective_configuration,
+        )?;
+        Ok(DaemonResponse::Plan(EnvironmentPlanSnapshot {
+            worktree: stored.worktree,
+            profile: stored.profile,
+            generation: stored.generation,
+            effective_configuration: stored.effective_configuration,
+        }))
     }
 
     fn up(
@@ -571,6 +644,18 @@ fn validate_up_request(
         ));
     }
     Ok(())
+}
+
+fn canonical_plan_path(path: &str, worktree: &Path) -> Result<PathBuf, DaemonError> {
+    let path = Path::new(path)
+        .canonicalize()
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+    if !path.is_file() || !path.starts_with(worktree) {
+        return Err(DaemonError::InvalidConfig(
+            "plan files must be regular files inside the requested worktree".into(),
+        ));
+    }
+    Ok(path)
 }
 
 fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {

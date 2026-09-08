@@ -6,7 +6,7 @@ use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -136,6 +136,18 @@ pub struct StoredPlugin {
     pub plugin_state_version: u32,
     pub capabilities: Vec<String>,
     pub trusted: bool,
+}
+
+/// A redacted, provider-free configuration snapshot for one worktree/profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredPlan {
+    pub key: String,
+    pub project_fingerprint: String,
+    pub worktree_fingerprint: String,
+    pub worktree: String,
+    pub profile: String,
+    pub generation: u64,
+    pub effective_configuration: serde_json::Value,
 }
 
 pub struct StateStore {
@@ -428,6 +440,76 @@ impl StateStore {
         Ok(count > 0)
     }
 
+    /// Persists a redacted plan and advances generation only when its effective
+    /// configuration changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plan cannot be serialized or SQLite cannot
+    /// atomically compare and store the generation.
+    pub fn record_effective_plan(
+        &mut self,
+        project_fingerprint: &str,
+        worktree_fingerprint: &str,
+        worktree: &str,
+        profile: &str,
+        effective_configuration: &serde_json::Value,
+    ) -> Result<StoredPlan, StateError> {
+        let key = format!("{project_fingerprint}|{worktree_fingerprint}|{profile}");
+        let configuration = serde_json::to_string(effective_configuration)?;
+        let transaction = self.connection.transaction()?;
+        let existing = transaction.query_row(
+            "SELECT generation, effective_configuration_json FROM effective_plans WHERE plan_key = ?1",
+            params![key],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        );
+        let generation = match existing {
+            Ok((generation, existing)) if existing == configuration => generation,
+            Ok((generation, _)) => {
+                let next = generation
+                    .checked_add(1)
+                    .ok_or(StateError::NumericOutOfRange)?;
+                transaction.execute(
+                    "UPDATE effective_plans
+                     SET worktree = ?1, generation = ?2, effective_configuration_json = ?3,
+                         updated_at = unixepoch()
+                     WHERE plan_key = ?4",
+                    params![worktree, next, configuration, key],
+                )?;
+                next
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                transaction.execute(
+                    "INSERT INTO effective_plans (plan_key, project_fingerprint, worktree_fingerprint,
+                                                  worktree, profile, generation, effective_configuration_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+                    params![
+                        key,
+                        project_fingerprint,
+                        worktree_fingerprint,
+                        worktree,
+                        profile,
+                        configuration,
+                    ],
+                )?;
+                1
+            }
+            Err(error) => return Err(StateError::Sqlite(error)),
+        };
+        transaction.commit()?;
+        Ok(StoredPlan {
+            key,
+            project_fingerprint: project_fingerprint.into(),
+            worktree_fingerprint: worktree_fingerprint.into(),
+            worktree: worktree.into(),
+            profile: profile.into(),
+            generation: generation
+                .try_into()
+                .map_err(|_| StateError::NumericOutOfRange)?,
+            effective_configuration: effective_configuration.clone(),
+        })
+    }
+
     /// Updates verified Git context without changing project or worktree identity.
     ///
     /// # Errors
@@ -616,6 +698,23 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 6 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS effective_plans (
+                    plan_key TEXT PRIMARY KEY,
+                    project_fingerprint TEXT NOT NULL,
+                    worktree_fingerprint TEXT NOT NULL,
+                    worktree TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    effective_configuration_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 );
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 }
@@ -781,5 +880,29 @@ mod tests {
             environment.project_fingerprint,
             format!("legacy:{legacy_id}")
         );
+    }
+
+    #[test]
+    fn increments_plan_generation_only_for_a_changed_redacted_snapshot() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let snapshot = serde_json::json!({"token": "${{ secrets.API_TOKEN }}", "port": 4000});
+        let first = store
+            .record_effective_plan("project", "worktree", "/tmp/worktree", "dev", &snapshot)
+            .expect("first plan persists");
+        let repeated = store
+            .record_effective_plan("project", "worktree", "/tmp/worktree", "dev", &snapshot)
+            .expect("same plan persists");
+        let changed = store
+            .record_effective_plan(
+                "project",
+                "worktree",
+                "/tmp/worktree",
+                "dev",
+                &serde_json::json!({"token": "${{ secrets.API_TOKEN }}", "port": 5000}),
+            )
+            .expect("changed plan persists");
+        assert_eq!(first.generation, 1);
+        assert_eq!(repeated.generation, 1);
+        assert_eq!(changed.generation, 2);
     }
 }

@@ -10,6 +10,13 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod plan;
+
+pub use plan::{
+    DependencyEdge, DependencyKind, EffectivePlan, PlanOptions, PlannedResource, compile_document,
+    compile_manifest,
+};
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]

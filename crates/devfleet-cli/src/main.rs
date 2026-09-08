@@ -1,8 +1,8 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use devfleet_cli::request;
 use devfleet_protocol::{
-    DaemonRequest, DaemonResponse, EnvironmentUpRequest, PROTOCOL_VERSION, ProcessSpec,
-    SmokeResponse, SmokeStatus,
+    DaemonRequest, DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, PROTOCOL_VERSION,
+    ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 use uuid::Uuid;
@@ -25,11 +25,37 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    Plan(PlanArgs),
     Up(UpArgs),
     Status { environment_id: Uuid },
     List,
     Stop { environment_id: Uuid },
     Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct PlanArgs {
+    #[arg(long)]
+    worktree: PathBuf,
+    #[arg(long, default_value = "process")]
+    profile: String,
+    /// Defaults to devfleet.toml inside --worktree.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    #[arg(long)]
+    local_override: Option<PathBuf>,
+    /// Declares a required secret reference without sending a secret value.
+    #[arg(long = "secret-ref")]
+    secret_references: Vec<String>,
+    /// JSON operation override in dotted.path=JSON form.
+    #[arg(long = "set")]
+    operation_overrides: Vec<String>,
+    /// Known runtime output in resource.output=JSON form.
+    #[arg(long = "output")]
+    runtime_outputs: Vec<String>,
+    /// Reserved planning endpoint in resource.endpoint=JSON form.
+    #[arg(long = "endpoint")]
+    planning_endpoints: Vec<String>,
 }
 
 #[derive(ClapArgs)]
@@ -92,6 +118,27 @@ fn main() -> anyhow::Result<()> {
 
 fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
     match command {
+        Command::Plan(plan) => {
+            let worktree = plan.worktree.canonicalize()?;
+            let manifest = plan
+                .manifest
+                .unwrap_or_else(|| worktree.join("devfleet.toml"))
+                .canonicalize()?;
+            Ok(DaemonRequest::Plan(EnvironmentPlanRequest {
+                worktree: worktree.display().to_string(),
+                profile: plan.profile,
+                manifest: manifest.display().to_string(),
+                local_override: plan
+                    .local_override
+                    .map(|path| path.canonicalize())
+                    .transpose()?
+                    .map(|path| path.display().to_string()),
+                secret_references: parse_references(plan.secret_references)?,
+                operation_overrides: parse_json_values(plan.operation_overrides, "--set")?,
+                runtime_outputs: parse_json_values(plan.runtime_outputs, "--output")?,
+                planning_endpoints: parse_json_values(plan.planning_endpoints, "--endpoint")?,
+            }))
+        }
         Command::Up(up) => Ok(DaemonRequest::Up(EnvironmentUpRequest {
             worktree: up.worktree.canonicalize()?.display().to_string(),
             profile: up.profile,
@@ -116,6 +163,39 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
     }
 }
 
+fn parse_references(values: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut references = values.into_iter().collect::<Vec<_>>();
+    references.sort();
+    if references.iter().any(String::is_empty)
+        || references.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        anyhow::bail!("--secret-ref values must be nonempty and unique");
+    }
+    Ok(references)
+}
+
+fn parse_json_values(
+    values: Vec<String>,
+    option: &str,
+) -> anyhow::Result<BTreeMap<String, serde_json::Value>> {
+    values
+        .into_iter()
+        .try_fold(BTreeMap::new(), |mut entries, value| {
+            let (key, json) = value
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("{option} must use key=JSON"))?;
+            if key.is_empty() || entries.contains_key(key) {
+                anyhow::bail!("{option} keys must be nonempty and unique");
+            }
+            entries.insert(
+                key.into(),
+                serde_json::from_str(json)
+                    .map_err(|_| anyhow::anyhow!("{option} values must be valid JSON"))?,
+            );
+            Ok(entries)
+        })
+}
+
 fn parse_environment(values: Vec<String>) -> anyhow::Result<BTreeMap<String, String>> {
     values
         .into_iter()
@@ -136,6 +216,10 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     match response {
+        DaemonResponse::Plan(plan) => println!(
+            "{} {} generation {}",
+            plan.worktree, plan.profile, plan.generation
+        ),
         DaemonResponse::Accepted(operation) => println!(
             "accepted operation {} for environment {}",
             operation.operation_id, operation.environment_id
@@ -182,5 +266,13 @@ mod tests {
     fn rejects_duplicate_or_malformed_environment_entries() {
         assert!(parse_environment(vec!["A=1".into(), "A=2".into()]).is_err());
         assert!(parse_environment(vec!["missing".into()]).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_or_malformed_plan_values() {
+        assert!(parse_json_values(vec!["api.port=4000".into()], "--output").is_ok());
+        assert!(parse_json_values(vec!["missing".into()], "--output").is_err());
+        assert!(parse_json_values(vec!["api.port=not-json".into()], "--output").is_err());
+        assert!(parse_references(vec!["API_TOKEN".into(), "API_TOKEN".into()]).is_err());
     }
 }
