@@ -113,6 +113,18 @@ pub struct EnvironmentUpRequest {
     pub process: ProcessSpec,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComposeUpRequest {
+    pub worktree: String,
+    pub profile: String,
+    pub instance: Option<String>,
+    pub trusted: bool,
+    pub files: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub endpoints: Vec<ComposeEndpoint>,
+    pub authorizations: ComposeAuthorizations,
+}
+
 /// Inputs for a side-effect-free declarative plan preview. Secret values are
 /// intentionally absent: callers may only declare a reference as available.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -132,6 +144,7 @@ pub struct EnvironmentPlanRequest {
 pub enum DaemonRequest {
     Plan(EnvironmentPlanRequest),
     Up(EnvironmentUpRequest),
+    ComposeUp(ComposeUpRequest),
     Status {
         environment_id: Uuid,
     },
@@ -265,6 +278,18 @@ pub struct EnvironmentSnapshot {
     pub lifecycle: LifecycleState,
     pub reconciliation_diagnostic: Option<String>,
     pub process: Option<ProcessSnapshot>,
+    pub endpoints: Vec<EndpointSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EndpointSnapshot {
+    pub name: String,
+    pub service: String,
+    pub internal_url: String,
+    pub host_url: String,
+    pub device_url: String,
+    pub readiness_path: String,
+    pub healthy: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -301,6 +326,38 @@ pub struct PluginReconcileRequest {
     pub process: ProcessSpec,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComposeEndpoint {
+    pub name: String,
+    pub service: String,
+    pub container_port: u16,
+    pub host_port: u16,
+    pub readiness_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComposeAuthorizations {
+    pub global_container_names: Option<String>,
+    pub host_networking: Option<String>,
+    pub external_resources: Option<String>,
+    pub global_volume_names: Option<String>,
+    pub unmanaged_ports: Option<String>,
+    pub shared_mutable_binds: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComposeReconcileRequest {
+    pub protocol: ProtocolVersion,
+    pub operation_id: Uuid,
+    pub environment_id: Uuid,
+    pub worktree: String,
+    pub project_name: String,
+    pub files: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub endpoints: Vec<ComposeEndpoint>,
+    pub authorizations: ComposeAuthorizations,
+}
+
 /// One versioned SDK call delivered inside a bounded JSON-RPC frame.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PluginCall {
@@ -318,6 +375,7 @@ pub enum PluginAction {
     Plan { configuration: Value },
     Inspect,
     Reconcile(PluginReconcileRequest),
+    ComposeReconcile(Box<ComposeReconcileRequest>),
     Stop,
     Destroy,
     Action { name: String, input: Value },
@@ -364,7 +422,7 @@ pub struct HostWriteArtifactRequest {
 pub struct SupervisorStartRequest {
     pub environment_id: Uuid,
     pub operation_id: Uuid,
-    pub process: ProcessSpec,
+    pub action: PluginAction,
     /// Private per-environment directory, created by the daemon before launch.
     pub log_directory: String,
     /// Per-resource disk cap. Payloads never enter daemon state or event rows.

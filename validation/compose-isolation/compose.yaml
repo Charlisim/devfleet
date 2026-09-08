@@ -1,0 +1,44 @@
+services:
+  api:
+    image: alpine:3.20
+    command: ["sh", "-c", "exec nc -lk -p 3000 -e /bin/sh -c \"printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 3\\r\\n\\r\\nok\\n'\""]
+    ports:
+      - "127.0.0.1:${DEVFLEET_API_PORT}:3000"
+    volumes:
+      - files:/srv/data
+  database:
+    image: alpine:3.20
+    command: ["sh", "-c", "while true; do sleep 60; done"]
+    volumes:
+      - database:/var/lib/database
+  queue:
+    image: alpine:3.20
+    command: ["sh", "-c", "while true; do sleep 60; done"]
+    volumes:
+      - queue:/var/lib/queue
+  cache:
+    image: alpine:3.20
+    command: ["sh", "-c", "while true; do sleep 60; done"]
+    volumes:
+      - cache:/var/lib/cache
+  files:
+    image: alpine:3.20
+    command: ["sh", "-c", "while true; do sleep 60; done"]
+    volumes:
+      - files:/data
+  worker-01: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-02: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-03: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-04: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-05: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-06: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-07: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-08: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-09: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+  worker-10: { image: alpine:3.20, command: ["sh", "-c", "while true; do sleep 60; done"] }
+
+volumes:
+  database: {}
+  queue: {}
+  cache: {}
+  files: {}

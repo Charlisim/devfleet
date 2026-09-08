@@ -1,8 +1,9 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use devfleet_cli::request;
 use devfleet_protocol::{
-    DaemonRequest, DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, PROTOCOL_VERSION,
-    ProcessSpec, SmokeResponse, SmokeStatus,
+    ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest, DaemonResponse,
+    EnvironmentPlanRequest, EnvironmentUpRequest, PROTOCOL_VERSION, ProcessSpec, SmokeResponse,
+    SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -38,7 +39,50 @@ enum Command {
     Operation(OperationArgs),
     Events(EventsArgs),
     Logs(LogsArgs),
+    Compose(ComposeArgs),
     Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct ComposeArgs {
+    #[command(subcommand)]
+    command: ComposeCommand,
+}
+
+#[derive(Subcommand)]
+enum ComposeCommand {
+    Up(ComposeUpArgs),
+}
+
+#[derive(ClapArgs)]
+struct ComposeUpArgs {
+    #[arg(long)]
+    trust: bool,
+    #[arg(long)]
+    worktree: PathBuf,
+    #[arg(long, default_value = "compose")]
+    profile: String,
+    #[arg(long)]
+    instance: Option<String>,
+    #[arg(long = "file", required = true)]
+    files: Vec<PathBuf>,
+    #[arg(long = "env")]
+    environment: Vec<String>,
+    /// `NAME=SERVICE:CONTAINER_PORT:HOST_PORT:/READINESS_PATH`
+    #[arg(long = "endpoint")]
+    endpoints: Vec<String>,
+    #[arg(long = "allow-global-container-names")]
+    global_container_names: Option<String>,
+    #[arg(long = "allow-host-networking")]
+    host_networking: Option<String>,
+    #[arg(long = "allow-external-resources")]
+    external_resources: Option<String>,
+    #[arg(long = "allow-global-volume-names")]
+    global_volume_names: Option<String>,
+    #[arg(long = "allow-unmanaged-ports")]
+    unmanaged_ports: Option<String>,
+    #[arg(long = "allow-shared-mutable-binds")]
+    shared_mutable_binds: Option<String>,
 }
 
 #[derive(ClapArgs)]
@@ -286,6 +330,35 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 environment: parse_environment(up.environment)?,
             },
         })),
+        Command::Compose(compose) => match compose.command {
+            ComposeCommand::Up(up) => {
+                let worktree = up.worktree.canonicalize()?;
+                Ok(DaemonRequest::ComposeUp(ComposeUpRequest {
+                    worktree: worktree.display().to_string(),
+                    profile: up.profile,
+                    instance: up.instance,
+                    trusted: up.trust,
+                    files: up
+                        .files
+                        .into_iter()
+                        .map(|file| file.canonicalize())
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(|file| file.display().to_string())
+                        .collect(),
+                    environment: parse_environment(up.environment)?,
+                    endpoints: parse_compose_endpoints(up.endpoints)?,
+                    authorizations: ComposeAuthorizations {
+                        global_container_names: up.global_container_names,
+                        host_networking: up.host_networking,
+                        external_resources: up.external_resources,
+                        global_volume_names: up.global_volume_names,
+                        unmanaged_ports: up.unmanaged_ports,
+                        shared_mutable_binds: up.shared_mutable_binds,
+                    },
+                }))
+            }
+        },
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
         Command::Stop { environment_id } => Ok(DaemonRequest::Stop { environment_id }),
@@ -364,6 +437,43 @@ fn parse_environment(values: Vec<String>) -> anyhow::Result<BTreeMap<String, Str
         })
 }
 
+fn parse_compose_endpoints(values: Vec<String>) -> anyhow::Result<Vec<ComposeEndpoint>> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut host_ports = std::collections::BTreeSet::new();
+    values
+        .into_iter()
+        .map(|value| {
+            let (name, definition) = value.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--endpoint must use NAME=SERVICE:CONTAINER_PORT:HOST_PORT:/PATH")
+            })?;
+            let mut parts = definition.splitn(4, ':');
+            let service = parts.next().unwrap_or_default();
+            let container_port = parts.next().unwrap_or_default().parse::<u16>()?;
+            let host_port = parts.next().unwrap_or_default().parse::<u16>()?;
+            let readiness_path = parts.next().unwrap_or_default();
+            if name.is_empty()
+                || service.is_empty()
+                || container_port == 0
+                || host_port == 0
+                || !readiness_path.starts_with('/')
+                || !names.insert(name.to_owned())
+                || !host_ports.insert(host_port)
+            {
+                anyhow::bail!(
+                    "--endpoint names and host ports must be unique with nonzero ports and /PATH"
+                );
+            }
+            Ok(ComposeEndpoint {
+                name: name.into(),
+                service: service.into(),
+                container_port,
+                host_port,
+                readiness_path: readiness_path.into(),
+            })
+        })
+        .collect()
+}
+
 fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string(response)?);
@@ -378,13 +488,25 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
             "accepted operation {} for environment {}",
             operation.operation_id, operation.environment_id
         ),
-        DaemonResponse::Environment(environment) => println!(
-            "{} {}/{} {:?}",
-            environment.environment_id,
-            environment.project_id,
-            environment.worktree_id,
-            environment.lifecycle
-        ),
+        DaemonResponse::Environment(environment) => {
+            println!(
+                "{} {}/{} {:?}",
+                environment.environment_id,
+                environment.project_id,
+                environment.worktree_id,
+                environment.lifecycle
+            );
+            for endpoint in &environment.endpoints {
+                println!(
+                    "endpoint {} internal={} host={} device={} healthy={}",
+                    endpoint.name,
+                    endpoint.internal_url,
+                    endpoint.host_url,
+                    endpoint.device_url,
+                    endpoint.healthy
+                );
+            }
+        }
         DaemonResponse::Environments(environments) => {
             for environment in environments {
                 println!(
@@ -445,6 +567,14 @@ mod tests {
         assert!(parse_json_values(vec!["missing".into()], "--output").is_err());
         assert!(parse_json_values(vec!["api.port=not-json".into()], "--output").is_err());
         assert!(parse_references(vec!["API_TOKEN".into(), "API_TOKEN".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_scoped_compose_endpoints() {
+        let endpoints = parse_compose_endpoints(vec!["api=api:3000:20001:/health".into()])
+            .expect("endpoint parses");
+        assert_eq!(endpoints[0].host_port, 20_001);
+        assert!(parse_compose_endpoints(vec!["api=api:3000:20001:health".into()]).is_err());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 //! Per-environment owner of one process group and its private control socket.
 
 use anyhow::Context as _;
-use devfleet_core::LogStore;
+use devfleet_logging::LogStore;
 use devfleet_protocol::{
-    HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginAction, PluginCall,
-    PluginReconcileRequest, ProcessSnapshot, ReadinessState, SupervisorRequest, SupervisorResponse,
-    SupervisorStartRequest, read_json_line, write_json_line,
+    HostSpawnRequest, JsonRpcRequest, JsonRpcResponse, PROTOCOL_VERSION, PluginCall,
+    ProcessSnapshot, ReadinessState, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
+    read_json_line, write_json_line,
 };
 use nix::{
     errno::Errno,
@@ -64,6 +64,7 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
             control_socket.display()
         )
     })?;
+    let _socket_cleanup = SocketCleanup(control_socket.to_path_buf());
     fs::set_permissions(control_socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
@@ -82,6 +83,14 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
     }
 }
 
+struct SocketCleanup(PathBuf);
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 fn request_spawn(
     plugin: &Path,
     initial: &SupervisorStartRequest,
@@ -94,19 +103,21 @@ fn request_spawn(
             protocol: PROTOCOL_VERSION,
             operation_id: initial.operation_id,
             plugin_state_version: 1,
-            action: PluginAction::Reconcile(PluginReconcileRequest {
-                protocol: PROTOCOL_VERSION,
-                operation_id: initial.operation_id,
-                process: initial.process.clone(),
-            }),
+            action: initial.action.clone(),
         })?,
     };
-    let mut plugin_process = Command::new(plugin)
+    let mut command = Command::new(plugin);
+    command
         .arg("--serve")
+        .env_clear()
+        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    let mut plugin_process = command.spawn()?;
     let mut stdin = plugin_process
         .stdin
         .take()
@@ -115,19 +126,19 @@ fn request_spawn(
     drop(stdin);
     let output = plugin_process.wait_with_output()?;
     if !output.status.success() {
-        anyhow::bail!("official.process exited unsuccessfully");
+        anyhow::bail!("provider exited unsuccessfully");
     }
     let response =
         read_json_line::<JsonRpcResponse>(&mut BufReader::new(output.stdout.as_slice()))?;
     if response.id != request.id {
-        anyhow::bail!("official.process response identity does not match request");
+        anyhow::bail!("provider response identity does not match request");
     }
     if let Some(error) = response.error {
-        anyhow::bail!("official.process rejected the request: {}", error.message);
+        anyhow::bail!("provider rejected the request: {}", error.message);
     }
     let result = response
         .result
-        .ok_or_else(|| anyhow::anyhow!("official.process returned no result"))?;
+        .ok_or_else(|| anyhow::anyhow!("provider returned no result"))?;
     Ok(serde_json::from_value(result)?)
 }
 

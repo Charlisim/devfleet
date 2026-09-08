@@ -41,8 +41,16 @@ fn main() -> anyhow::Result<()> {
         return run(DaemonConfig {
             state_dir: args.state_dir.expect("clap requires state directory"),
             socket: args.socket.expect("clap requires socket"),
-            supervisor: args.supervisor.expect("clap requires supervisor"),
-            process_plugin: args.process_plugin.expect("clap requires process plugin"),
+            supervisor: args
+                .supervisor
+                .expect("clap requires supervisor")
+                .canonicalize()
+                .map_err(|error| anyhow::anyhow!("canonicalize supervisor: {error}"))?,
+            process_plugin: args
+                .process_plugin
+                .expect("clap requires process plugin")
+                .canonicalize()
+                .map_err(|error| anyhow::anyhow!("canonicalize process plugin: {error}"))?,
         });
     }
     eprintln!(

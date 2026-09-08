@@ -45,6 +45,28 @@ devfleet --socket /tmp/df-$(id -u)/daemon.sock plugin trust official.process
 devfleet --socket /tmp/df-$(id -u)/daemon.sock plugin list
 ```
 
+The Compose provider is installed and trusted separately. It only accepts a
+local Docker Unix-socket context in v0.1, so a remote context returns an
+actionable rejection instead of a misleading localhost endpoint.
+
+```sh
+devfleet --socket /tmp/df-$(id -u)/daemon.sock plugin install \
+  "$(dirname "$(command -v devfleetd)")/devfleet-plugin-compose"
+devfleet --socket /tmp/df-$(id -u)/daemon.sock plugin trust official.compose
+devfleet --socket /tmp/df-$(id -u)/daemon.sock compose up \
+  --trust --worktree "$PWD" --file "$PWD/compose.yaml" \
+  --env DEVFLEET_API_PORT=20001 \
+  --endpoint api=api:3000:20001:/health
+```
+
+Before startup, the provider asks Docker for the effective merged JSON model.
+It requires project-scoped names, loopback-only endpoint publications, and
+private mutable storage. Built services need a project-specific image tag or
+immutable digest. Flags such as `--allow-external-resources` require a
+nonempty explanation. `status` reports internal, host, and device
+endpoint semantics; health is an actual bounded HTTP probe of the declared
+readiness path.
+
 In another terminal, execute an explicitly trusted fixture with a fully
 specified program, working directory and environment. The command must follow
 `--`; it is passed as argv and never interpolated by a shell.

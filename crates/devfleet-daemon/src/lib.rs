@@ -1,16 +1,18 @@
 //! Local daemon: private IPC, persistent state, and supervisor composition.
 
-use devfleet_core::{LogStore, PlanOptions, compile_manifest, discover_git_worktree};
+use devfleet_core::{PlanOptions, compile_manifest, discover_git_worktree};
+use devfleet_logging::LogStore;
 use devfleet_protocol::{
-    DaemonRequest, DaemonResponse, EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode,
-    EventSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, OperationAccepted,
-    OperationSnapshot, PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot, ProcessSpec,
+    ComposeReconcileRequest, ComposeUpRequest, DaemonRequest, DaemonResponse, EndpointSnapshot,
+    EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot, JsonRpcRequest,
+    JsonRpcResponse, LifecycleState, LogSnapshot, OperationAccepted, OperationSnapshot,
+    PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot, ProcessSnapshot,
     ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
     read_json_line, write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredEnvironment, StoredEvent, StoredLifecycle, StoredOperation, StoredProcess,
-    StoredReadiness, VerifiedGitContext,
+    StateStore, StoredEndpoint, StoredEnvironment, StoredEvent, StoredLifecycle, StoredOperation,
+    StoredProcess, StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -19,6 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{BufReader, Read, Write},
+    net::{SocketAddr, TcpStream},
     os::unix::{
         fs::{MetadataExt, PermissionsExt},
         net::UnixListener,
@@ -31,8 +34,9 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SOCKET_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+const SOCKET_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const SUPERVISOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SOCKET_PATH_BYTES: usize = 96;
 const MAX_RESOURCE_LOG_BYTES: u64 = 1024 * 1024;
 
@@ -65,10 +69,9 @@ pub fn run(config: DaemonConfig) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("daemon socket has no parent directory"))?;
     prepare_private_dir(socket_parent)?;
     ensure_short_socket_path(&config.socket)?;
-    if config.socket.exists() {
-        anyhow::bail!("daemon socket already exists; another daemon may own it");
-    }
+    clear_stale_daemon_socket(&config.socket)?;
     let listener = UnixListener::bind(&config.socket)?;
+    let _socket_cleanup = DaemonSocketCleanup(config.socket.clone());
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
     let mut state = StateStore::open(&config.state_dir.join("state.sqlite3"))?;
     reconcile_supervisors(&mut state)?;
@@ -128,6 +131,7 @@ impl Daemon {
         match request {
             DaemonRequest::Plan(request) => self.plan(request),
             DaemonRequest::Up(request) => self.up(request),
+            DaemonRequest::ComposeUp(request) => self.compose_up(request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -246,8 +250,17 @@ impl Daemon {
             environment.project_fingerprint == git_identity.project_fingerprint
                 && environment.worktree_fingerprint == git_identity.worktree_fingerprint
         });
-        if let Some(environment) = matching_worktree.filter(|environment| {
-            environment.profile == request.profile && environment.instance == request.instance
+        let matching_environment = environments.iter().find(|environment| {
+            environment.project_fingerprint == git_identity.project_fingerprint
+                && environment.worktree_fingerprint == git_identity.worktree_fingerprint
+                && environment.profile == request.profile
+                && environment.instance == request.instance
+        });
+        if let Some(environment) = matching_environment.filter(|environment| {
+            matches!(
+                environment.lifecycle,
+                StoredLifecycle::Starting | StoredLifecycle::Running
+            )
         }) {
             self.state
                 .update_worktree_context(environment.id, &git_context)?;
@@ -256,6 +269,7 @@ impl Daemon {
                 environment_id: environment.id,
             }));
         }
+        cleanup_stopped_supervisor_socket(matching_environment)?;
 
         let project_id = environments
             .iter()
@@ -273,7 +287,7 @@ impl Daemon {
         )?;
 
         let environment = StoredEnvironment {
-            id: Uuid::now_v7(),
+            id: matching_environment.map_or_else(Uuid::now_v7, |environment| environment.id),
             key: environment_key(
                 &git_identity.project_fingerprint,
                 &git_identity.worktree_fingerprint,
@@ -296,6 +310,7 @@ impl Daemon {
             lifecycle: StoredLifecycle::Starting,
             reconciliation_diagnostic: None,
             process: None,
+            endpoints: Vec::new(),
         };
         let operation_id = Uuid::now_v7();
         self.state.record_start_intent(&environment, operation_id)?;
@@ -318,11 +333,15 @@ impl Daemon {
         let log_directory = log_directory(&self.config.state_dir, environment.id);
         prepare_private_dir(&log_directory)
             .map_err(|error| DaemonError::Operation(error.to_string()))?;
-        let redactions = known_secret_values(&request.process);
+        let redactions = known_secret_values(&request.process.environment);
         let start = SupervisorStartRequest {
             environment_id: environment.id,
             operation_id,
-            process: request.process,
+            action: PluginAction::Reconcile(PluginReconcileRequest {
+                protocol: PROTOCOL_VERSION,
+                operation_id,
+                process: request.process,
+            }),
             log_directory: log_directory.display().to_string(),
             log_max_bytes: MAX_RESOURCE_LOG_BYTES,
             redactions,
@@ -345,6 +364,150 @@ impl Daemon {
             self.state.mark_failed(environment.id)?;
             return Err(DaemonError::Operation(
                 "process exited before its initial readiness observation".into(),
+            ));
+        }
+        Ok(DaemonResponse::Accepted(OperationAccepted {
+            operation_id,
+            environment_id: environment.id,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn compose_up(&mut self, request: ComposeUpRequest) -> Result<DaemonResponse, DaemonError> {
+        validate_compose_up_request(&request)?;
+        let compose_plugin = self.trusted_plugin("official.compose", "compose.reconcile")?;
+        let git_identity = discover_git_worktree(Path::new(&request.worktree))
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let git_context = VerifiedGitContext {
+            common_git_dir: git_identity.common_git_dir.display().to_string(),
+            git_dir: git_identity.git_dir.display().to_string(),
+            worktree: request.worktree.clone(),
+            head: git_identity.head.clone(),
+            branch: git_identity.branch.clone(),
+            detached: git_identity.detached,
+        };
+        let environments = self.state.environments()?;
+        let matching_worktree = environments.iter().find(|environment| {
+            environment.project_fingerprint == git_identity.project_fingerprint
+                && environment.worktree_fingerprint == git_identity.worktree_fingerprint
+        });
+        let matching_environment = environments.iter().find(|environment| {
+            environment.project_fingerprint == git_identity.project_fingerprint
+                && environment.worktree_fingerprint == git_identity.worktree_fingerprint
+                && environment.profile == request.profile
+                && environment.instance == request.instance
+        });
+        if let Some(environment) = matching_environment.filter(|environment| {
+            matches!(
+                environment.lifecycle,
+                StoredLifecycle::Starting | StoredLifecycle::Running
+            )
+        }) {
+            self.state
+                .update_worktree_context(environment.id, &git_context)?;
+            return Ok(DaemonResponse::Accepted(OperationAccepted {
+                operation_id: Uuid::nil(),
+                environment_id: environment.id,
+            }));
+        }
+        cleanup_stopped_supervisor_socket(matching_environment)?;
+        let project_id = environments
+            .iter()
+            .find(|environment| environment.project_fingerprint == git_identity.project_fingerprint)
+            .map_or_else(Uuid::now_v7, |environment| environment.project_id);
+        let worktree_id =
+            matching_worktree.map_or_else(Uuid::now_v7, |environment| environment.worktree_id);
+        self.state.orphan_replaced_worktree(
+            &request.worktree,
+            &request.profile,
+            request.instance.as_deref(),
+            &git_identity.project_fingerprint,
+            &git_identity.worktree_fingerprint,
+        )?;
+        let environment = StoredEnvironment {
+            id: matching_environment.map_or_else(Uuid::now_v7, |environment| environment.id),
+            key: environment_key(
+                &git_identity.project_fingerprint,
+                &git_identity.worktree_fingerprint,
+                &request.profile,
+                request.instance.as_deref(),
+            ),
+            project_id,
+            worktree_id,
+            project_fingerprint: git_identity.project_fingerprint,
+            worktree_fingerprint: git_identity.worktree_fingerprint,
+            common_git_dir: git_context.common_git_dir,
+            git_dir: git_context.git_dir,
+            worktree: request.worktree.clone(),
+            profile: request.profile,
+            instance: request.instance,
+            head: git_context.head,
+            branch: git_context.branch,
+            detached: git_context.detached,
+            generation: 1,
+            lifecycle: StoredLifecycle::Starting,
+            reconciliation_diagnostic: None,
+            process: None,
+            endpoints: stored_compose_endpoints(&request.endpoints),
+        };
+        let operation_id = Uuid::now_v7();
+        self.state.record_start_intent(&environment, operation_id)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            Some(operation_id),
+            "compose_up_accepted",
+        )?;
+        self.state.set_operation_context(
+            operation_id,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| DaemonError::Operation(error.to_string()))?
+                .as_millis()
+                + 60_000,
+            "compose",
+        )?;
+        let control_socket = supervisor_socket_path(environment.id)?;
+        let log_directory = log_directory(&self.config.state_dir, environment.id);
+        prepare_private_dir(&log_directory)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let redactions = known_secret_values(&request.environment);
+        let start = SupervisorStartRequest {
+            environment_id: environment.id,
+            operation_id,
+            action: PluginAction::ComposeReconcile(Box::new(ComposeReconcileRequest {
+                protocol: PROTOCOL_VERSION,
+                operation_id,
+                environment_id: environment.id,
+                worktree: request.worktree,
+                project_name: compose_project_name(environment.project_id, environment.id),
+                files: request.files,
+                environment: request.environment,
+                endpoints: request.endpoints,
+                authorizations: request.authorizations,
+            })),
+            log_directory: log_directory.display().to_string(),
+            log_max_bytes: MAX_RESOURCE_LOG_BYTES,
+            redactions,
+        };
+        if let Err(error) = self.start_supervisor(&control_socket, &compose_plugin, &start) {
+            self.state.mark_failed(environment.id)?;
+            return Err(error);
+        }
+        let response = request_supervisor(&control_socket, SupervisorRequest::Inspect)?;
+        let SupervisorResponse::Process(process) = response;
+        self.state
+            .record_running_process(environment.id, &stored_process(&process))?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            Some(operation_id),
+            "compose_running",
+        )?;
+        if process.readiness != ReadinessState::ProcessAlive {
+            self.state.mark_failed(environment.id)?;
+            return Err(DaemonError::Operation(
+                "Compose exited before its initial readiness observation".into(),
             ));
         }
         Ok(DaemonResponse::Accepted(OperationAccepted {
@@ -388,6 +551,7 @@ impl Daemon {
             ));
         }
         self.state.mark_stopped(environment_id)?;
+        remove_supervisor_socket(&process.supervisor_socket)?;
         self.emit_event(environment_id, environment.generation, None, "stopped")?;
         self.status(environment_id)
     }
@@ -419,6 +583,7 @@ impl Daemon {
                 ));
             }
             self.state.mark_stopped(operation.environment_id)?;
+            remove_supervisor_socket(&process.supervisor_socket)?;
         }
         self.state
             .mark_operation_cancelled(operation_id, "reaped")?;
@@ -506,9 +671,7 @@ impl Daemon {
         process_plugin: &Path,
         request: &SupervisorStartRequest,
     ) -> Result<(), DaemonError> {
-        if control_socket.exists() {
-            return Err(DaemonError::OwnershipUncertain);
-        }
+        clear_stale_supervisor_socket(control_socket)?;
         let mut supervisor = Command::new(&self.config.supervisor)
             .arg("--serve")
             .arg("--control-socket")
@@ -575,9 +738,13 @@ impl Daemon {
     }
 
     fn trusted_process_plugin(&self) -> Result<PathBuf, DaemonError> {
+        self.trusted_plugin("official.process", "process.reconcile")
+    }
+
+    fn trusted_plugin(&self, id: &str, capability: &str) -> Result<PathBuf, DaemonError> {
         let plugin = self
             .state
-            .plugin("official.process")?
+            .plugin(id)?
             .ok_or(DaemonError::PluginTrustRequired)?;
         if !plugin.trusted {
             return Err(DaemonError::PluginTrustRequired);
@@ -585,15 +752,11 @@ impl Daemon {
         self.verify_plugin_lock(&plugin)?;
         let inspected = inspect_plugin(Path::new(&plugin.path))?;
         if !same_plugin_metadata(&plugin, &inspected)
-            || !inspected
-                .capabilities
-                .iter()
-                .any(|item| item == "process.reconcile")
+            || !inspected.capabilities.iter().any(|item| item == capability)
         {
-            return Err(DaemonError::InvalidConfig(
-                "installed official.process descriptor or checksum no longer matches its lockfile"
-                    .into(),
-            ));
+            return Err(DaemonError::InvalidConfig(format!(
+                "installed {id} descriptor or checksum no longer matches its lockfile"
+            )));
         }
         Ok(PathBuf::from(plugin.path))
     }
@@ -806,6 +969,109 @@ fn validate_up_request(
     Ok(())
 }
 
+fn validate_compose_up_request(request: &ComposeUpRequest) -> Result<(), DaemonError> {
+    if !request.trusted {
+        return Err(DaemonError::TrustRequired);
+    }
+    if request.profile.is_empty() || request.files.is_empty() {
+        return Err(DaemonError::InvalidConfig(
+            "profile and at least one Compose file are required".into(),
+        ));
+    }
+    let worktree = Path::new(&request.worktree)
+        .canonicalize()
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+    if !worktree.is_dir() || request.instance.as_deref().is_some_and(str::is_empty) {
+        return Err(DaemonError::InvalidConfig(
+            "worktree must exist and instance names must be nonempty".into(),
+        ));
+    }
+    let mut files = BTreeSet::new();
+    for file in &request.files {
+        let file = Path::new(file)
+            .canonicalize()
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        if !file.is_file() || !file.starts_with(&worktree) || !files.insert(file) {
+            return Err(DaemonError::InvalidConfig(
+                "Compose files must be unique regular files inside the worktree".into(),
+            ));
+        }
+    }
+    let mut endpoints = BTreeSet::new();
+    for endpoint in &request.endpoints {
+        if endpoint.name.is_empty()
+            || endpoint.service.is_empty()
+            || endpoint.container_port == 0
+            || endpoint.host_port == 0
+            || !endpoint.readiness_path.starts_with('/')
+            || !endpoints.insert((&endpoint.name, endpoint.host_port))
+        {
+            return Err(DaemonError::InvalidConfig(
+                "Compose endpoints require unique names, ports, and readiness paths".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compose_project_name(project_id: Uuid, environment_id: Uuid) -> String {
+    let project = project_id.to_string().replace('-', "");
+    let environment = environment_id.to_string().replace('-', "");
+    format!("df_{}_{}", &project[..8], &environment[..8])
+}
+
+fn stored_compose_endpoints(
+    endpoints: &[devfleet_protocol::ComposeEndpoint],
+) -> Vec<StoredEndpoint> {
+    endpoints
+        .iter()
+        .map(|endpoint| StoredEndpoint {
+            name: endpoint.name.clone(),
+            service: endpoint.service.clone(),
+            internal_url: format!("http://{}:{}", endpoint.service, endpoint.container_port),
+            host_url: format!("http://127.0.0.1:{}", endpoint.host_port),
+            device_url: format!("http://127.0.0.1:{}", endpoint.host_port),
+            readiness_path: endpoint.readiness_path.clone(),
+            healthy: false,
+        })
+        .collect()
+}
+
+fn endpoint_is_healthy(endpoint: &StoredEndpoint) -> bool {
+    let Some(authority) = endpoint.host_url.strip_prefix("http://") else {
+        return endpoint.healthy;
+    };
+    let Ok(address) = authority.parse::<SocketAddr>() else {
+        return endpoint.healthy;
+    };
+    let timeout = Duration::from_millis(100);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return false;
+    }
+    let request = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        endpoint.readiness_path, authority
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = [0_u8; 64];
+    let Ok(read) = stream.read(&mut response) else {
+        return false;
+    };
+    response[..read]
+        .split(|byte| *byte == b' ')
+        .nth(1)
+        .and_then(|status| std::str::from_utf8(status).ok())
+        .and_then(|status| status.parse::<u16>().ok())
+        .is_some_and(|status| (200..400).contains(&status))
+}
+
 fn canonical_plan_path(path: &str, worktree: &Path) -> Result<PathBuf, DaemonError> {
     let path = Path::new(path)
         .canonicalize()
@@ -819,6 +1085,18 @@ fn canonical_plan_path(path: &str, worktree: &Path) -> Result<PathBuf, DaemonErr
 }
 
 fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
+    let lifecycle = match environment.lifecycle {
+        StoredLifecycle::Starting => LifecycleState::Starting,
+        StoredLifecycle::Running => LifecycleState::Running,
+        StoredLifecycle::Stopped => LifecycleState::Stopped,
+        StoredLifecycle::Failed => LifecycleState::Failed,
+        StoredLifecycle::Degraded => LifecycleState::Degraded,
+        StoredLifecycle::Orphaned => LifecycleState::Orphaned,
+    };
+    let probe_health = matches!(
+        lifecycle,
+        LifecycleState::Starting | LifecycleState::Running
+    );
     EnvironmentSnapshot {
         environment_id: environment.id,
         project_id: environment.project_id,
@@ -827,14 +1105,7 @@ fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
         profile: environment.profile,
         instance: environment.instance,
         generation: environment.generation,
-        lifecycle: match environment.lifecycle {
-            StoredLifecycle::Starting => LifecycleState::Starting,
-            StoredLifecycle::Running => LifecycleState::Running,
-            StoredLifecycle::Stopped => LifecycleState::Stopped,
-            StoredLifecycle::Failed => LifecycleState::Failed,
-            StoredLifecycle::Degraded => LifecycleState::Degraded,
-            StoredLifecycle::Orphaned => LifecycleState::Orphaned,
-        },
+        lifecycle,
         reconciliation_diagnostic: environment.reconciliation_diagnostic,
         process: environment.process.map(|process| ProcessSnapshot {
             pid: process.pid,
@@ -846,6 +1117,22 @@ fn snapshot(environment: StoredEnvironment) -> EnvironmentSnapshot {
                 StoredReadiness::ProcessStopped => ReadinessState::ProcessStopped,
             },
         }),
+        endpoints: environment
+            .endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let healthy = probe_health && endpoint_is_healthy(&endpoint);
+                EndpointSnapshot {
+                    name: endpoint.name,
+                    service: endpoint.service,
+                    internal_url: endpoint.internal_url,
+                    host_url: endpoint.host_url,
+                    device_url: endpoint.device_url,
+                    readiness_path: endpoint.readiness_path,
+                    healthy,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -979,13 +1266,80 @@ fn supervisor_socket_path(environment_id: Uuid) -> Result<PathBuf, DaemonError> 
     Ok(path)
 }
 
+struct DaemonSocketCleanup(PathBuf);
+
+impl Drop for DaemonSocketCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn clear_stale_daemon_socket(path: &Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => anyhow::bail!("daemon socket already exists; another daemon may own it"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            fs::remove_file(path).map_err(Into::into)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cleanup_stopped_supervisor_socket(
+    environment: Option<&StoredEnvironment>,
+) -> Result<(), DaemonError> {
+    if let Some(process) = environment
+        .filter(|environment| environment.lifecycle == StoredLifecycle::Stopped)
+        .and_then(|environment| environment.process.as_ref())
+    {
+        remove_supervisor_socket(&process.supervisor_socket)?;
+    }
+    Ok(())
+}
+
+fn clear_stale_supervisor_socket(path: &Path) -> Result<(), DaemonError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(DaemonError::OwnershipUncertain),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            remove_supervisor_socket(&path.display().to_string())
+        }
+        Err(error) => Err(DaemonError::Operation(format!(
+            "inspect existing supervisor socket: {error}"
+        ))),
+    }
+}
+
+fn remove_supervisor_socket(path: &str) -> Result<(), DaemonError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(DaemonError::Operation(format!(
+            "remove stopped supervisor socket: {error}"
+        ))),
+    }
+}
+
 fn log_directory(state_dir: &Path, environment_id: Uuid) -> PathBuf {
     state_dir.join("logs").join(environment_id.to_string())
 }
 
-fn known_secret_values(process: &ProcessSpec) -> Vec<String> {
-    process
-        .environment
+fn known_secret_values(environment: &BTreeMap<String, String>) -> Vec<String> {
+    environment
         .iter()
         .filter_map(|(name, value)| {
             let normalized = name.to_ascii_lowercase();
@@ -1023,8 +1377,21 @@ fn request_supervisor(
     socket: &Path,
     command: SupervisorRequest,
 ) -> Result<SupervisorResponse, DaemonError> {
-    let mut stream = std::os::unix::net::UnixStream::connect(socket)
-        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    let started = Instant::now();
+    let mut stream = loop {
+        match std::os::unix::net::UnixStream::connect(socket) {
+            Ok(stream) => break stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) && started.elapsed() < SUPERVISOR_CONNECT_TIMEOUT =>
+            {
+                thread::sleep(SOCKET_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(DaemonError::Operation(error.to_string())),
+        }
+    };
     assert_same_user(&stream).map_err(|error| DaemonError::Operation(error.to_string()))?;
     let request = JsonRpcRequest {
         jsonrpc: "2.0".into(),
@@ -1065,4 +1432,57 @@ fn assert_same_user(stream: &std::os::unix::net::UnixStream) -> anyhow::Result<(
 
 fn protocol_error(error: &devfleet_protocol::ProtocolError) -> DaemonError {
     DaemonError::Operation(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, net::TcpListener, os::unix::net::UnixListener};
+    use tempfile::TempDir;
+
+    #[test]
+    fn removes_a_verified_stopped_supervisor_socket_idempotently() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let socket = temporary.path().join("supervisor.sock");
+        fs::write(&socket, []).expect("socket fixture");
+        remove_supervisor_socket(socket.to_str().expect("UTF-8 socket path"))
+            .expect("socket cleanup");
+        assert!(!socket.exists());
+        remove_supervisor_socket(socket.to_str().expect("UTF-8 socket path"))
+            .expect("missing socket cleanup");
+    }
+
+    #[test]
+    fn removes_a_refused_supervisor_socket_before_restart() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let socket = temporary.path().join("supervisor.sock");
+        drop(UnixListener::bind(&socket).expect("supervisor socket"));
+        clear_stale_supervisor_socket(&socket).expect("stale socket cleanup");
+        assert!(!socket.exists());
+    }
+
+    #[test]
+    fn probes_only_a_successful_loopback_readiness_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("request");
+            let mut request = [0_u8; 256];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(b"HTTP/1.0 204 No Content\r\n\r\n")
+                .expect("response");
+        });
+        let endpoint = StoredEndpoint {
+            name: "api".into(),
+            service: "api".into(),
+            internal_url: "http://api:3000".into(),
+            host_url: format!("http://127.0.0.1:{port}"),
+            device_url: format!("http://127.0.0.1:{port}"),
+            readiness_path: "/health".into(),
+            healthy: false,
+        };
+        assert!(endpoint_is_healthy(&endpoint));
+        server.join().expect("server joins");
+    }
 }

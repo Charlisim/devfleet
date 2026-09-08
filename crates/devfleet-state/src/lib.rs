@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -53,6 +53,18 @@ pub struct StoredEnvironment {
     pub lifecycle: StoredLifecycle,
     pub reconciliation_diagnostic: Option<String>,
     pub process: Option<StoredProcess>,
+    pub endpoints: Vec<StoredEndpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredEndpoint {
+    pub name: String,
+    pub service: String,
+    pub internal_url: String,
+    pub host_url: String,
+    pub device_url: String,
+    pub readiness_path: String,
+    pub healthy: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -284,9 +296,9 @@ impl StateStore {
             "INSERT INTO environments (id, environment_key, project_id, worktree_id,
                                       project_fingerprint, worktree_fingerprint, common_git_dir,
                                       git_dir, worktree, profile, instance, head, branch, detached,
-                                      generation, lifecycle,
-                                      reconciliation_diagnostic)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                                      generation, lifecycle, reconciliation_diagnostic,
+                                      endpoints_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(environment_key) DO UPDATE SET
                 project_id = excluded.project_id,
                 worktree_id = excluded.worktree_id,
@@ -302,7 +314,8 @@ impl StateStore {
                 detached = excluded.detached,
                 generation = excluded.generation,
                 lifecycle = excluded.lifecycle,
-                reconciliation_diagnostic = excluded.reconciliation_diagnostic",
+                reconciliation_diagnostic = excluded.reconciliation_diagnostic,
+                endpoints_json = excluded.endpoints_json",
             params![
                 environment.id.to_string(),
                 environment.key,
@@ -321,6 +334,7 @@ impl StateStore {
                 generation,
                 environment.lifecycle.as_db(),
                 environment.reconciliation_diagnostic,
+                serde_json::to_string(&environment.endpoints)?,
             ],
         )?;
         transaction.execute(
@@ -894,8 +908,8 @@ impl StateStore {
             "SELECT e.id, e.environment_key, e.project_id, e.worktree_id,
                     e.project_fingerprint, e.worktree_fingerprint, e.common_git_dir, e.git_dir,
                     e.worktree, e.profile, e.instance, e.head, e.branch, e.detached,
-                    e.generation, e.lifecycle, e.reconciliation_diagnostic, p.pid,
-                    p.process_group, p.started_at_unix_ms, p.supervisor_socket, p.readiness
+                    e.generation, e.lifecycle, e.reconciliation_diagnostic, e.endpoints_json,
+                    p.pid, p.process_group, p.started_at_unix_ms, p.supervisor_socket, p.readiness
              FROM environments e
              LEFT JOIN processes p ON p.environment_id = e.id
              WHERE (?1 IS NULL OR e.id = ?1)
@@ -1081,6 +1095,14 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 10 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 ALTER TABLE environments ADD COLUMN endpoints_json TEXT NOT NULL DEFAULT '[]';
+                 PRAGMA user_version = 10;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 }
@@ -1223,11 +1245,11 @@ fn stored_port_lease_from_row(
 }
 
 fn stored_environment(row: &rusqlite::Row<'_>) -> Result<StoredEnvironment, StateError> {
-    let pid = row.get::<_, Option<i64>>(17)?;
-    let process_group = row.get::<_, Option<i32>>(18)?;
-    let started_at = row.get::<_, Option<String>>(19)?;
-    let supervisor_socket = row.get::<_, Option<String>>(20)?;
-    let readiness = row.get::<_, Option<String>>(21)?;
+    let pid = row.get::<_, Option<i64>>(18)?;
+    let process_group = row.get::<_, Option<i32>>(19)?;
+    let started_at = row.get::<_, Option<String>>(20)?;
+    let supervisor_socket = row.get::<_, Option<String>>(21)?;
+    let readiness = row.get::<_, Option<String>>(22)?;
     let process = match (pid, process_group, started_at, supervisor_socket, readiness) {
         (
             Some(pid),
@@ -1267,6 +1289,7 @@ fn stored_environment(row: &rusqlite::Row<'_>) -> Result<StoredEnvironment, Stat
         lifecycle: StoredLifecycle::from_db(&row.get::<_, String>(15)?)?,
         reconciliation_diagnostic: row.get(16)?,
         process,
+        endpoints: serde_json::from_str(&row.get::<_, String>(17)?)?,
     })
 }
 
@@ -1298,6 +1321,15 @@ mod tests {
             lifecycle: StoredLifecycle::Starting,
             reconciliation_diagnostic: None,
             process: None,
+            endpoints: vec![StoredEndpoint {
+                name: "api".into(),
+                service: "api".into(),
+                internal_url: "http://api:3000".into(),
+                host_url: "http://127.0.0.1:20001".into(),
+                device_url: "http://127.0.0.1:20001".into(),
+                readiness_path: "/health".into(),
+                healthy: false,
+            }],
         }
     }
 
@@ -1349,6 +1381,7 @@ mod tests {
             observed.process.expect("process exists").readiness,
             StoredReadiness::ProcessStopped
         );
+        assert_eq!(observed.endpoints[0].host_url, "http://127.0.0.1:20001");
     }
 
     #[test]

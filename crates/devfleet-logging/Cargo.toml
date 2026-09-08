@@ -1,0 +1,16 @@
+[package]
+name = "devfleet-logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[lints]
+workspace = true

@@ -4,6 +4,7 @@
 | --- | --- | --- |
 | `devfleet-protocol` | Versioned, serializable boundary DTOs and protocol errors | SQLite, process execution, provider implementations |
 | `devfleet-core` | Provider-neutral identity, plans, graph and lifecycle concepts | Tool commands, database access, official plugins |
+| `devfleet-logging` | Bounded, redacted resource-log storage | Daemon state and provider orchestration |
 | `devfleet-state` | SQLite schema migrations, transactions and persisted records | Planning policy, external process control |
 | `devfleet-plugin-sdk` | Provider trait, frame validation and supervised-host requests | Daemon storage, official plugin implementations |
 | `devfleet-daemon` | Orchestration, state composition, global allocations and IPC | Provider-specific tool execution |

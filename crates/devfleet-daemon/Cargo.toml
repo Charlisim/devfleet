@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 devfleet-core = { path = "../devfleet-core" }
+devfleet-logging = { path = "../devfleet-logging" }
 devfleet-protocol = { path = "../devfleet-protocol" }
 devfleet-state = { path = "../devfleet-state" }
 fs2.workspace = true

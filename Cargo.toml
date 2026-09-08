@@ -2,13 +2,15 @@
 members = [
   "crates/devfleet-cli",
   "crates/devfleet-core",
-  "crates/devfleet-daemon",
+    "crates/devfleet-daemon",
+    "crates/devfleet-logging",
   "crates/devfleet-plugin-sdk",
   "crates/devfleet-protocol",
   "crates/devfleet-state",
   "crates/devfleet-supervisor",
   "crates/devfleet-testkit",
-  "plugins/process",
+    "plugins/process",
+    "plugins/compose",
 ]
 exclude = ["validation/ios-isolation"]
 resolver = "3"

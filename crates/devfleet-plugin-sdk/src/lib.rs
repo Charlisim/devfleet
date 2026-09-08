@@ -1,9 +1,9 @@
 //! Versioned SDK boundary for trusted, independent Rust provider binaries.
 
 use devfleet_protocol::{
-    ErrorCode, JsonRpcRequest, JsonRpcResponse, MAX_FRAME_BYTES, PROTOCOL_VERSION, PluginAction,
-    PluginCall, PluginReconcileRequest, ProtocolError, ProtocolVersion, RpcFailure, read_json_line,
-    write_json_line,
+    ComposeReconcileRequest, ErrorCode, JsonRpcRequest, JsonRpcResponse, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, PluginAction, PluginCall, PluginReconcileRequest, ProtocolError,
+    ProtocolVersion, RpcFailure, read_json_line, write_json_line,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,10 @@ pub trait Provider: Send + Sync {
 
     fn reconcile(&self, _request: PluginReconcileRequest) -> Result<Value, PluginError> {
         Err(PluginError::UnsupportedMethod("reconcile".into()))
+    }
+
+    fn reconcile_compose(&self, _request: ComposeReconcileRequest) -> Result<Value, PluginError> {
+        Err(PluginError::UnsupportedMethod("compose reconcile".into()))
     }
 
     fn stop(&self) -> Result<Value, PluginError> {
@@ -164,6 +168,7 @@ fn dispatch<P: Provider>(provider: &P, call: PluginCall) -> Result<Value, Plugin
         PluginAction::Plan { configuration } => provider.plan(configuration),
         PluginAction::Inspect => provider.inspect(),
         PluginAction::Reconcile(request) => provider.reconcile(request),
+        PluginAction::ComposeReconcile(request) => provider.reconcile_compose(*request),
         PluginAction::Stop => provider.stop(),
         PluginAction::Destroy => provider.destroy(),
         PluginAction::Action { name, input } => provider.action(name, input),
@@ -178,6 +183,7 @@ fn capability(action: &PluginAction) -> &'static str {
         PluginAction::Plan { .. } => "lifecycle.plan",
         PluginAction::Inspect => "lifecycle.inspect",
         PluginAction::Reconcile(_) => "process.reconcile",
+        PluginAction::ComposeReconcile(_) => "compose.reconcile",
         PluginAction::Stop => "lifecycle.stop",
         PluginAction::Destroy => "lifecycle.destroy",
         PluginAction::Action { .. } => "lifecycle.action",

@@ -189,9 +189,9 @@ dependencies = [
 name = "devfleet-core"
 version = "0.1.0"
 dependencies = [
+ "devfleet-logging",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "toml",
  "uuid",
@@ -205,6 +205,7 @@ dependencies = [
  "clap",
  "devfleet-cli",
  "devfleet-core",
+ "devfleet-logging",
  "devfleet-protocol",
  "devfleet-state",
  "devfleet-testkit",
@@ -216,6 +217,29 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "uuid",
+]
+
+[[package]]
+name = "devfleet-logging"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "devfleet-plugin-compose"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "devfleet-plugin-sdk",
+ "devfleet-protocol",
+ "semver",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "uuid",
 ]
 
@@ -272,7 +296,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "devfleet-core",
+ "devfleet-logging",
  "devfleet-protocol",
  "devfleet-testkit",
  "nix",
