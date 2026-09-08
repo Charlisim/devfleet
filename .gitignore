@@ -10,3 +10,4 @@ validation/ios-isolation/app/fixture.json
 validation/ios-isolation/app/revision.json
 validation/ios-isolation/app/.metro-cache/
 validation/ios-isolation/app/ios/IsolationApp.xcworkspace/
+validation/ios-isolation/app/revision.js

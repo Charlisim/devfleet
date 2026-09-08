@@ -4,7 +4,7 @@ Bounded experiment for [issue #1](https://github.com/Charlisim/devfleet/issues/1
 
 ## Prerequisites and reproduction
 
-The target matrix is macOS 26.6.2 (25G83), Apple Silicon arm64, Xcode 26.4.1 (17E202), iOS Simulator 26.4 (23E254a), React Native 0.87.1 and Community CLI 20.2.0. Use Node 24.20.0 and Rust 1.98.0. React Native is pinned in `app/package-lock.json`; CocoaPods dependencies have their own lockfile. Install the specified simulator runtime explicitly before starting. No runtime downloads, personal simulator adoption, or global cache resets occur.
+The target matrix is macOS 26.6.2 (25G83), Apple Silicon arm64, Xcode 26.4.1 (17E202), iOS Simulator 26.4.1 (23E254a; runtime identifier iOS-26-4), React Native 0.87.1 and Community CLI 20.2.0. Use Node 24.20.0, Rust 1.98.0, Ruby 3.3.5 and CocoaPods 1.16.2. Confirm `pod --version` succeeds in the shell that starts the fixture. On the measured host, RVM CocoaPods worked; the Homebrew CocoaPods executable failed with a missing `nkf` dependency. React Native is pinned in `app/package-lock.json`; CocoaPods dependencies have their own lockfile. Install the specified simulator runtime explicitly before starting. No runtime downloads, personal simulator adoption, or global cache resets occur.
 
 From the repository root, with `cargo`, `rustc`, `node`, `npm`, `pod`, `git`, `xcodebuild`, and `xcrun` on PATH:
 
@@ -30,7 +30,7 @@ All servers bind IPv4 loopback. The simulator-to-host route under test is `127.0
 ## Scenarios and evidence
 
 1. Build/install/launch A and B; both report `IDENTITY_VERIFIED`.
-2. Edit A's JS-imported `revision.json`, relaunch without building, observe `edited-A`; B still reports `initial`. A's native binary SHA-256 stays unchanged.
+2. Edit A's JavaScript module `revision.js`, relaunch without building, observe `edited-A`; B still reports `initial`. A's native binary SHA-256 stays unchanged.
 3. Change A's generated Swift backend endpoint to B, relaunch without rebuilding: the installed app still calls A with its old build identity and unchanged binary.
 4. Rebuild/install A: its binary changes and the real backend response identifies B; require `IDENTITY_MISMATCH` with bundle A/backend B.
 5. Rebuild A with Metro B and backend A: require `IDENTITY_MISMATCH` with bundle B/backend A.

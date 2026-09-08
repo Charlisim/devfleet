@@ -107,7 +107,16 @@ fn generate(e: &Environment, metro: u16, backend: u16) -> Result<String> {
     fs::write(e.app().join("ios/IsolationApp/AppDelegate.swift"), source)?;
     Ok(build)
 }
+fn write_revision(e: &Environment, value: &str) -> Result<()> {
+    fs::write(
+        e.app().join("revision.js"),
+        format!("export default {};\n", json!({"value":value})),
+    )?;
+    Ok(())
+}
 fn prepare(root: &Path, state: &Path) -> Result<()> {
+    command("pod", &["--version"], root)?;
+    command("npm", &["--version"], root)?;
     if state.exists() {
         return Err("State directory already exists; choose a fresh directory".into());
     }
@@ -152,7 +161,7 @@ fn prepare(root: &Path, state: &Path) -> Result<()> {
         let e = environments.last().unwrap();
         generate(e, e.metro, e.backend)?;
         write_json(&e.app().join("fixture.json"), &json!({"environment":e.id}))?;
-        write_json(&e.app().join("revision.json"), &json!({"value":"initial"}))?;
+        write_revision(e, "initial")?;
         logged(
             "npm",
             &["ci"],
@@ -324,7 +333,7 @@ fn record(
         "head":command("git", &["rev-parse","HEAD"], &e.worktree)?,"report":r,"verdict":status,
         "binary_sha256":binary_hash(e,state)?,
         "native_source_sha256":hash(&fs::read(e.app().join("ios/IsolationApp/AppDelegate.swift"))?),
-        "revision_sha256":hash(&fs::read(e.app().join("revision.json"))?),
+        "revision_sha256":hash(&fs::read(e.app().join("revision.js"))?),
         "npm_lock_sha256":hash(&fs::read(e.app().join("package-lock.json"))?),
         "pod_lock_sha256":hash(&fs::read(e.app().join("ios/Podfile.lock"))?),"timestamp_unix":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()});
     evidence.push(entry);
@@ -367,7 +376,7 @@ fn experiment(state: &Path) -> Result<()> {
     let mut evidence = Vec::new();
     for e in &environments {
         let build_id = generate(e, e.metro, e.backend)?;
-        write_json(&e.app().join("revision.json"), &json!({"value":"initial"}))?;
+        write_revision(e, "initial")?;
         let expected = Arc::new(Mutex::new(Expected {
             environment: e.id.clone(),
             build_id,
@@ -436,7 +445,7 @@ fn experiment(state: &Path) -> Result<()> {
     let (be, br) = &contexts[1];
     let original_binary = binary_hash(a, state)?;
     let original_b_binary = binary_hash(b, state)?;
-    write_json(&a.app().join("revision.json"), &json!({"value":"edited-A"}))?;
+    write_revision(a, "edited-A")?;
     let nonce = launch(a, ae, ar)?;
     let r = wait_report(ar, &nonce, "edited-A")?;
     record(
