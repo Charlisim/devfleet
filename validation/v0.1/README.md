@@ -24,7 +24,9 @@ Run on the target macOS Apple Silicon matrix in a disposable state directory:
 cargo build --locked --manifest-path validation/ios-isolation/Cargo.toml
 validation/ios-isolation/target/debug/ios-isolation prepare "$PWD" /tmp/devfleet-ios-proof
 validation/ios-isolation/target/debug/ios-isolation run /tmp/devfleet-ios-proof
-./scripts/measure-v01-daemon.sh validation/v0.1/HARDWARE-RESULTS.json "$PWD"
+./scripts/measure-v01-daemon.sh validation/v0.1/HARDWARE-RESULTS.json "$PWD" 1
+./scripts/measure-v01-daemon.sh validation/v0.1/HARDWARE-RESULTS-4.json "$PWD" 4
+./scripts/measure-v01-daemon.sh validation/v0.1/HARDWARE-RESULTS-10.json "$PWD" 10
 ```
 
 The iOS fixture creates exactly two detached worktrees and two owned UDIDs. It
@@ -40,15 +42,17 @@ build concurrency in `HARDWARE-RESULTS.json` or a dated sibling. The fixture
 does not remove containers, volumes, simulators, worktrees or evidence.
 
 `measure-v01-daemon.sh` builds release binaries, starts one private temporary
-daemon, creates one trusted process environment, takes 100 `environment.status`
-samples, reads that daemon's RSS, and writes one non-overwriting JSON result.
-Its 200 ms p95 and 100 MiB RSS fields are measured comparisons, not guarantees.
-The process fixture and external tools are excluded from the daemon RSS.
+daemon, creates the requested number of trusted process environments, takes 100
+round-robin `environment.status` samples, reads that daemon's RSS/CPU, stops
+every owned environment, and writes one non-overwriting JSON result. Its 200 ms
+p95 and 100 MiB RSS fields are measured comparisons, not guarantees. The
+process fixture and external tools are excluded from the daemon RSS.
 
 ## Scope
 
 The recorded iOS matrix is macOS 26.6.2 arm64, Xcode 26.4.1, iOS Simulator
 26.4.1, React Native 0.87.1, Node 26.7.0, Rust 1.98.0 and CocoaPods 1.16.2.
-Any change to that matrix requires a fresh hardware result. Four- and
-ten-environment simulator runs remain hardware-gated; do not infer universal
-simulator capacity from the two-worktree fixture.
+Any change to that matrix requires a fresh hardware result. The checked-in
+four- and ten-environment runs use the process provider only; simulator runs
+remain hardware-gated. Do not infer universal simulator capacity from any of
+these fixtures.

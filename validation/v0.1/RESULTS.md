@@ -27,8 +27,14 @@ sample starts one process-backed environment and excludes that process and other
 external tools from RSS. It is a measured local result, not a cross-project or
 simulator-capacity claim.
 
-The report marks four- and ten-environment runs incomplete. Before release, run
-the hardware procedure in `README.md` and retain CPU, memory, disk, service
-count and build concurrency for those real runs. Missing or failed measurements
-block the v0.1 release; this file deliberately makes no capacity or performance
-guarantee.
+[`HARDWARE-RESULTS-4.json`](HARDWARE-RESULTS-4.json) and
+[`HARDWARE-RESULTS-10.json`](HARDWARE-RESULTS-10.json) record process-backed
+four- and ten-environment runs on the same host. They measured 36.678 ms / 5,504
+KiB / 0.9% CPU and 38.396 ms / 5,824 KiB / 0.7% CPU respectively; both reports
+also retain host CPU, memory, disk, service count and zero native-build
+concurrency. The ten-environment run sampled each environment round-robin and
+stopped every owned process before cleanup.
+
+Those are process-provider measurements only. They neither exercise simulators
+or native builds nor establish simulator capacity. A target iOS/Compose hardware
+replay remains required before release if that workload or matrix changes.
