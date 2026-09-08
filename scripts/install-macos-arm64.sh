@@ -148,11 +148,16 @@ install_cask() {
   fi
 }
 
-printf '%s\n' "Installing runtime prerequisites with Homebrew: git, node, cocoapods, Docker Desktop"
+printf '%s\n' "Installing runtime prerequisites with Homebrew: git, node and cocoapods"
 install_formula git
 install_formula node
 install_formula cocoapods
-install_cask docker
+if command -v docker >/dev/null 2>&1; then
+  printf '%s\n' "Docker CLI detected; keeping the existing Docker-compatible runtime."
+else
+  printf '%s\n' "Docker CLI not found; installing Docker Desktop with Homebrew."
+  install_cask docker
+fi
 
 if [ -e "$prefix" ]; then
   [ -f "$prefix/manifest.json" ] || fail "prefix already exists and is not a DevFleet package: $prefix"
@@ -264,7 +269,7 @@ if ! command -v xcodebuild >/dev/null 2>&1; then
   printf '%s\n' "Xcode is still required for iOS Simulator environments. Install Xcode from Apple, open it once, then run xcodebuild -runFirstLaunch."
 fi
 if ! docker info >/dev/null 2>&1; then
-  printf '%s\n' "Open Docker Desktop once and wait for it to finish starting before using Compose environments."
+  printf '%s\n' "Start a Docker-compatible runtime such as OrbStack or Docker Desktop before using Compose environments."
 fi
 if ! pod --version >/dev/null 2>&1; then
   printf '%s\n' "CocoaPods is installed through Homebrew but is not runnable yet; resolve pod --version before using iOS environments."

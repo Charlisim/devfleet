@@ -20,10 +20,11 @@ process environments, reads each status and stops both.
 ## Installer, dependencies and trust
 
 The archive includes `install-macos-arm64.sh`. It verifies every packaged file
-before copying it to a versioned user prefix, installs Git, Node, CocoaPods and
-Docker Desktop with Homebrew, registers a private per-user launch agent, then
-installs and trusts all five checksum-verified official providers. The default
-paths are `~/.local/share/devfleet/v0.1.0`,
+before copying it to a versioned user prefix, installs Git, Node and CocoaPods
+with Homebrew, detects an existing Docker-compatible CLI such as OrbStack, and
+otherwise installs Docker Desktop with Homebrew. It registers a private
+per-user launch agent, then installs and trusts all five checksum-verified
+official providers. The default paths are `~/.local/share/devfleet/v0.1.0`,
 `~/Library/Application Support/DevFleet`, and
 `/tmp/df-$(id -u)/devfleet.sock`.
 
@@ -47,9 +48,9 @@ Homebrew's official installer.
 
 Homebrew cannot install the complete Xcode Simulator runtime. Install Xcode
 from Apple, open it once, run `xcodebuild -runFirstLaunch`, and download the
-required simulator runtime before creating iOS environments. Docker Desktop
-also needs to be opened once after its cask installation. Run `pod --version`
-and `devfleet doctor` in each worktree before using iOS.
+required simulator runtime before creating iOS environments. Start OrbStack,
+Docker Desktop, or another local Docker-compatible runtime before Compose use.
+Run `pod --version` and `devfleet doctor` in each worktree before using iOS.
 
 ## Manual installation and trust
 
