@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub mod execution;
 pub mod plan;
+pub mod ports;
 
 pub use execution::{
     ExecutionContext, ExecutionError, ExecutionJournal, ExecutionNode, ExecutionPlan,
@@ -22,6 +23,7 @@ pub use plan::{
     DependencyEdge, DependencyKind, EffectivePlan, PlanOptions, PlannedResource, compile_document,
     compile_manifest,
 };
+pub use ports::{EndpointUrls, PortBlock, PortError, PortRange, ReservedPorts, retry_handoff};
 
 macro_rules! id_type {
     ($name:ident) => {

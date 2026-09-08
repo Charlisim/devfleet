@@ -2,11 +2,11 @@
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -24,6 +24,10 @@ pub enum StateError {
     NumericOutOfRange,
     #[error("stored JSON is invalid")]
     Json(#[from] serde_json::Error),
+    #[error("port lease request is invalid")]
+    InvalidPortLease,
+    #[error("no port block remains in the configured range")]
+    PortRangeExhausted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -148,6 +152,38 @@ pub struct StoredPlan {
     pub profile: String,
     pub generation: u64,
     pub effective_configuration: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredPortLease {
+    pub environment_key: String,
+    pub project_fingerprint: String,
+    pub generation: u64,
+    pub range_start: u16,
+    pub range_end: u16,
+    pub block_start: u16,
+    pub block_size: u16,
+    pub offsets: BTreeMap<String, u16>,
+    pub state: PortLeaseState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortLeaseState {
+    Reserved,
+    Stopped,
+    Quarantined,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortLeaseRequest {
+    pub environment_key: String,
+    pub project_fingerprint: String,
+    pub generation: u64,
+    pub range_start: u16,
+    pub range_end: u16,
+    pub block_size: u16,
+    pub offsets: BTreeMap<String, u16>,
 }
 
 pub struct StateStore {
@@ -510,6 +546,87 @@ impl StateStore {
         })
     }
 
+    /// Reserves one user-wide port block transactionally. Stopped and quarantined
+    /// leases remain unavailable until an explicit reconciliation releases them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid offsets, exhausted ranges, or failed storage.
+    pub fn reserve_port_lease(
+        &mut self,
+        request: &PortLeaseRequest,
+    ) -> Result<StoredPortLease, StateError> {
+        validate_port_request(request)?;
+        let transaction = self.connection.transaction()?;
+        let existing = transaction.query_row(
+            "SELECT project_fingerprint, generation, range_start, range_end, block_start, block_size, offsets_json, state
+             FROM port_leases WHERE environment_key = ?1",
+            params![request.environment_key],
+            stored_port_lease_from_row(&request.environment_key),
+        );
+        let lease = match existing {
+            Ok(lease) => lease,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let mut occupied =
+                    transaction.prepare("SELECT block_start, block_size FROM port_leases")?;
+                let occupied = occupied
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let block_start = candidate_block_start(request, &occupied)
+                    .ok_or(StateError::PortRangeExhausted)?;
+                transaction.execute(
+                    "INSERT INTO port_leases (environment_key, project_fingerprint, generation, range_start, range_end,
+                                              block_start, block_size, offsets_json, state)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'reserved')",
+                    params![request.environment_key, request.project_fingerprint,
+                        i64::try_from(request.generation).map_err(|_| StateError::NumericOutOfRange)?,
+                        i64::from(request.range_start), i64::from(request.range_end), i64::from(block_start),
+                        i64::from(request.block_size), serde_json::to_string(&request.offsets)?],
+                )?;
+                StoredPortLease {
+                    environment_key: request.environment_key.clone(),
+                    project_fingerprint: request.project_fingerprint.clone(),
+                    generation: request.generation,
+                    range_start: request.range_start,
+                    range_end: request.range_end,
+                    block_start,
+                    block_size: request.block_size,
+                    offsets: request.offsets.clone(),
+                    state: PortLeaseState::Reserved,
+                }
+            }
+            Err(error) => return Err(StateError::Sqlite(error)),
+        };
+        transaction.commit()?;
+        Ok(lease)
+    }
+
+    /// Retains slot preference after stop rather than treating a timer as proof it is free.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist the retained lease state.
+    pub fn mark_port_lease_stopped(&mut self, environment_key: &str) -> Result<bool, StateError> {
+        Ok(self.connection.execute(
+            "UPDATE port_leases SET state = 'stopped' WHERE environment_key = ?1",
+            params![environment_key],
+        )? == 1)
+    }
+
+    /// Quarantines a lease whose previous endpoint ownership cannot be proven.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist quarantine state.
+    pub fn quarantine_port_lease(&mut self, environment_key: &str) -> Result<bool, StateError> {
+        Ok(self.connection.execute(
+            "UPDATE port_leases SET state = 'quarantined' WHERE environment_key = ?1",
+            params![environment_key],
+        )? == 1)
+    }
+
     /// Updates verified Git context without changing project or worktree identity.
     ///
     /// # Errors
@@ -715,7 +832,101 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 7 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS port_leases (
+                    environment_key TEXT PRIMARY KEY,
+                    project_fingerprint TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    range_start INTEGER NOT NULL,
+                    range_end INTEGER NOT NULL,
+                    block_start INTEGER NOT NULL UNIQUE,
+                    block_size INTEGER NOT NULL,
+                    offsets_json TEXT NOT NULL,
+                    state TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 7;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
+    }
+}
+
+fn validate_port_request(request: &PortLeaseRequest) -> Result<(), StateError> {
+    if request.range_start == 0
+        || request.range_start > request.range_end
+        || request.block_size == 0
+    {
+        return Err(StateError::InvalidPortLease);
+    }
+    let mut offsets = std::collections::BTreeSet::new();
+    if request.offsets.is_empty()
+        || request.offsets.iter().any(|(name, offset)| {
+            name.is_empty() || *offset >= request.block_size || !offsets.insert(offset)
+        })
+    {
+        return Err(StateError::InvalidPortLease);
+    }
+    Ok(())
+}
+
+fn candidate_block_start(request: &PortLeaseRequest, occupied: &[(i64, i64)]) -> Option<u16> {
+    let mut start = u32::from(request.range_start);
+    while start + u32::from(request.block_size) - 1 <= u32::from(request.range_end) {
+        let candidate = u16::try_from(start).ok()?;
+        let candidate_end = i64::from(candidate) + i64::from(request.block_size) - 1;
+        if occupied
+            .iter()
+            .all(|(start, size)| candidate_end < *start || i64::from(candidate) > start + size - 1)
+        {
+            return Some(candidate);
+        }
+        start += u32::from(request.block_size);
+    }
+    None
+}
+
+fn stored_port_lease_from_row(
+    environment_key: &str,
+) -> impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<StoredPortLease> + '_ {
+    move |row| {
+        let generation: i64 = row.get(1)?;
+        let range_start: i64 = row.get(2)?;
+        let range_end: i64 = row.get(3)?;
+        let block_start: i64 = row.get(4)?;
+        let block_size: i64 = row.get(5)?;
+        let state: String = row.get(7)?;
+        let offsets: BTreeMap<String, u16> = serde_json::from_str(&row.get::<_, String>(6)?)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let state = match state.as_str() {
+            "reserved" => PortLeaseState::Reserved,
+            "stopped" => PortLeaseState::Stopped,
+            "quarantined" => PortLeaseState::Quarantined,
+            _ => return Err(rusqlite::Error::InvalidQuery),
+        };
+        Ok(StoredPortLease {
+            environment_key: environment_key.into(),
+            project_fingerprint: row.get(0)?,
+            generation: generation
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, generation))?,
+            range_start: range_start
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, range_start))?,
+            range_end: range_end
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, range_end))?,
+            block_start: block_start
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(4, block_start))?,
+            block_size: block_size
+                .try_into()
+                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, block_size))?,
+            offsets,
+            state,
+        })
     }
 }
 
@@ -904,5 +1115,53 @@ mod tests {
         assert_eq!(first.generation, 1);
         assert_eq!(repeated.generation, 1);
         assert_eq!(changed.generation, 2);
+    }
+
+    #[test]
+    fn allocates_distinct_blocks_and_retains_stopped_or_quarantined_preferences() {
+        let mut store = StateStore::open_in_memory().expect("state opens");
+        let request = |environment_key: &str| PortLeaseRequest {
+            environment_key: environment_key.into(),
+            project_fingerprint: "project".into(),
+            generation: 1,
+            range_start: 20_000,
+            range_end: 20_127,
+            block_size: 64,
+            offsets: BTreeMap::from([("api".into(), 1), ("metro".into(), 2)]),
+        };
+        let first = store
+            .reserve_port_lease(&request("one"))
+            .expect("first lease");
+        let overlapping = PortLeaseRequest {
+            environment_key: "overlap".into(),
+            project_fingerprint: "other-project".into(),
+            generation: 1,
+            range_start: 20_032,
+            range_end: 20_095,
+            block_size: 64,
+            offsets: BTreeMap::from([("api".into(), 1)]),
+        };
+        assert!(matches!(
+            store.reserve_port_lease(&overlapping),
+            Err(StateError::PortRangeExhausted)
+        ));
+        let second = store
+            .reserve_port_lease(&request("two"))
+            .expect("second lease");
+        assert_ne!(first.block_start, second.block_start);
+        assert!(store.mark_port_lease_stopped("one").expect("stops lease"));
+        let retained = store
+            .reserve_port_lease(&request("one"))
+            .expect("retains preference");
+        assert_eq!(retained.block_start, first.block_start);
+        assert!(
+            store
+                .quarantine_port_lease("two")
+                .expect("quarantines lease")
+        );
+        assert!(matches!(
+            store.reserve_port_lease(&request("three")),
+            Err(StateError::PortRangeExhausted)
+        ));
     }
 }
