@@ -1,0 +1,25 @@
+{
+  "release": "0.1.0",
+  "platform": "macos-aarch64",
+  "rust": "1.98.0",
+  "protocol": {
+    "major": 1,
+    "minor": 0
+  },
+  "tested_matrix": {
+    "macos": "26.6.2 (25G83)",
+    "xcode": "26.4.1 (17E202)",
+    "ios_simulator": "26.4.1 (23E254a)",
+    "react_native": "0.87.1",
+    "node": "26.7.0",
+    "cocoapods": "1.16.2"
+  },
+  "unsupported": [
+    "windows",
+    "distributed_execution",
+    "physical_devices",
+    "plugin_marketplace",
+    "gui",
+    "untested_expo"
+  ]
+}

@@ -22,3 +22,17 @@ jobs:
       - run: cargo test --workspace --locked
       - run: ./scripts/check-boundaries.sh
       - uses: rustsec/audit-check@v2.0.0
+      - name: collect provenance
+        run: |
+          mkdir -p target/provenance
+          git rev-parse HEAD > target/provenance/source-commit.txt
+          rustc --version > target/provenance/rustc.txt
+          sw_vers > target/provenance/macos.txt
+          xcodebuild -version > target/provenance/xcode.txt
+          xcrun simctl list runtimes > target/provenance/simulator-runtimes.txt
+          printf 'react_native=0.87.1\n' > target/provenance/react-native.txt
+          shasum -a 256 Cargo.lock > target/provenance/Cargo.lock.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devfleet-provenance
+          path: target/provenance

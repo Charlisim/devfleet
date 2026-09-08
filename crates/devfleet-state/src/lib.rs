@@ -2802,6 +2802,27 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_newer_schema_without_changing_it() {
+        let connection = Connection::open_in_memory().expect("future database opens");
+        let future_version = CURRENT_SCHEMA_VERSION + 1;
+        connection
+            .execute_batch(&format!("PRAGMA user_version = {future_version};"))
+            .expect("future version persists");
+        let mut store = StateStore { connection };
+        assert!(matches!(
+            store.migrate(),
+            Err(StateError::NewerSchema {
+                found,
+                supported: CURRENT_SCHEMA_VERSION
+            }) if found == future_version
+        ));
+        assert_eq!(
+            store.schema_version().expect("version reads"),
+            future_version
+        );
+    }
+
+    #[test]
     fn increments_plan_generation_only_for_a_changed_redacted_snapshot() {
         let mut store = StateStore::open_in_memory().expect("state store opens");
         let snapshot = serde_json::json!({"token": "${{ secrets.API_TOKEN }}", "port": 4000});
