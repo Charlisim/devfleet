@@ -34,12 +34,13 @@ tests independent Metro/backend routes, a JavaScript-only edit, a compiled
 endpoint change, both deliberate crosswires, and restoration. It retains the
 fixture resources for inspection; follow its README before any cleanup.
 
-Run the fifteen-service Compose fixture from two Git worktrees with separate
-managed `DEVFLEET_API_PORT` values. Verify both health endpoints, write a marker
-only to the first `files` volume, stop through DevFleet, then record the two
-project names, endpoints, volume outcome, CPU, memory, disk, service count and
-build concurrency in `HARDWARE-RESULTS.json` or a dated sibling. The fixture
-does not remove containers, volumes, simulators, worktrees or evidence.
+Run the fifteen-service Compose fixture from two Git worktrees with
+`--endpoint api=api:3000:0:/health`; DevFleet injects separate managed
+`DEVFLEET_API_PORT` values. Verify both health endpoints, write a marker only to
+the first `files` volume, stop through DevFleet, then record the two project
+names, endpoints, volume outcome, CPU, memory, disk, service count and build
+concurrency in `HARDWARE-RESULTS.json` or a dated sibling. The fixture does not
+remove containers, volumes, simulators, worktrees or evidence.
 
 `measure-v01-daemon.sh` builds release binaries, starts one private temporary
 daemon, creates the requested number of trusted process environments, takes 100

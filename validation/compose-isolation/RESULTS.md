@@ -16,5 +16,5 @@ fifteen-service fixture.
   stopped, so a stopped environment can start again without taking ownership
   of an active process.
 
-The fixture uses `DEVFLEET_API_PORT`; pass it through `--env` together with the
-matching declared endpoint.
+The fixture uses the `DEVFLEET_API_PORT` value injected by DevFleet from the
+declared endpoint. New runs use `--endpoint api=api:3000:0:/health`.

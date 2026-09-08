@@ -1325,6 +1325,7 @@ impl Daemon {
                 })?;
             }
         }
+        inject_compose_endpoint_port_environment(&mut request.environment, &request.endpoints)?;
         environment.endpoints = stored_compose_endpoints(&request.endpoints);
         let mut port_reservation = (!assigned_ports.is_empty())
             .then(|| ReservedPorts::bind(assigned_ports.clone()))
@@ -4272,6 +4273,47 @@ fn validate_compose_up_request(request: &ComposeUpRequest) -> Result<(), DaemonE
     Ok(())
 }
 
+fn inject_compose_endpoint_port_environment(
+    environment: &mut BTreeMap<String, String>,
+    endpoints: &[devfleet_protocol::ComposeEndpoint],
+) -> Result<(), DaemonError> {
+    let mut assigned = BTreeSet::new();
+    for endpoint in endpoints {
+        let key = format!(
+            "DEVFLEET_{}_PORT",
+            endpoint
+                .name
+                .bytes()
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() {
+                        byte.to_ascii_uppercase() as char
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        );
+        if !assigned.insert(key.clone()) {
+            return Err(DaemonError::InvalidConfig(format!(
+                "Compose endpoint names resolve to the same managed port variable '{key}'"
+            )));
+        }
+        let value = endpoint.host_port.to_string();
+        match environment.get(&key) {
+            Some(existing) if existing != &value => {
+                return Err(DaemonError::InvalidConfig(format!(
+                    "{key} must match DevFleet's resolved endpoint port {value}"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                environment.insert(key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn compose_project_name(project_id: Uuid, environment_id: Uuid) -> String {
     let project = project_id.to_string().replace('-', "");
     let environment = environment_id.to_string().replace('-', "");
@@ -5924,6 +5966,33 @@ mod tests {
             )
             .expect("second reservation");
         assert_eq!(second["api"], 20_064);
+    }
+
+    #[test]
+    fn compose_receives_resolved_endpoint_port_variables() {
+        let endpoints = vec![
+            devfleet_protocol::ComposeEndpoint {
+                name: "api".into(),
+                service: "api".into(),
+                container_port: 3_000,
+                host_port: 20_000,
+                readiness_path: "/health".into(),
+            },
+            devfleet_protocol::ComposeEndpoint {
+                name: "web-api".into(),
+                service: "web".into(),
+                container_port: 3_001,
+                host_port: 20_001,
+                readiness_path: "/ready".into(),
+            },
+        ];
+        let mut environment = BTreeMap::new();
+        inject_compose_endpoint_port_environment(&mut environment, &endpoints)
+            .expect("resolved ports inject");
+        assert_eq!(environment["DEVFLEET_API_PORT"], "20000");
+        assert_eq!(environment["DEVFLEET_WEB_API_PORT"], "20001");
+        environment.insert("DEVFLEET_API_PORT".into(), "20002".into());
+        assert!(inject_compose_endpoint_port_environment(&mut environment, &endpoints).is_err());
     }
 
     fn destroy_environment(worktree: &Path) -> StoredEnvironment {

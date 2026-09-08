@@ -55,9 +55,14 @@ devfleet --socket /tmp/df-$(id -u)/daemon.sock plugin install \
 devfleet --socket /tmp/df-$(id -u)/daemon.sock plugin trust official.compose
 devfleet --socket /tmp/df-$(id -u)/daemon.sock compose up \
   --trust --worktree "$PWD" --file "$PWD/compose.yaml" \
-  --env DEVFLEET_API_PORT=20001 \
-  --endpoint api=api:3000:20001:/health
+  --endpoint api=api:3000:0:/health
 ```
+
+Use `HOST_PORT=0` to allocate a retained automatic port from the host lease.
+DevFleet injects the resolved value as `DEVFLEET_<ENDPOINT>_PORT`; the example
+endpoint therefore uses `${DEVFLEET_API_PORT}` in `compose.yaml`. An explicit
+host port remains available, but an explicitly supplied managed variable must
+match DevFleet's resolved value.
 
 ## Project setup and diagnosis
 
