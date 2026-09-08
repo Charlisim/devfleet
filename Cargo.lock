@@ -345,6 +345,7 @@ dependencies = [
  "devfleet-protocol",
  "devfleet-testkit",
  "nix",
+ "serde",
  "serde_json",
  "sha2",
  "uuid",

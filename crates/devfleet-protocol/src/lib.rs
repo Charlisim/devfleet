@@ -218,6 +218,40 @@ pub struct IosAppSnapshot {
     pub launched: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityVerificationStartRequest {
+    pub environment_id: Uuid,
+    pub backend_identity: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IdentityVerificationSnapshot {
+    pub environment_id: Uuid,
+    pub generation: u64,
+    pub verification_url: String,
+    pub nonce: String,
+    pub token: String,
+    pub status: IdentityVerificationStatus,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityVerificationStatus {
+    Pending,
+    Verified,
+    Mismatch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorIdentityVerificationRequest {
+    pub environment_id: Uuid,
+    pub generation: u64,
+    pub build_identity: String,
+    pub bundle_identity: String,
+    pub backend_identity: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IosSimulatorAction {
@@ -338,6 +372,10 @@ pub enum DaemonRequest {
     IosSimulatorAcquire(IosSimulatorAcquireRequest),
     IosSimulatorAction(IosSimulatorActionRequest),
     IosAppRun(IosAppRunRequest),
+    IdentityVerificationStart(IdentityVerificationStartRequest),
+    IdentityVerificationStatus {
+        environment_id: Uuid,
+    },
     Status {
         environment_id: Uuid,
     },
@@ -393,6 +431,7 @@ pub enum DaemonResponse {
     Bindings(Vec<BindingSnapshot>),
     IosSimulator(IosSimulatorSnapshot),
     IosApp(IosAppSnapshot),
+    IdentityVerification(IdentityVerificationSnapshot),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -696,6 +735,10 @@ pub enum SupervisorRequest {
         action: PluginAction,
         timeout_seconds: Option<u64>,
     },
+    StartIdentityVerification {
+        request: SupervisorIdentityVerificationRequest,
+    },
+    InspectIdentityVerification,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -706,6 +749,7 @@ pub enum SupervisorResponse {
     TaskFailed { stdout: String, stderr: String },
     TaskTimedOut,
     TaskOutput { stdout: String, stderr: String },
+    IdentityVerification(IdentityVerificationSnapshot),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

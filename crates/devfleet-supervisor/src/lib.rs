@@ -16,10 +16,11 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::{self, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
     os::unix::{fs::PermissionsExt, net::UnixListener, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::mpsc::{self, SyncSender},
+    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +46,7 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
     let initial = read_json_line::<SupervisorStartRequest>(&mut BufReader::new(io::stdin().lock()))
         .context("read supervisor start request")?;
     let task_plugins = initial.task_plugins.clone();
+    let mut identity_verification = None;
     let spawn_request = request_spawn(process_plugin, initial.operation_id, initial.action.clone())
         .context("request process provider spawn")?;
     let mut child = spawn(&spawn_request).context("spawn provider process")?;
@@ -81,6 +83,7 @@ pub fn serve(control_socket: &Path, process_plugin: &Path) -> anyhow::Result<()>
                     &mut snapshot,
                     process_plugin,
                     &task_plugins,
+                    &mut identity_verification,
                 )? {
                     logs.finish();
                     return Ok(());
@@ -251,6 +254,7 @@ fn handle_control(
     snapshot: &mut ProcessSnapshot,
     process_plugin: &Path,
     task_plugins: &[TrustedTaskPlugin],
+    identity_verification: &mut Option<IdentityVerification>,
 ) -> anyhow::Result<bool> {
     assert_same_user(&stream)?;
     let request = read_json_line::<JsonRpcRequest>(&mut BufReader::new(stream.try_clone()?))?;
@@ -280,6 +284,18 @@ fn handle_control(
             action,
             timeout_seconds,
         )?,
+        SupervisorRequest::StartIdentityVerification { request } => {
+            let verification = IdentityVerification::start(request)?;
+            let snapshot = verification.snapshot.clone();
+            *identity_verification = Some(verification);
+            SupervisorResponse::IdentityVerification(snapshot)
+        }
+        SupervisorRequest::InspectIdentityVerification => {
+            let verification = identity_verification
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("identity verification has not started"))?;
+            SupervisorResponse::IdentityVerification(verification.inspect())
+        }
     };
     let rpc = JsonRpcResponse::success(request.id, &response);
     stream.write_all(&write_json_line(&rpc)?)?;
@@ -417,6 +433,142 @@ fn run_task(
     })
 }
 
+struct IdentityVerification {
+    snapshot: devfleet_protocol::IdentityVerificationSnapshot,
+    receiver: Receiver<IdentityOutcome>,
+}
+
+struct IdentityOutcome {
+    status: devfleet_protocol::IdentityVerificationStatus,
+    diagnostic: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct IdentityReport {
+    environment_id: Uuid,
+    generation: u64,
+    build_identity: String,
+    bundle_identity: String,
+    backend_identity: String,
+    nonce: String,
+}
+
+impl IdentityVerification {
+    fn start(
+        request: devfleet_protocol::SupervisorIdentityVerificationRequest,
+    ) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let nonce = Uuid::now_v7().to_string();
+        let token = Uuid::now_v7().to_string();
+        let snapshot = devfleet_protocol::IdentityVerificationSnapshot {
+            environment_id: request.environment_id,
+            generation: request.generation,
+            verification_url: format!("http://127.0.0.1:{port}/identity"),
+            nonce: nonce.clone(),
+            token: token.clone(),
+            status: devfleet_protocol::IdentityVerificationStatus::Pending,
+            diagnostic: None,
+        };
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            serve_identity_listener(listener, request, nonce, token, sender);
+        });
+        Ok(Self { snapshot, receiver })
+    }
+
+    fn inspect(&mut self) -> devfleet_protocol::IdentityVerificationSnapshot {
+        match self.receiver.try_recv() {
+            Ok(outcome) => {
+                self.snapshot.status = outcome.status;
+                self.snapshot.diagnostic = outcome.diagnostic;
+            }
+            Err(TryRecvError::Disconnected)
+                if self.snapshot.status
+                    == devfleet_protocol::IdentityVerificationStatus::Pending =>
+            {
+                self.snapshot.status = devfleet_protocol::IdentityVerificationStatus::Mismatch;
+                self.snapshot.diagnostic =
+                    Some("verification listener stopped before a report".into());
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+        self.snapshot.clone()
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn serve_identity_listener(
+    listener: TcpListener,
+    expected: devfleet_protocol::SupervisorIdentityVerificationRequest,
+    nonce: String,
+    token: String,
+    sender: mpsc::Sender<IdentityOutcome>,
+) {
+    let deadline = SystemTime::now() + Duration::from_secs(600);
+    while SystemTime::now() < deadline {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Some(outcome) = identity_report(stream, &expected, &nonce, &token) {
+                    let _ = sender.send(outcome);
+                    return;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return,
+        }
+    }
+    let _ = sender.send(IdentityOutcome {
+        status: devfleet_protocol::IdentityVerificationStatus::Mismatch,
+        diagnostic: Some("identity report deadline exceeded".into()),
+    });
+}
+
+fn identity_report(
+    mut stream: TcpStream,
+    expected: &devfleet_protocol::SupervisorIdentityVerificationRequest,
+    nonce: &str,
+    token: &str,
+) -> Option<IdentityOutcome> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut bytes = vec![0_u8; 16 * 1024];
+    let read = stream.read(&mut bytes).ok()?;
+    let request = std::str::from_utf8(&bytes[..read]).ok()?;
+    let (headers, body) = request.split_once("\r\n\r\n")?;
+    let authorized = headers
+        .lines()
+        .any(|line| line.eq_ignore_ascii_case(&format!("authorization: Bearer {token}")));
+    if !headers.starts_with("POST /identity HTTP/") || !authorized {
+        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        return None;
+    }
+    let report: IdentityReport = serde_json::from_str(body).ok()?;
+    let matches = report.environment_id == expected.environment_id
+        && report.generation == expected.generation
+        && report.build_identity == expected.build_identity
+        && report.bundle_identity == expected.bundle_identity
+        && report.backend_identity == expected.backend_identity
+        && report.nonce == nonce;
+    let outcome = if matches {
+        IdentityOutcome {
+            status: devfleet_protocol::IdentityVerificationStatus::Verified,
+            diagnostic: None,
+        }
+    } else {
+        IdentityOutcome {
+            status: devfleet_protocol::IdentityVerificationStatus::Mismatch,
+            diagnostic: Some(
+                "IDENTITY_MISMATCH: identity report does not match this launch".into(),
+            ),
+        }
+    };
+    let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    Some(outcome)
+}
+
 fn assert_same_user(stream: &std::os::unix::net::UnixStream) -> anyhow::Result<()> {
     let (uid, _) = getpeereid(stream)?;
     if uid != getuid() {
@@ -478,5 +630,58 @@ mod tests {
             run_task_with_deadline(command, 1, "/tmp").expect("task deadline handles sleep");
         assert!(output.is_none());
         assert!(started.elapsed().expect("monotonic clock") < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn identity_listener_verifies_only_the_expected_launch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
+        let address = listener.local_addr().expect("listener address");
+        let expected = devfleet_protocol::SupervisorIdentityVerificationRequest {
+            environment_id: Uuid::now_v7(),
+            generation: 3,
+            build_identity: "build-a".into(),
+            bundle_identity: "com.example.app".into(),
+            backend_identity: "backend-a".into(),
+        };
+        let expected_for_thread = expected.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("report connects");
+            sender
+                .send(identity_report(
+                    stream,
+                    &expected_for_thread,
+                    "nonce-a",
+                    "token-a",
+                ))
+                .expect("report result sends");
+        });
+        let body = serde_json::json!({
+            "environment_id": expected.environment_id,
+            "generation": expected.generation,
+            "build_identity": expected.build_identity,
+            "bundle_identity": expected.bundle_identity,
+            "backend_identity": expected.backend_identity,
+            "nonce": "nonce-a",
+        })
+        .to_string();
+        let mut stream = TcpStream::connect(address).expect("client connects");
+        stream
+            .write_all(
+                format!(
+                    "POST /identity HTTP/1.1\r\nAuthorization: Bearer token-a\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .expect("report writes");
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("report receives")
+            .expect("report accepted");
+        assert_eq!(
+            outcome.status,
+            devfleet_protocol::IdentityVerificationStatus::Verified
+        );
     }
 }

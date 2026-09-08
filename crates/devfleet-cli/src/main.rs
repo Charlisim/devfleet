@@ -2,10 +2,11 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
-    DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
-    InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest, IosSimulatorAction,
-    IosSimulatorActionRequest, MetroUpRequest, PREPARATION_DEFAULT_TIMEOUT_SECONDS,
-    PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec, SmokeResponse, SmokeStatus,
+    DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, IdentityVerificationStartRequest,
+    InitializationRunRequest, InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest,
+    IosSimulatorAction, IosSimulatorActionRequest, MetroUpRequest,
+    PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec,
+    SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -47,6 +48,7 @@ enum Command {
     Prepare(PrepareArgs),
     Bindings(BindingsArgs),
     Ios(IosArgs),
+    Identity(IdentityArgs),
     Plugin(PluginArgs),
 }
 
@@ -67,6 +69,24 @@ enum BindingsCommand {
 struct IosArgs {
     #[command(subcommand)]
     command: IosCommand,
+}
+
+#[derive(ClapArgs)]
+struct IdentityArgs {
+    #[command(subcommand)]
+    command: IdentityCommand,
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    Start {
+        environment_id: Uuid,
+        #[arg(long)]
+        backend_identity: String,
+    },
+    Status {
+        environment_id: Uuid,
+    },
 }
 
 #[derive(Subcommand)]
@@ -544,6 +564,20 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 },
             )),
         },
+        Command::Identity(identity) => match identity.command {
+            IdentityCommand::Start {
+                environment_id,
+                backend_identity,
+            } => Ok(DaemonRequest::IdentityVerificationStart(
+                IdentityVerificationStartRequest {
+                    environment_id,
+                    backend_identity,
+                },
+            )),
+            IdentityCommand::Status { environment_id } => {
+                Ok(DaemonRequest::IdentityVerificationStatus { environment_id })
+            }
+        },
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
         Command::Stop { environment_id } => Ok(DaemonRequest::Stop { environment_id }),
@@ -791,6 +825,19 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
         DaemonResponse::IosApp(app) => println!(
             "{} {} metro={} launched={}",
             app.bundle_id, app.udid, app.metro_port, app.launched
+        ),
+        DaemonResponse::IdentityVerification(identity) => println!(
+            "{:?} {} nonce={} token={}{}",
+            identity.status,
+            identity.verification_url,
+            identity.nonce,
+            identity.token,
+            identity
+                .diagnostic
+                .as_deref()
+                .map_or_else(String::new, |diagnostic| format!(
+                    " diagnostic={diagnostic}"
+                ))
         ),
     }
     Ok(())

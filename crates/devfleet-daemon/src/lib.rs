@@ -10,15 +10,16 @@ use devfleet_protocol::{
     BindingApplyRequest, BindingIntegration, BindingInvalidation, BindingPhase, BindingSnapshot,
     ComposeReconcileRequest, ComposeUpRequest, DaemonRequest, DaemonResponse, EndpointSnapshot,
     EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot,
-    InitializationRunRequest, InitializationTask, InitializationTaskKind,
-    InitializationTaskSnapshot, InitializationTaskStatus, IosAppRunRequest, IosAppSnapshot,
-    IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
-    IosSimulatorLifecycle, IosSimulatorSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState,
-    LogSnapshot, MetroReconcileRequest, MetroUpRequest, OperationAccepted, OperationSnapshot,
-    PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot, PreparationRunRequest,
-    PreparationTaskKind, PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot,
-    ReadinessState, RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest,
-    TaskRerunPolicy, TrustedTaskPlugin, read_json_line, write_json_line,
+    IdentityVerificationSnapshot, IdentityVerificationStartRequest, InitializationRunRequest,
+    InitializationTask, InitializationTaskKind, InitializationTaskSnapshot,
+    InitializationTaskStatus, IosAppRunRequest, IosAppSnapshot, IosSimulatorAcquireRequest,
+    IosSimulatorAction, IosSimulatorActionRequest, IosSimulatorLifecycle, IosSimulatorSnapshot,
+    JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
+    MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
+    PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
+    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ReadinessState, RpcFailure,
+    SupervisorIdentityVerificationRequest, SupervisorRequest, SupervisorResponse,
+    SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
@@ -163,6 +164,12 @@ impl Daemon {
             DaemonRequest::IosSimulatorAcquire(request) => self.ios_simulator_acquire(&request),
             DaemonRequest::IosSimulatorAction(request) => self.ios_simulator_action(&request),
             DaemonRequest::IosAppRun(request) => self.ios_app_run(&request),
+            DaemonRequest::IdentityVerificationStart(request) => {
+                self.identity_verification_start(&request)
+            }
+            DaemonRequest::IdentityVerificationStatus { environment_id } => {
+                self.identity_verification_status(environment_id)
+            }
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -830,7 +837,8 @@ impl Daemon {
                 }
                 SupervisorResponse::Process(_)
                 | SupervisorResponse::TaskOutput { .. }
-                | SupervisorResponse::TaskTimedOut => {
+                | SupervisorResponse::TaskTimedOut
+                | SupervisorResponse::IdentityVerification(_) => {
                     return Err(DaemonError::Operation(
                         "supervisor returned a process response for an initialization task".into(),
                     ));
@@ -956,6 +964,9 @@ impl Daemon {
                 }
                 SupervisorResponse::TaskTimedOut => Some("task deadline exceeded"),
                 SupervisorResponse::Process(_) => Some("supervisor returned a process response"),
+                SupervisorResponse::IdentityVerification(_) => {
+                    Some("supervisor returned an identity verification response")
+                }
             };
             self.state
                 .finish_preparation_task(environment.id, name, diagnostic)?;
@@ -1267,7 +1278,9 @@ impl Daemon {
                     "iOS app build deadline exceeded; inspect before retrying".into(),
                 ));
             }
-            SupervisorResponse::TaskCompleted | SupervisorResponse::Process(_) => {
+            SupervisorResponse::TaskCompleted
+            | SupervisorResponse::Process(_)
+            | SupervisorResponse::IdentityVerification(_) => {
                 return Err(DaemonError::Operation(
                     "supervisor returned an invalid iOS app response".into(),
                 ));
@@ -1290,6 +1303,77 @@ impl Daemon {
             "app_launched",
         )?;
         Ok(DaemonResponse::IosApp(ios_app_snapshot(app)))
+    }
+
+    fn identity_verification_start(
+        &mut self,
+        request: &IdentityVerificationStartRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        if request.backend_identity.is_empty() {
+            return Err(DaemonError::InvalidConfig(
+                "identity verification requires a backend identity".into(),
+            ));
+        }
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment.process.ok_or(DaemonError::OwnershipUncertain)?;
+        let app = self
+            .state
+            .ios_app(environment.id)?
+            .filter(|app| app.launched)
+            .ok_or_else(|| {
+                DaemonError::Operation("identity verification requires a launched app".into())
+            })?;
+        let response = request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::StartIdentityVerification {
+                request: SupervisorIdentityVerificationRequest {
+                    environment_id: environment.id,
+                    generation: environment.generation,
+                    build_identity: app.native_fingerprint,
+                    bundle_identity: app.bundle_id,
+                    backend_identity: request.backend_identity.clone(),
+                },
+            },
+        )?;
+        let snapshot = identity_verification_response(response)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            "identity_verification_pending",
+        )?;
+        Ok(DaemonResponse::IdentityVerification(snapshot))
+    }
+
+    fn identity_verification_status(
+        &mut self,
+        environment_id: Uuid,
+    ) -> Result<DaemonResponse, DaemonError> {
+        let environment = self
+            .state
+            .environment(environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment.process.ok_or(DaemonError::OwnershipUncertain)?;
+        let snapshot = identity_verification_response(request_supervisor(
+            Path::new(&process.supervisor_socket),
+            SupervisorRequest::InspectIdentityVerification,
+        )?)?;
+        if snapshot.status != devfleet_protocol::IdentityVerificationStatus::Pending {
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                None,
+                match snapshot.status {
+                    devfleet_protocol::IdentityVerificationStatus::Verified => "identity_verified",
+                    devfleet_protocol::IdentityVerificationStatus::Mismatch => "identity_mismatch",
+                    devfleet_protocol::IdentityVerificationStatus::Pending => unreachable!(),
+                },
+            )?;
+        }
+        Ok(DaemonResponse::IdentityVerification(snapshot))
     }
 
     fn ios_discovery(plugin: &Path) -> Result<IosDiscovery, DaemonError> {
@@ -1331,7 +1415,8 @@ impl Daemon {
             }
             SupervisorResponse::TaskCompleted
             | SupervisorResponse::TaskTimedOut
-            | SupervisorResponse::Process(_) => Err(DaemonError::Operation(
+            | SupervisorResponse::Process(_)
+            | SupervisorResponse::IdentityVerification(_) => Err(DaemonError::Operation(
                 "supervisor returned an invalid iOS task response".into(),
             )),
         }
@@ -2823,8 +2908,20 @@ fn supervisor_process(response: SupervisorResponse) -> Result<ProcessSnapshot, D
         SupervisorResponse::TaskCompleted
         | SupervisorResponse::TaskFailed { .. }
         | SupervisorResponse::TaskTimedOut
-        | SupervisorResponse::TaskOutput { .. } => Err(DaemonError::Operation(
+        | SupervisorResponse::TaskOutput { .. }
+        | SupervisorResponse::IdentityVerification(_) => Err(DaemonError::Operation(
             "supervisor returned a task response for process control".into(),
+        )),
+    }
+}
+
+fn identity_verification_response(
+    response: SupervisorResponse,
+) -> Result<IdentityVerificationSnapshot, DaemonError> {
+    match response {
+        SupervisorResponse::IdentityVerification(snapshot) => Ok(snapshot),
+        _ => Err(DaemonError::Operation(
+            "supervisor returned an invalid identity verification response".into(),
         )),
     }
 }
