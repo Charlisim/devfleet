@@ -357,8 +357,10 @@ dependencies = [
 name = "devfleet-testkit"
 version = "0.1.0"
 dependencies = [
+ "devfleet-core",
  "devfleet-protocol",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

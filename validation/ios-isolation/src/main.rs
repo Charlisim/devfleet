@@ -654,4 +654,49 @@ mod tests {
         r.native_environment = "B".into();
         assert_eq!(verdict(&r, &e), "IDENTITY_MISMATCH");
     }
+
+    #[test]
+    fn checked_in_hardware_evidence_covers_isolation_and_crosswires() {
+        let evidence_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("evidence");
+        let result: Value = serde_json::from_slice(
+            &fs::read(evidence_root.join("result.json")).expect("checked-in result reads"),
+        )
+        .expect("checked-in result parses");
+        assert_eq!(result["passed"], true);
+        assert_eq!(result["status"], "passed");
+
+        let environments: Vec<Value> = serde_json::from_slice(
+            &fs::read(evidence_root.join("environments.json"))
+                .expect("checked-in environments read"),
+        )
+        .expect("checked-in environments parse");
+        assert_eq!(environments.len(), 2);
+        assert_eq!(environments[0]["id"], "A");
+        assert_eq!(environments[1]["id"], "B");
+        assert_ne!(environments[0]["udid"], environments[1]["udid"]);
+        assert_ne!(environments[0]["metro"], environments[1]["metro"]);
+        assert_ne!(environments[0]["backend"], environments[1]["backend"]);
+
+        let evidence: Vec<Value> = serde_json::from_slice(
+            &fs::read(evidence_root.join("evidence.json")).expect("checked-in evidence reads"),
+        )
+        .expect("checked-in evidence parses");
+        for (environment, phase, verdict) in [
+            ("A", "initial", "IDENTITY_VERIFIED"),
+            ("B", "initial", "IDENTITY_VERIFIED"),
+            ("A", "js-edit", "IDENTITY_VERIFIED"),
+            ("B", "js-unchanged", "IDENTITY_VERIFIED"),
+            ("A", "endpoint-without-build", "IDENTITY_VERIFIED"),
+            ("A", "cross-backend", "IDENTITY_MISMATCH"),
+            ("A", "cross-metro", "IDENTITY_MISMATCH"),
+            ("A", "restored", "IDENTITY_VERIFIED"),
+            ("B", "final-unchanged", "IDENTITY_VERIFIED"),
+        ] {
+            assert!(evidence.iter().any(|entry| {
+                entry["environment"] == environment
+                    && entry["phase"] == phase
+                    && entry["verdict"] == verdict
+            }));
+        }
+    }
 }

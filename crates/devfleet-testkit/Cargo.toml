@@ -7,8 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+devfleet-core = { path = "../devfleet-core" }
 devfleet-protocol = { path = "../devfleet-protocol" }
 serde_json.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

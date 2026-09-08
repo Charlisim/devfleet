@@ -1,0 +1,21 @@
+{
+  "status_samples": 100,
+  "status_p95_ms": 40.861,
+  "status_target_ms": 200,
+  "status_target_passed": true,
+  "daemon_idle_rss_kib": 5904,
+  "daemon_rss_target_kib": 102400,
+  "daemon_rss_target_passed": true,
+  "environment_count": 1,
+  "service_count": 1,
+  "native_build_concurrency": 0,
+  "cpu_logical_cores": 14,
+  "host_memory_bytes": 25769803776,
+  "worktree_available_disk_kib": 80152012,
+  "macos_version": "26.6.2",
+  "architecture": "arm64",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Homebrew)",
+  "external_tools_excluded": true,
+  "four_environment_run_completed": false,
+  "ten_environment_run_completed": false
+}
