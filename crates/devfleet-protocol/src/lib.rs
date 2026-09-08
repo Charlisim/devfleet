@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const PREPARATION_DEFAULT_TIMEOUT_SECONDS: u64 = 900;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -131,6 +132,12 @@ pub struct ComposeUpRequest {
 pub struct InitializationRunRequest {
     pub environment_id: Uuid,
     pub tasks: Vec<InitializationTask>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreparationRunRequest {
+    pub environment_id: Uuid,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -263,6 +270,30 @@ pub enum InitializationTaskStatus {
     Uncertain,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationTaskKind {
+    Dependencies,
+    Pods,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationTaskStatus {
+    Completed,
+    Failed,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreparationTaskSnapshot {
+    pub kind: PreparationTaskKind,
+    pub fingerprint: String,
+    pub attempts: u64,
+    pub status: PreparationTaskStatus,
+    pub diagnostic: Option<String>,
+}
+
 /// Inputs for a side-effect-free declarative plan preview. Secret values are
 /// intentionally absent: callers may only declare a reference as available.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -285,6 +316,7 @@ pub enum DaemonRequest {
     ComposeUp(ComposeUpRequest),
     MetroUp(MetroUpRequest),
     InitializationRun(InitializationRunRequest),
+    PreparationRun(PreparationRunRequest),
     BindingApply(BindingApplyRequest),
     IosSimulatorAcquire(IosSimulatorAcquireRequest),
     IosSimulatorAction(IosSimulatorActionRequest),
@@ -339,6 +371,7 @@ pub enum DaemonResponse {
     Plugin(PluginSnapshot),
     Plugins(Vec<PluginSnapshot>),
     InitializationTasks(Vec<InitializationTaskSnapshot>),
+    PreparationTasks(Vec<PreparationTaskSnapshot>),
     Bindings(Vec<BindingSnapshot>),
     IosSimulator(IosSimulatorSnapshot),
 }
@@ -429,6 +462,7 @@ pub struct EnvironmentSnapshot {
     pub endpoints: Vec<EndpointSnapshot>,
     pub initialization_ready: bool,
     pub initialization_tasks: Vec<InitializationTaskSnapshot>,
+    pub preparation_tasks: Vec<PreparationTaskSnapshot>,
     pub bindings: Vec<BindingSnapshot>,
     pub ios_simulator: Option<IosSimulatorSnapshot>,
 }
@@ -630,6 +664,7 @@ pub enum SupervisorRequest {
         operation_id: Uuid,
         plugin_id: String,
         action: PluginAction,
+        timeout_seconds: Option<u64>,
     },
 }
 
@@ -638,8 +673,9 @@ pub enum SupervisorRequest {
 pub enum SupervisorResponse {
     Process(ProcessSnapshot),
     TaskCompleted,
-    TaskFailed,
-    TaskOutput { stdout: String },
+    TaskFailed { stdout: String, stderr: String },
+    TaskTimedOut,
+    TaskOutput { stdout: String, stderr: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

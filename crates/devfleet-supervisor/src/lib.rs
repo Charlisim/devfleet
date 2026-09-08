@@ -272,7 +272,14 @@ fn handle_control(
             operation_id,
             plugin_id,
             action,
-        } => run_plugin_task(task_plugins, operation_id, &plugin_id, action)?,
+            timeout_seconds,
+        } => run_plugin_task(
+            task_plugins,
+            operation_id,
+            &plugin_id,
+            action,
+            timeout_seconds,
+        )?,
     };
     let rpc = JsonRpcResponse::success(request.id, &response);
     stream.write_all(&write_json_line(&rpc)?)?;
@@ -285,6 +292,7 @@ fn run_plugin_task(
     operation_id: Uuid,
     plugin_id: &str,
     action: PluginAction,
+    timeout_seconds: Option<u64>,
 ) -> anyhow::Result<SupervisorResponse> {
     let PluginAction::Action {
         name: capability, ..
@@ -307,22 +315,71 @@ fn run_plugin_task(
         .argv
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("provider returned an empty argv"))?;
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .current_dir(&request.cwd)
         .env_clear()
         .envs(&request.environment)
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .with_context(|| format!("run supervised plugin task in {}", request.cwd))?;
-    if !output.status.success() || output.stdout.len() > devfleet_protocol::MAX_FRAME_BYTES {
-        return Ok(SupervisorResponse::TaskFailed);
+        .stderr(Stdio::piped());
+    let output = if let Some(seconds) = timeout_seconds {
+        run_task_with_deadline(command, seconds, &request.cwd)?
+    } else {
+        Some(
+            command
+                .output()
+                .with_context(|| format!("run supervised plugin task in {}", request.cwd))?,
+        )
+    };
+    let Some(output) = output else {
+        return Ok(SupervisorResponse::TaskTimedOut);
+    };
+    if output.stdout.len().saturating_add(output.stderr.len()) > devfleet_protocol::MAX_FRAME_BYTES
+    {
+        return Ok(SupervisorResponse::TaskFailed {
+            stdout: String::new(),
+            stderr: "supervised task output exceeds the protocol frame limit".into(),
+        });
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| anyhow::anyhow!("supervised task output is not UTF-8"))?;
-    Ok(SupervisorResponse::TaskOutput { stdout })
+    let stderr = String::from_utf8(output.stderr)
+        .map_err(|_| anyhow::anyhow!("supervised task error output is not UTF-8"))?;
+    if !output.status.success() {
+        return Ok(SupervisorResponse::TaskFailed { stdout, stderr });
+    }
+    Ok(SupervisorResponse::TaskOutput { stdout, stderr })
+}
+
+fn run_task_with_deadline(
+    mut command: Command,
+    timeout_seconds: u64,
+    cwd: &str,
+) -> anyhow::Result<Option<std::process::Output>> {
+    if timeout_seconds == 0 {
+        anyhow::bail!("supervised plugin task deadline must be nonzero");
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("run supervised plugin task in {cwd}"))?;
+    let started = SystemTime::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output().map(Some).map_err(Into::into);
+        }
+        if started.elapsed()? >= Duration::from_secs(timeout_seconds) {
+            if let Ok(process_group) = i32::try_from(child.id()) {
+                let _ = signal_group(process_group, Signal::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
 }
 
 fn run_task(
@@ -353,7 +410,10 @@ fn run_task(
     Ok(if status.success() {
         SupervisorResponse::TaskCompleted
     } else {
-        SupervisorResponse::TaskFailed
+        SupervisorResponse::TaskFailed {
+            stdout: String::new(),
+            stderr: String::new(),
+        }
     })
 }
 
@@ -402,5 +462,21 @@ fn wait_for_exit(child: &mut Child, deadline: Duration) -> anyhow::Result<bool> 
             return Ok(false);
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deadline_reaps_the_owned_task_process() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("2");
+        let started = SystemTime::now();
+        let output =
+            run_task_with_deadline(command, 1, "/tmp").expect("task deadline handles sleep");
+        assert!(output.is_none());
+        assert!(started.elapsed().expect("monotonic clock") < Duration::from_secs(2));
     }
 }

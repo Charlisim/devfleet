@@ -4,7 +4,8 @@ use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
     DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
     InitializationTask, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
-    MetroUpRequest, PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
+    MetroUpRequest, PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest,
+    ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -43,6 +44,7 @@ enum Command {
     Compose(ComposeArgs),
     Metro(MetroArgs),
     Initialize(InitializeArgs),
+    Prepare(PrepareArgs),
     Bindings(BindingsArgs),
     Ios(IosArgs),
     Plugin(PluginArgs),
@@ -88,6 +90,21 @@ enum IosCommand {
 struct InitializeArgs {
     #[command(subcommand)]
     command: InitializeCommand,
+}
+
+#[derive(ClapArgs)]
+struct PrepareArgs {
+    #[command(subcommand)]
+    command: PrepareCommand,
+}
+
+#[derive(Subcommand)]
+enum PrepareCommand {
+    Run {
+        environment_id: Uuid,
+        #[arg(long, default_value_t = PREPARATION_DEFAULT_TIMEOUT_SECONDS)]
+        timeout_seconds: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -468,6 +485,15 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 tasks: serde_json::from_slice::<Vec<InitializationTask>>(&std::fs::read(file)?)?,
             })),
         },
+        Command::Prepare(preparation) => match preparation.command {
+            PrepareCommand::Run {
+                environment_id,
+                timeout_seconds,
+            } => Ok(DaemonRequest::PreparationRun(PreparationRunRequest {
+                environment_id,
+                timeout_seconds,
+            })),
+        },
         Command::Bindings(bindings) => match bindings.command {
             BindingsCommand::Apply { file } => {
                 Ok(DaemonRequest::BindingApply(serde_json::from_slice::<
@@ -710,6 +736,21 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                     task.id,
                     task.status,
                     task.rerun_policy,
+                    task.attempts,
+                    task.diagnostic
+                        .as_deref()
+                        .map_or_else(String::new, |diagnostic| format!(
+                            " diagnostic={diagnostic}"
+                        ))
+                );
+            }
+        }
+        DaemonResponse::PreparationTasks(tasks) => {
+            for task in tasks {
+                println!(
+                    "{:?} {:?} attempts={}{}",
+                    task.kind,
+                    task.status,
                     task.attempts,
                     task.diagnostic
                         .as_deref()

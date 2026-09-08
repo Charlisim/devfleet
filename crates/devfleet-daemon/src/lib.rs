@@ -15,14 +15,15 @@ use devfleet_protocol::{
     IosSimulatorAction, IosSimulatorActionRequest, IosSimulatorLifecycle, IosSimulatorSnapshot,
     JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
     MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
-    PluginReconcileRequest, PluginSnapshot, ProcessSnapshot, ReadinessState, RpcFailure,
+    PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
+    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ReadinessState, RpcFailure,
     SupervisorRequest, SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy,
     TrustedTaskPlugin, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
-    StoredInitializationTask, StoredIosDevice, StoredLifecycle, StoredOperation, StoredProcess,
-    StoredReadiness, VerifiedGitContext,
+    StoredInitializationTask, StoredIosDevice, StoredLifecycle, StoredOperation,
+    StoredPreparationTask, StoredProcess, StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -157,6 +158,7 @@ impl Daemon {
             DaemonRequest::ComposeUp(request) => self.compose_up(request),
             DaemonRequest::MetroUp(request) => self.metro_up(request),
             DaemonRequest::InitializationRun(request) => self.run_initialization(&request),
+            DaemonRequest::PreparationRun(request) => self.run_preparation(&request),
             DaemonRequest::BindingApply(request) => self.apply_bindings(request),
             DaemonRequest::IosSimulatorAcquire(request) => self.ios_simulator_acquire(&request),
             DaemonRequest::IosSimulatorAction(request) => self.ios_simulator_action(&request),
@@ -813,7 +815,7 @@ impl Daemon {
                         "initialization_task_completed",
                     )?;
                 }
-                SupervisorResponse::TaskFailed => {
+                SupervisorResponse::TaskFailed { .. } => {
                     let diagnostic = "task process exited unsuccessfully";
                     self.state
                         .fail_initialization_task(environment.id, &task.id, diagnostic)?;
@@ -825,7 +827,9 @@ impl Daemon {
                     )?;
                     return Err(DaemonError::Operation(format!("{}: {diagnostic}", task.id)));
                 }
-                SupervisorResponse::Process(_) | SupervisorResponse::TaskOutput { .. } => {
+                SupervisorResponse::Process(_)
+                | SupervisorResponse::TaskOutput { .. }
+                | SupervisorResponse::TaskTimedOut => {
                     return Err(DaemonError::Operation(
                         "supervisor returned a process response for an initialization task".into(),
                     ));
@@ -837,6 +841,142 @@ impl Daemon {
                 .initialization_tasks(environment.id)?
                 .into_iter()
                 .map(initialization_task_snapshot)
+                .collect(),
+        ))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_preparation(
+        &mut self,
+        request: &PreparationRunRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        if request.timeout_seconds == 0 || request.timeout_seconds > 3_600 {
+            return Err(DaemonError::InvalidConfig(
+                "preparation deadline must be between one second and one hour".into(),
+            ));
+        }
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment
+            .process
+            .clone()
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        if !matches!(
+            environment.lifecycle,
+            StoredLifecycle::Running | StoredLifecycle::Starting
+        ) {
+            return Err(DaemonError::Operation(
+                "preparation requires a running owned environment".into(),
+            ));
+        }
+        let prior = self
+            .state
+            .preparation_tasks(environment.id)?
+            .into_iter()
+            .map(|task| (task.kind.clone(), task))
+            .collect::<BTreeMap<_, _>>();
+        for (kind, capability) in [
+            (
+                PreparationTaskKind::Dependencies,
+                "preparation.dependencies",
+            ),
+            (PreparationTaskKind::Pods, "preparation.pods"),
+        ] {
+            let name = preparation_kind_name(kind);
+            let fingerprint = preparation_fingerprint(Path::new(&environment.worktree), kind)?;
+            if let Some(stored) = prior.get(name) {
+                if stored.status == "running" && stored.fingerprint == fingerprint {
+                    return Err(DaemonError::Operation(format!(
+                        "preparation task '{name}' has an uncertain prior outcome; inspect it before an explicit rerun"
+                    )));
+                }
+                if stored.status == "completed" && stored.fingerprint == fingerprint {
+                    self.emit_event(
+                        environment.id,
+                        environment.generation,
+                        None,
+                        "preparation_task_skipped",
+                    )?;
+                    continue;
+                }
+            }
+            let operation_id = Uuid::now_v7();
+            self.state
+                .record_preparation_intent(&StoredPreparationTask {
+                    environment_id: environment.id,
+                    kind: name.into(),
+                    fingerprint,
+                    attempts: 0,
+                    status: "running".into(),
+                    diagnostic: None,
+                })?;
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                Some(operation_id),
+                "preparation_task_running",
+            )?;
+            let response = request_supervisor(
+                Path::new(&process.supervisor_socket),
+                SupervisorRequest::RunPluginTask {
+                    operation_id,
+                    plugin_id: "official.react-native".into(),
+                    action: PluginAction::Action {
+                        name: capability.into(),
+                        input: serde_json::json!({
+                            "worktree": environment.worktree,
+                            "timeout_seconds": request.timeout_seconds,
+                        }),
+                    },
+                    timeout_seconds: Some(request.timeout_seconds),
+                },
+            )
+            .map_err(|error| match error {
+                DaemonError::Operation(message)
+                    if message.contains("requested plugin capability is not authorized") =>
+                {
+                    DaemonError::CapabilityUnsupported(capability.into())
+                }
+                error => error,
+            })?;
+            let diagnostic = match response {
+                SupervisorResponse::TaskOutput { stdout, stderr } => {
+                    self.append_preparation_log(environment.id, name, &stdout, &stderr)?;
+                    None
+                }
+                SupervisorResponse::TaskCompleted => {
+                    Some("supervisor returned a generic task response")
+                }
+                SupervisorResponse::TaskFailed { stdout, stderr } => {
+                    self.append_preparation_log(environment.id, name, &stdout, &stderr)?;
+                    Some("task process exited unsuccessfully")
+                }
+                SupervisorResponse::TaskTimedOut => Some("task deadline exceeded"),
+                SupervisorResponse::Process(_) => Some("supervisor returned a process response"),
+            };
+            self.state
+                .finish_preparation_task(environment.id, name, diagnostic)?;
+            self.emit_event(
+                environment.id,
+                environment.generation,
+                Some(operation_id),
+                if diagnostic.is_some() {
+                    "preparation_task_failed"
+                } else {
+                    "preparation_task_completed"
+                },
+            )?;
+            if let Some(diagnostic) = diagnostic {
+                return Err(DaemonError::Operation(format!("{name}: {diagnostic}")));
+            }
+        }
+        Ok(DaemonResponse::PreparationTasks(
+            self.state
+                .preparation_tasks(environment.id)?
+                .into_iter()
+                .map(preparation_task_snapshot)
                 .collect(),
         ))
     }
@@ -1014,6 +1154,7 @@ impl Daemon {
                     name: capability.into(),
                     input,
                 },
+                timeout_seconds: None,
             },
         )
         .map_err(|error| match error {
@@ -1025,13 +1166,15 @@ impl Daemon {
             error => error,
         })?;
         match response {
-            SupervisorResponse::TaskOutput { stdout } => Ok(stdout),
-            SupervisorResponse::TaskFailed => {
+            SupervisorResponse::TaskOutput { stdout, .. } => Ok(stdout),
+            SupervisorResponse::TaskFailed { .. } => {
                 Err(DaemonError::DeviceUnavailable(capability.into()))
             }
-            SupervisorResponse::TaskCompleted | SupervisorResponse::Process(_) => Err(
-                DaemonError::Operation("supervisor returned an invalid iOS task response".into()),
-            ),
+            SupervisorResponse::TaskCompleted
+            | SupervisorResponse::TaskTimedOut
+            | SupervisorResponse::Process(_) => Err(DaemonError::Operation(
+                "supervisor returned an invalid iOS task response".into(),
+            )),
         }
     }
 
@@ -1106,11 +1249,13 @@ impl Daemon {
             .environment(environment_id)?
             .ok_or(DaemonError::NotFound)?;
         let tasks = self.state.initialization_tasks(environment_id)?;
+        let preparation = self.state.preparation_tasks(environment_id)?;
         let bindings = self.state.bindings(environment_id)?;
         let ios = self.state.ios_device(environment_id)?;
         Ok(DaemonResponse::Environment(snapshot(
             environment,
             tasks,
+            preparation,
             bindings,
             ios,
         )))
@@ -1123,9 +1268,10 @@ impl Daemon {
             .into_iter()
             .map(|environment| {
                 let tasks = self.state.initialization_tasks(environment.id)?;
+                let preparation = self.state.preparation_tasks(environment.id)?;
                 let bindings = self.state.bindings(environment.id)?;
                 let ios = self.state.ios_device(environment.id)?;
-                Ok::<_, DaemonError>(snapshot(environment, tasks, bindings, ios))
+                Ok::<_, DaemonError>(snapshot(environment, tasks, preparation, bindings, ios))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DaemonResponse::Environments(environments))
@@ -1262,6 +1408,27 @@ impl Daemon {
         Ok(())
     }
 
+    fn append_preparation_log(
+        &self,
+        environment_id: Uuid,
+        kind: &str,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<(), DaemonError> {
+        let logs = LogStore::new(
+            log_directory(&self.config.state_dir, environment_id),
+            MAX_RESOURCE_LOG_BYTES,
+            Vec::new(),
+        )
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let resource = format!("preparation-{kind}");
+        for line in stdout.lines().chain(stderr.lines()) {
+            logs.append(&resource, line)
+                .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn start_supervisor(
         &self,
         control_socket: &Path,
@@ -1342,13 +1509,16 @@ impl Daemon {
         self.state
             .plugins()?
             .into_iter()
-            .filter(|plugin| plugin.trusted && plugin.id == "official.ios")
+            .filter(|plugin| {
+                plugin.trusted
+                    && matches!(plugin.id.as_str(), "official.ios" | "official.react-native")
+            })
             .map(|plugin| {
                 self.verify_plugin_lock(&plugin)?;
                 let inspected = inspect_plugin(Path::new(&plugin.path))?;
                 if !same_plugin_metadata(&plugin, &inspected) {
                     return Err(DaemonError::InvalidConfig(
-                        "installed official.ios descriptor or checksum no longer matches its lockfile"
+                        "installed task-provider descriptor or checksum no longer matches its lockfile"
                             .into(),
                     ));
                 }
@@ -1858,9 +2028,66 @@ fn initialization_task_snapshot(task: StoredInitializationTask) -> Initializatio
     }
 }
 
+fn preparation_task_snapshot(task: StoredPreparationTask) -> PreparationTaskSnapshot {
+    let kind = match task.kind.as_str() {
+        "dependencies" => PreparationTaskKind::Dependencies,
+        _ => PreparationTaskKind::Pods,
+    };
+    let status = match task.status.as_str() {
+        "completed" => PreparationTaskStatus::Completed,
+        "failed" => PreparationTaskStatus::Failed,
+        _ => PreparationTaskStatus::Uncertain,
+    };
+    PreparationTaskSnapshot {
+        kind,
+        fingerprint: task.fingerprint,
+        attempts: task.attempts,
+        status,
+        diagnostic: task.diagnostic,
+    }
+}
+
+fn preparation_kind_name(kind: PreparationTaskKind) -> &'static str {
+    match kind {
+        PreparationTaskKind::Dependencies => "dependencies",
+        PreparationTaskKind::Pods => "pods",
+    }
+}
+
+fn preparation_fingerprint(
+    worktree: &Path,
+    kind: PreparationTaskKind,
+) -> Result<String, DaemonError> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(preparation_kind_name(kind).as_bytes());
+    let paths = match kind {
+        PreparationTaskKind::Dependencies => vec![worktree.join("package-lock.json")],
+        PreparationTaskKind::Pods => {
+            let ios = worktree.join("ios");
+            let lockfile = ios.join("Podfile.lock");
+            vec![ios.join("Podfile"), lockfile]
+        }
+    };
+    for path in paths {
+        if path.file_name().is_some_and(|name| name == "Podfile.lock") && !path.exists() {
+            continue;
+        }
+        let content = fs::read(&path).map_err(|_| {
+            DaemonError::InvalidConfig(format!(
+                "preparation input is missing or unreadable: {}",
+                path.display()
+            ))
+        })?;
+        bytes.extend_from_slice(path.to_string_lossy().as_bytes());
+        bytes.extend_from_slice(&content);
+    }
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn snapshot(
     environment: StoredEnvironment,
     tasks: Vec<StoredInitializationTask>,
+    preparation: Vec<StoredPreparationTask>,
     bindings: Vec<StoredBinding>,
     ios: Option<StoredIosDevice>,
 ) -> EnvironmentSnapshot {
@@ -1916,6 +2143,10 @@ fn snapshot(
         initialization_tasks: tasks
             .into_iter()
             .map(initialization_task_snapshot)
+            .collect(),
+        preparation_tasks: preparation
+            .into_iter()
+            .map(preparation_task_snapshot)
             .collect(),
         bindings: bindings.into_iter().map(binding_snapshot).collect(),
         ios_simulator: ios.and_then(|device| ios_snapshot(device).ok()),
@@ -2312,7 +2543,8 @@ fn supervisor_process(response: SupervisorResponse) -> Result<ProcessSnapshot, D
     match response {
         SupervisorResponse::Process(process) => Ok(process),
         SupervisorResponse::TaskCompleted
-        | SupervisorResponse::TaskFailed
+        | SupervisorResponse::TaskFailed { .. }
+        | SupervisorResponse::TaskTimedOut
         | SupervisorResponse::TaskOutput { .. } => Err(DaemonError::Operation(
             "supervisor returned a task response for process control".into(),
         )),
@@ -2347,6 +2579,30 @@ mod tests {
         assert!(!socket.exists());
         remove_supervisor_socket(socket.to_str().expect("UTF-8 socket path"))
             .expect("missing socket cleanup");
+    }
+
+    #[test]
+    fn preparation_fingerprint_changes_only_with_its_declared_inputs() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let ios = temporary.path().join("ios");
+        fs::create_dir_all(&ios).expect("iOS directory");
+        fs::write(temporary.path().join("package-lock.json"), "first").expect("lockfile");
+        fs::write(ios.join("Podfile"), "platform :ios, '18.0'").expect("Podfile");
+        let first = preparation_fingerprint(temporary.path(), PreparationTaskKind::Dependencies)
+            .expect("first fingerprint");
+        let pods = preparation_fingerprint(temporary.path(), PreparationTaskKind::Pods)
+            .expect("pods fingerprint");
+        fs::write(temporary.path().join("package-lock.json"), "second").expect("lockfile");
+        assert_ne!(
+            first,
+            preparation_fingerprint(temporary.path(), PreparationTaskKind::Dependencies)
+                .expect("changed fingerprint")
+        );
+        assert_eq!(
+            pods,
+            preparation_fingerprint(temporary.path(), PreparationTaskKind::Pods)
+                .expect("unrelated input does not affect Pods")
+        );
     }
 
     #[test]

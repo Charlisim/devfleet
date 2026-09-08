@@ -45,24 +45,19 @@ impl Provider for ReactNativeProvider {
                 "preparation requires a worktree and nonzero deadline".into(),
             ));
         }
-        let argv = match name.as_str() {
+        let (argv, cwd) = match name.as_str() {
             "preparation.dependencies" => {
                 require_file(&worktree.join("package-lock.json"), "package-lock.json")?;
                 reject_symlink(&worktree.join("node_modules"))?;
-                vec![npm()?, "ci".into()]
+                (vec![npm()?, "ci".into()], worktree.clone())
             }
             "preparation.pods" => {
                 let ios = worktree.join("ios");
                 require_file(&ios.join("Podfile"), "ios/Podfile")?;
                 reject_symlink(&ios.join("Pods"))?;
-                vec![pod()?, "install".into(), "--deployment".into()]
+                (vec![pod()?, "install".into(), "--deployment".into()], ios)
             }
             _ => return Err(PluginError::UnsupportedMethod(name)),
-        };
-        let cwd = if argv.len() == 3 {
-            worktree.join("ios")
-        } else {
-            worktree
         };
         serde_json::to_value(HostSpawnRequest {
             argv,
@@ -88,16 +83,15 @@ fn require_file(path: &Path, name: &str) -> Result<(), PluginError> {
     })
 }
 fn reject_symlink(path: &Path) -> Result<(), PluginError> {
-    if path.exists()
-        && path
-            .symlink_metadata()
-            .map_err(|error| PluginError::RequestFailed(error.to_string()))?
-            .file_type()
-            .is_symlink()
-    {
-        return Err(PluginError::RequestFailed(
-            "PREPARATION_INVALID: mutable dependency output is a symlink".into(),
-        ));
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(PluginError::RequestFailed(
+                "PREPARATION_INVALID: mutable dependency output is a symlink".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(PluginError::RequestFailed(error.to_string())),
     }
     Ok(())
 }
@@ -151,4 +145,17 @@ fn main() -> anyhow::Result<()> {
 }
 fn current_platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_a_broken_symlink_for_mutable_dependencies() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let link = temporary.path().join("node_modules");
+        std::os::unix::fs::symlink("missing-target", &link).expect("broken symlink");
+        assert!(reject_symlink(&link).is_err());
+    }
 }
