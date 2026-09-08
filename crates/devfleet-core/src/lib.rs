@@ -11,6 +11,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod execution;
+pub mod logs;
 pub mod plan;
 pub mod ports;
 
@@ -19,6 +20,7 @@ pub use execution::{
     ExecutionResult, GraphProvider, NodeOwnership, NodeResult, OperationCoordinator,
     OperationDisposition,
 };
+pub use logs::{LogError, LogStore};
 pub use plan::{
     DependencyEdge, DependencyKind, EffectivePlan, PlanOptions, PlannedResource, compile_document,
     compile_manifest,
