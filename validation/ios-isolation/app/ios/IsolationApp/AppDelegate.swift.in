@@ -1,0 +1,47 @@
+import UIKit
+import React
+import React_RCTAppDelegate
+import ReactAppDependencyProvider
+
+#if !DEBUG
+#error("This feasibility fixture must never be distributed.")
+#endif
+
+@main
+class AppDelegate: UIResponder, UIApplicationDelegate {
+  var window: UIWindow?
+  var reactNativeFactory: RCTReactNativeFactory?
+  var reactNativeDelegate: ReactNativeDelegate?
+
+  func application(
+    _ application: UIApplication,
+    didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
+  ) -> Bool {
+    let delegate = ReactNativeDelegate()
+    delegate.dependencyProvider = RCTAppDependencyProvider()
+    let factory = RCTReactNativeFactory(delegate: delegate)
+    reactNativeDelegate = delegate
+    reactNativeFactory = factory
+    window = UIWindow(frame: UIScreen.main.bounds)
+    factory.startReactNative(
+      withModuleName: "IsolationApp",
+      in: window,
+      initialProperties: [
+        "nativeEnvironment": "@@ENVIRONMENT@@",
+        "buildId": "@@BUILD@@",
+        "backendUrl": "http://127.0.0.1:@@BACKEND@@/identity",
+        "reportUrl": "http://127.0.0.1:@@REPORT@@/report",
+        "nonce": ProcessInfo.processInfo.environment["FLEET_NONCE"] ?? "missing"
+      ],
+      launchOptions: launchOptions
+    )
+    return true
+  }
+}
+
+class ReactNativeDelegate: RCTDefaultReactNativeFactoryDelegate {
+  override func sourceURL(for bridge: RCTBridge) -> URL? { bundleURL() }
+  override func bundleURL() -> URL? {
+    URL(string: "http://127.0.0.1:@@METRO@@/index.bundle?platform=ios&dev=true&minify=false")
+  }
+}

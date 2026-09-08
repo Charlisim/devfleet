@@ -1,0 +1,12 @@
+.scratch/
+target/
+node_modules/
+.DS_Store
+validation/ios-isolation/app/ios/Pods/
+validation/ios-isolation/app/ios/build/
+validation/ios-isolation/app/ios/.xcode.env*
+validation/ios-isolation/app/ios/IsolationApp/AppDelegate.swift
+validation/ios-isolation/app/fixture.json
+validation/ios-isolation/app/revision.json
+validation/ios-isolation/app/.metro-cache/
+validation/ios-isolation/app/ios/IsolationApp.xcworkspace/
