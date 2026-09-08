@@ -1,0 +1,4 @@
+interface:
+  display_name: "DevFleet"
+  short_description: "Opera entornos locales de worktrees Git"
+  default_prompt: "Usa $devfleet para preparar y diagnosticar este worktree Git."
