@@ -1,6 +1,11 @@
 //! Stable, serializable contracts at the `DevFleet` process boundary.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+use std::{
+    collections::BTreeMap,
+    io::{BufRead, Read},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -27,6 +32,180 @@ pub struct RequestContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcRequest {
+    pub jsonrpc: String,
+    pub id: Uuid,
+    pub method: String,
+    pub params: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JsonRpcResponse {
+    pub jsonrpc: String,
+    pub id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcFailure>,
+}
+
+impl JsonRpcResponse {
+    /// Creates a successful JSON-RPC response from a serializable protocol DTO.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a DevFleet-owned DTO violates its `Serialize` contract.
+    #[must_use]
+    pub fn success<T: Serialize>(id: Uuid, result: &T) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: Some(serde_json::to_value(result).expect("serializable protocol DTO")),
+            error: None,
+        }
+    }
+
+    #[must_use]
+    pub fn failure(id: Uuid, error: RpcFailure) -> Self {
+        Self {
+            jsonrpc: "2.0".into(),
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RpcFailure {
+    pub code: ErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    ConfigInvalid,
+    PermissionDenied,
+    ProtocolInvalid,
+    ProtocolIncompatible,
+    ResourceNotFound,
+    OperationFailed,
+    OperationCancelled,
+    OwnershipUncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProcessSpec {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentUpRequest {
+    pub key: String,
+    pub worktree: String,
+    pub profile: String,
+    pub trusted: bool,
+    pub process: ProcessSpec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "command", content = "arguments", rename_all = "snake_case")]
+pub enum DaemonRequest {
+    Up(EnvironmentUpRequest),
+    Status { environment_id: Uuid },
+    List,
+    Stop { environment_id: Uuid },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum DaemonResponse {
+    Accepted(OperationAccepted),
+    Environment(EnvironmentSnapshot),
+    Environments(Vec<EnvironmentSnapshot>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationAccepted {
+    pub operation_id: Uuid,
+    pub environment_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EnvironmentSnapshot {
+    pub environment_id: Uuid,
+    pub key: String,
+    pub worktree: String,
+    pub profile: String,
+    pub generation: u64,
+    pub lifecycle: LifecycleState,
+    pub process: Option<ProcessSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    pub process_group: i32,
+    pub started_at_unix_ms: u128,
+    pub supervisor_socket: String,
+    pub readiness: ReadinessState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    Starting,
+    Running,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessState {
+    ProcessAlive,
+    ProcessStopped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PluginReconcileRequest {
+    pub protocol: ProtocolVersion,
+    pub operation_id: Uuid,
+    pub process: ProcessSpec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostSpawnRequest {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SupervisorStartRequest {
+    pub environment_id: Uuid,
+    pub operation_id: Uuid,
+    pub process: ProcessSpec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "command", content = "arguments", rename_all = "snake_case")]
+pub enum SupervisorRequest {
+    Inspect,
+    Stop,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum SupervisorResponse {
+    Process(ProcessSnapshot),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SmokeResponse {
     pub component: String,
     pub protocol: ProtocolVersion,
@@ -48,6 +227,10 @@ pub enum ProtocolError {
     FrameTooLarge,
     #[error("invalid JSON-RPC frame")]
     InvalidFrame,
+    #[error("JSON-RPC frame must end in one newline")]
+    MissingFrameTerminator,
+    #[error("JSON-RPC payload does not match the expected DTO")]
+    InvalidPayload,
 }
 
 /// Validates the framing limits before JSON-RPC parsing.
@@ -63,6 +246,39 @@ pub fn validate_frame(frame: &[u8]) -> Result<(), ProtocolError> {
         return Err(ProtocolError::InvalidFrame);
     }
     Ok(())
+}
+
+/// Reads a bounded single-line JSON-RPC frame and deserializes its payload.
+///
+/// # Errors
+///
+/// Returns an error for oversized, unterminated, invalid UTF-8, or invalid JSON
+/// frames.
+pub fn read_json_line<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<T, ProtocolError> {
+    let mut frame = Vec::new();
+    reader
+        .by_ref()
+        .take((MAX_FRAME_BYTES + 1) as u64)
+        .read_until(b'\n', &mut frame)
+        .map_err(|_| ProtocolError::InvalidFrame)?;
+    validate_frame(&frame)?;
+    if !frame.ends_with(b"\n") {
+        return Err(ProtocolError::MissingFrameTerminator);
+    }
+    serde_json::from_slice(&frame).map_err(|_| ProtocolError::InvalidPayload)
+}
+
+/// Serializes a DTO as one bounded JSON-RPC line.
+///
+/// # Errors
+///
+/// Returns an error if the serialized representation exceeds the protocol frame
+/// limit.
+pub fn write_json_line<T: Serialize>(value: &T) -> Result<Vec<u8>, ProtocolError> {
+    let mut frame = serde_json::to_vec(value).map_err(|_| ProtocolError::InvalidPayload)?;
+    frame.push(b'\n');
+    validate_frame(&frame)?;
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -81,5 +297,12 @@ mod tests {
     fn requires_matching_major_protocol_version() {
         assert!(PROTOCOL_VERSION.compatible_with(ProtocolVersion { major: 1, minor: 5 }));
         assert!(!PROTOCOL_VERSION.compatible_with(ProtocolVersion { major: 2, minor: 0 }));
+    }
+
+    #[test]
+    fn rejects_an_unterminated_frame() {
+        let mut input = std::io::Cursor::new(b"{}".to_vec());
+        let result = read_json_line::<Value>(&mut input);
+        assert_eq!(result, Err(ProtocolError::MissingFrameTerminator));
     }
 }

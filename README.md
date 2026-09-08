@@ -15,9 +15,40 @@ cargo test --workspace
 ```
 
 The workspace uses Rust 1.98.0. `devfleet`, `devfleetd` and
-`devfleet-supervisor` currently expose smoke-only entry points while the
-supervised-process vertical slice is implemented. They do not yet claim to
-manage an environment.
+`devfleet-supervisor` now support the first local-process vertical slice. The
+remaining v0.1 providers and lifecycle operations are still being implemented.
+
+## Supervised local-process fixture
+
+Start the daemon with explicit release-installed supervisor and process-plugin
+paths. The state directory and socket parent must be private user-owned
+directories; the socket must be short enough for Unix-domain socket limits.
+
+```sh
+devfleetd --serve \
+  --state-dir /tmp/devfleet-state \
+  --socket /tmp/df-$(id -u)/daemon.sock \
+  --supervisor "$(dirname "$(command -v devfleetd)")/devfleet-supervisor" \
+  --process-plugin "$(dirname "$(command -v devfleetd)")/devfleet-plugin-process"
+```
+
+In another terminal, execute an explicitly trusted fixture with a fully
+specified program, working directory and environment. The command must follow
+`--`; it is passed as argv and never interpolated by a shell.
+
+```sh
+devfleet --socket /tmp/df-$(id -u)/daemon.sock --json up \
+  --trust --key fixture --worktree "$PWD" --cwd "$PWD" \
+  -- /bin/sleep 60
+```
+
+Use `status`, `list` and `stop <environment-id>` with the same socket. The
+supervisor clears inherited process environment, owns a new process group and
+uses SIGINT, SIGTERM and SIGKILL only for that owned group. `stop` retains the
+environment, operation and process identity in SQLite. Local peer UID checks,
+0600 sockets, a 0700 state directory, a single writer lock and 1 MiB JSON-RPC
+frames protect this bounded slice. Plugins are trusted native code; these
+controls are not an OS sandbox.
 
 ## Component boundaries
 

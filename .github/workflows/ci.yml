@@ -18,6 +18,7 @@ jobs:
           components: clippy,rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace --locked
       - run: cargo test --workspace --locked
       - run: ./scripts/check-boundaries.sh
       - uses: rustsec/audit-check@v2.0.0

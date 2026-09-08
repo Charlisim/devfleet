@@ -18,5 +18,9 @@ devfleet-protocol = { path = "../../crates/devfleet-protocol" }
 semver.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+devfleet-plugin-sdk = { path = "../../crates/devfleet-plugin-sdk" }
+uuid.workspace = true
+
 [lints]
 workspace = true
