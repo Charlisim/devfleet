@@ -1,0 +1,25 @@
+[package]
+name = "devfleet-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "devfleetd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+devfleet-core = { path = "../devfleet-core" }
+devfleet-protocol = { path = "../devfleet-protocol" }
+devfleet-state = { path = "../devfleet-state" }
+serde_json.workspace = true
+
+[dev-dependencies]
+devfleet-testkit = { path = "../devfleet-testkit" }
+
+[lints]
+workspace = true

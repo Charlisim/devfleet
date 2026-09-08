@@ -1,0 +1,16 @@
+[package]
+name = "devfleet-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+devfleet-protocol = { path = "../devfleet-protocol" }
+semver.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
