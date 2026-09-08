@@ -10,11 +10,15 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod bindings;
 pub mod execution;
 pub mod logs;
 pub mod plan;
 pub mod ports;
 
+pub use bindings::{
+    BindingContract, BindingError, BindingIntegration, BindingPhase, Invalidation, resolve_bindings,
+};
 pub use execution::{
     ExecutionContext, ExecutionError, ExecutionJournal, ExecutionNode, ExecutionPlan,
     ExecutionResult, GraphProvider, NodeOwnership, NodeResult, OperationCoordinator,

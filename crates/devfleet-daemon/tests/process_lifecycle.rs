@@ -1,9 +1,11 @@
 use devfleet_cli::request;
 use devfleet_protocol::{
-    DaemonRequest, DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest,
-    InitializationRunRequest, InitializationTask, InitializationTaskKind, LifecycleState,
-    ProcessSpec, ReadinessState, TaskRerunPolicy,
+    BindingApplyRequest, BindingIntegration, BindingInvalidation, BindingPhase, DaemonRequest,
+    DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
+    InitializationTask, InitializationTaskKind, LifecycleState, ProcessSpec, ReadinessState,
+    TaskRerunPolicy,
 };
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeMap,
     fs,
@@ -28,6 +30,128 @@ impl Drop for DaemonFixture {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bindings_write_private_phase_artifacts_and_expose_only_public_metadata() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let environment = up_environment(&fixture.socket, temporary.path(), "bindings");
+    for (phase, integration, invalidation) in [
+        (
+            BindingPhase::Process,
+            BindingIntegration::ProcessEnvironment,
+            BindingInvalidation::Restart,
+        ),
+        (
+            BindingPhase::Bundle,
+            BindingIntegration::BundleConfig,
+            BindingInvalidation::Reload,
+        ),
+        (
+            BindingPhase::NativeBuild,
+            BindingIntegration::NativeBuildSettings,
+            BindingInvalidation::Rebuild,
+        ),
+        (
+            BindingPhase::Runtime,
+            BindingIntegration::RuntimeConfiguration,
+            BindingInvalidation::Reconnect,
+        ),
+    ] {
+        let response = request(
+            &fixture.socket,
+            DaemonRequest::BindingApply(BindingApplyRequest {
+                environment_id: environment,
+                phase,
+                integration,
+                public_values: BTreeMap::from([("APP_PUBLIC_FEATURE".into(), "enabled".into())]),
+                backend_only_values: if phase == BindingPhase::Runtime {
+                    BTreeMap::from([("DATABASE_PASSWORD".into(), "private".into())])
+                } else {
+                    BTreeMap::new()
+                },
+                reserved_endpoints: BTreeMap::from([(
+                    "APP_PUBLIC_API_URL".into(),
+                    "http://127.0.0.1:20001".into(),
+                )]),
+            }),
+        )
+        .expect("binding applies");
+        let DaemonResponse::Bindings(bindings) = response else {
+            panic!("expected bindings");
+        };
+        assert!(
+            bindings
+                .iter()
+                .any(|binding| binding.phase == phase && binding.invalidation == invalidation)
+        );
+    }
+    let private = fixture
+        .state_dir
+        .join("bindings")
+        .join(environment.to_string())
+        .join("runtime.json");
+    assert_eq!(
+        fs::metadata(&private)
+            .expect("private metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(
+        fs::read_to_string(&private)
+            .expect("private artifact")
+            .contains("private")
+    );
+    let DaemonResponse::Environment(status) = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: environment,
+        },
+    )
+    .expect("status") else {
+        panic!("expected status");
+    };
+    assert_eq!(status.bindings.len(), 4);
+    assert!(
+        status
+            .bindings
+            .iter()
+            .all(|binding| !binding.public_values.contains_key("DATABASE_PASSWORD"))
+    );
+    assert!(
+        request(
+            &fixture.socket,
+            DaemonRequest::BindingApply(BindingApplyRequest {
+                environment_id: environment,
+                phase: BindingPhase::Bundle,
+                integration: BindingIntegration::RuntimeConfiguration,
+                public_values: BTreeMap::new(),
+                backend_only_values: BTreeMap::new(),
+                reserved_endpoints: BTreeMap::new(),
+            })
+        )
+        .is_err()
+    );
+    assert!(
+        request(
+            &fixture.socket,
+            DaemonRequest::BindingApply(BindingApplyRequest {
+                environment_id: environment,
+                phase: BindingPhase::Runtime,
+                integration: BindingIntegration::RuntimeConfiguration,
+                public_values: BTreeMap::from([("APP_PUBLIC_API_URL".into(), "wrong".into())]),
+                backend_only_values: BTreeMap::new(),
+                reserved_endpoints: BTreeMap::from([("APP_PUBLIC_API_URL".into(), "right".into())]),
+            })
+        )
+        .is_err()
+    );
+    stop(&fixture.socket, environment);
 }
 
 #[test]

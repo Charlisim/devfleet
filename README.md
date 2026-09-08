@@ -75,6 +75,17 @@ Completed `never` tasks are retained and skipped on retry. A task left running
 when the daemon loses its reply is shown as uncertain and is never retried
 automatically. No inverse migration or data deletion is performed.
 
+## Phase bindings
+
+Apply an explicit `BindingApplyRequest` JSON document with `devfleet bindings
+apply --file bindings.json`. It selects one matching phase/integration pair:
+`process`/`process_environment`, `bundle`/`bundle_config`,
+`native_build`/`native_build_settings`, or `runtime`/`runtime_configuration`.
+Public keys use the `APP_PUBLIC_` prefix. Reserved endpoints apply last and
+cannot be overridden. The daemon stores generated values in a private
+per-environment artifact and exposes only public values, fingerprints, and the
+restart/reload/rebuild/reconnect decision through status.
+
 Before startup, the provider asks Docker for the effective merged JSON model.
 It requires project-scoped names, loopback-only endpoint publications, and
 private mutable storage. Built services need a project-specific image tag or

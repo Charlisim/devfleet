@@ -132,6 +132,52 @@ pub struct InitializationRunRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BindingApplyRequest {
+    pub environment_id: Uuid,
+    pub phase: BindingPhase,
+    pub integration: BindingIntegration,
+    pub public_values: BTreeMap<String, String>,
+    pub backend_only_values: BTreeMap<String, String>,
+    pub reserved_endpoints: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingPhase {
+    Process,
+    Bundle,
+    NativeBuild,
+    Runtime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingIntegration {
+    ProcessEnvironment,
+    BundleConfig,
+    NativeBuildSettings,
+    RuntimeConfiguration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingInvalidation {
+    Restart,
+    Reload,
+    Rebuild,
+    Reconnect,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BindingSnapshot {
+    pub phase: BindingPhase,
+    pub integration: BindingIntegration,
+    pub fingerprint: String,
+    pub invalidation: BindingInvalidation,
+    pub public_values: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InitializationTask {
     pub id: String,
     pub kind: InitializationTaskKind,
@@ -196,6 +242,7 @@ pub enum DaemonRequest {
     Up(EnvironmentUpRequest),
     ComposeUp(ComposeUpRequest),
     InitializationRun(InitializationRunRequest),
+    BindingApply(BindingApplyRequest),
     Status {
         environment_id: Uuid,
     },
@@ -246,6 +293,7 @@ pub enum DaemonResponse {
     Plugin(PluginSnapshot),
     Plugins(Vec<PluginSnapshot>),
     InitializationTasks(Vec<InitializationTaskSnapshot>),
+    Bindings(Vec<BindingSnapshot>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -297,6 +345,7 @@ pub struct EnvironmentPlanSnapshot {
     pub profile: String,
     pub generation: u64,
     pub effective_configuration: Value,
+    pub bindings: Vec<BindingSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -333,6 +382,7 @@ pub struct EnvironmentSnapshot {
     pub endpoints: Vec<EndpointSnapshot>,
     pub initialization_ready: bool,
     pub initialization_tasks: Vec<InitializationTaskSnapshot>,
+    pub bindings: Vec<BindingSnapshot>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

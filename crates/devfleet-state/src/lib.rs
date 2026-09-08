@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -147,6 +147,17 @@ pub struct StoredInitializationTask {
     pub attempts: u64,
     pub status: String,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredBinding {
+    pub environment_id: Uuid,
+    pub phase: String,
+    pub integration: String,
+    pub fingerprint: String,
+    pub invalidation: String,
+    pub public_values_json: String,
+    pub private_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -516,6 +527,53 @@ impl StateStore {
             "UPDATE initialization_tasks SET status = 'failed', diagnostic = ?3
              WHERE environment_id = ?1 AND task_id = ?2",
             params![environment_id.to_string(), task_id, diagnostic],
+        )?;
+        Ok(())
+    }
+
+    /// Returns phase-specific bindings without reading private values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read persisted binding metadata.
+    pub fn bindings(&self, environment_id: Uuid) -> Result<Vec<StoredBinding>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT environment_id, phase, integration, fingerprint, invalidation, public_values_json, private_path
+             FROM bindings WHERE environment_id = ?1 ORDER BY phase",
+        )?;
+        let mut rows = statement.query(params![environment_id.to_string()])?;
+        let mut bindings = Vec::new();
+        while let Some(row) = rows.next()? {
+            bindings.push(stored_binding(row)?);
+        }
+        Ok(bindings)
+    }
+
+    /// Records only public binding metadata and the private artifact path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot persist binding metadata.
+    pub fn record_binding(&mut self, binding: &StoredBinding) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO bindings (
+                environment_id, phase, integration, fingerprint, invalidation, public_values_json, private_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(environment_id, phase) DO UPDATE SET
+                integration = excluded.integration,
+                fingerprint = excluded.fingerprint,
+                invalidation = excluded.invalidation,
+                public_values_json = excluded.public_values_json,
+                private_path = excluded.private_path",
+            params![
+                binding.environment_id.to_string(),
+                binding.phase,
+                binding.integration,
+                binding.fingerprint,
+                binding.invalidation,
+                binding.public_values_json,
+                binding.private_path,
+            ],
         )?;
         Ok(())
     }
@@ -1226,8 +1284,38 @@ impl StateStore {
                  COMMIT;",
             )?;
         }
+        if version < 12 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS bindings (
+                    environment_id TEXT NOT NULL REFERENCES environments(id),
+                    phase TEXT NOT NULL,
+                    integration TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    invalidation TEXT NOT NULL,
+                    public_values_json TEXT NOT NULL,
+                    private_path TEXT NOT NULL,
+                    PRIMARY KEY (environment_id, phase)
+                 );
+                 PRAGMA user_version = 12;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
+}
+
+fn stored_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredBinding> {
+    Ok(StoredBinding {
+        environment_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        phase: row.get(1)?,
+        integration: row.get(2)?,
+        fingerprint: row.get(3)?,
+        invalidation: row.get(4)?,
+        public_values_json: row.get(5)?,
+        private_path: row.get(6)?,
+    })
 }
 
 fn stored_initialization_task(

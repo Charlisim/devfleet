@@ -192,6 +192,7 @@ dependencies = [
  "devfleet-logging",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "toml",
  "uuid",

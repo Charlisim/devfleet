@@ -1,9 +1,9 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use devfleet_cli::request;
 use devfleet_protocol::{
-    ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest, DaemonResponse,
-    EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest, InitializationTask,
-    PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
+    BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
+    DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, InitializationRunRequest,
+    InitializationTask, PROTOCOL_VERSION, ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -41,7 +41,21 @@ enum Command {
     Logs(LogsArgs),
     Compose(ComposeArgs),
     Initialize(InitializeArgs),
+    Bindings(BindingsArgs),
     Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct BindingsArgs {
+    #[command(subcommand)]
+    command: BindingsCommand,
+}
+#[derive(Subcommand)]
+enum BindingsCommand {
+    Apply {
+        #[arg(long)]
+        file: PathBuf,
+    },
 }
 
 #[derive(ClapArgs)]
@@ -313,6 +327,7 @@ fn print_logs(socket: &Path, logs: &LogsArgs, json: bool) -> anyhow::Result<()> 
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
     match command {
         Command::Plan(plan) => {
@@ -384,6 +399,15 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 environment_id,
                 tasks: serde_json::from_slice::<Vec<InitializationTask>>(&std::fs::read(file)?)?,
             })),
+        },
+        Command::Bindings(bindings) => match bindings.command {
+            BindingsCommand::Apply { file } => {
+                Ok(DaemonRequest::BindingApply(serde_json::from_slice::<
+                    BindingApplyRequest,
+                >(
+                    &std::fs::read(file)?
+                )?))
+            }
         },
         Command::Status { environment_id } => Ok(DaemonRequest::Status { environment_id }),
         Command::List => Ok(DaemonRequest::List),
@@ -500,6 +524,7 @@ fn parse_compose_endpoints(values: Vec<String>) -> anyhow::Result<Vec<ComposeEnd
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string(response)?);
@@ -530,6 +555,12 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                     endpoint.host_url,
                     endpoint.device_url,
                     endpoint.healthy
+                );
+            }
+            for binding in &environment.bindings {
+                println!(
+                    "binding {:?} {:?} {}",
+                    binding.phase, binding.invalidation, binding.fingerprint
                 );
             }
         }
@@ -586,6 +617,14 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                         .map_or_else(String::new, |diagnostic| format!(
                             " diagnostic={diagnostic}"
                         ))
+                );
+            }
+        }
+        DaemonResponse::Bindings(bindings) => {
+            for binding in bindings {
+                println!(
+                    "{:?} {:?} {:?}",
+                    binding.phase, binding.invalidation, binding.fingerprint
                 );
             }
         }

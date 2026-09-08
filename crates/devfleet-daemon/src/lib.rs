@@ -1,8 +1,12 @@
 //! Local daemon: private IPC, persistent state, and supervisor composition.
 
-use devfleet_core::{PlanOptions, compile_manifest, discover_git_worktree};
+use devfleet_core::{
+    BindingIntegration as CoreBindingIntegration, BindingPhase as CoreBindingPhase, Invalidation,
+    PlanOptions, compile_manifest, discover_git_worktree, resolve_bindings,
+};
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
+    BindingApplyRequest, BindingIntegration, BindingInvalidation, BindingPhase, BindingSnapshot,
     ComposeReconcileRequest, ComposeUpRequest, DaemonRequest, DaemonResponse, EndpointSnapshot,
     EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot,
     InitializationRunRequest, InitializationTask, InitializationTaskKind,
@@ -13,8 +17,9 @@ use devfleet_protocol::{
     read_json_line, write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredEndpoint, StoredEnvironment, StoredEvent, StoredInitializationTask,
-    StoredLifecycle, StoredOperation, StoredProcess, StoredReadiness, VerifiedGitContext,
+    StateStore, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
+    StoredInitializationTask, StoredLifecycle, StoredOperation, StoredProcess, StoredReadiness,
+    VerifiedGitContext,
 };
 use fs2::FileExt;
 use nix::unistd::{getpeereid, getuid};
@@ -135,6 +140,7 @@ impl Daemon {
             DaemonRequest::Up(request) => self.up(request),
             DaemonRequest::ComposeUp(request) => self.compose_up(request),
             DaemonRequest::InitializationRun(request) => self.run_initialization(&request),
+            DaemonRequest::BindingApply(request) => self.apply_bindings(request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -223,12 +229,89 @@ impl Daemon {
             &request.profile,
             &plan.effective_configuration,
         )?;
+        let bindings = self
+            .state
+            .environments()?
+            .into_iter()
+            .find(|environment| {
+                environment.project_fingerprint == git_identity.project_fingerprint
+                    && environment.worktree_fingerprint == git_identity.worktree_fingerprint
+                    && environment.profile == request.profile
+            })
+            .map(|environment| self.state.bindings(environment.id))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(binding_snapshot)
+            .collect();
         Ok(DaemonResponse::Plan(EnvironmentPlanSnapshot {
             worktree: stored.worktree,
             profile: stored.profile,
             generation: stored.generation,
             effective_configuration: stored.effective_configuration,
+            bindings,
         }))
+    }
+
+    fn apply_bindings(
+        &mut self,
+        request: BindingApplyRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        let environment = self
+            .state
+            .environment(request.environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let contract = resolve_bindings(
+            core_phase(request.phase),
+            core_integration(request.integration),
+            request.public_values,
+            request.backend_only_values,
+            request.reserved_endpoints,
+        )
+        .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        let directory = self
+            .config
+            .state_dir
+            .join("bindings")
+            .join(environment.id.to_string());
+        prepare_private_dir(&directory)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let path = directory.join(format!("{}.json", phase_name(contract.phase)));
+        let private = serde_json::json!({
+            "phase": contract.phase,
+            "integration": contract.integration,
+            "public_values": contract.public_values,
+            "backend_only_values": contract.backend_only_values,
+        });
+        write_private_atomically(
+            &path,
+            &serde_json::to_vec(&private)
+                .map_err(|error| DaemonError::Operation(error.to_string()))?,
+        )?;
+        let public = serde_json::to_string(&contract.public_values)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        self.state.record_binding(&StoredBinding {
+            environment_id: environment.id,
+            phase: phase_name(contract.phase).into(),
+            integration: integration_name(contract.integration).into(),
+            fingerprint: contract.fingerprint,
+            invalidation: invalidation_name(contract.invalidation).into(),
+            public_values_json: public,
+            private_path: path.display().to_string(),
+        })?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            "binding_applied",
+        )?;
+        Ok(DaemonResponse::Bindings(
+            self.state
+                .bindings(environment.id)?
+                .into_iter()
+                .map(binding_snapshot)
+                .collect(),
+        ))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -638,7 +721,12 @@ impl Daemon {
             .environment(environment_id)?
             .ok_or(DaemonError::NotFound)?;
         let tasks = self.state.initialization_tasks(environment_id)?;
-        Ok(DaemonResponse::Environment(snapshot(environment, tasks)))
+        let bindings = self.state.bindings(environment_id)?;
+        Ok(DaemonResponse::Environment(snapshot(
+            environment,
+            tasks,
+            bindings,
+        )))
     }
 
     fn list(&self) -> Result<DaemonResponse, DaemonError> {
@@ -647,9 +735,9 @@ impl Daemon {
             .environments()?
             .into_iter()
             .map(|environment| {
-                self.state
-                    .initialization_tasks(environment.id)
-                    .map(|tasks| snapshot(environment, tasks))
+                let tasks = self.state.initialization_tasks(environment.id)?;
+                let bindings = self.state.bindings(environment.id)?;
+                Ok::<_, DaemonError>(snapshot(environment, tasks, bindings))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DaemonResponse::Environments(environments))
@@ -1324,6 +1412,7 @@ fn initialization_task_snapshot(task: StoredInitializationTask) -> Initializatio
 fn snapshot(
     environment: StoredEnvironment,
     tasks: Vec<StoredInitializationTask>,
+    bindings: Vec<StoredBinding>,
 ) -> EnvironmentSnapshot {
     let lifecycle = match environment.lifecycle {
         StoredLifecycle::Starting => LifecycleState::Starting,
@@ -1378,6 +1467,7 @@ fn snapshot(
             .into_iter()
             .map(initialization_task_snapshot)
             .collect(),
+        bindings: bindings.into_iter().map(binding_snapshot).collect(),
     }
 }
 
@@ -1581,6 +1671,88 @@ fn remove_supervisor_socket(path: &str) -> Result<(), DaemonError> {
 
 fn log_directory(state_dir: &Path, environment_id: Uuid) -> PathBuf {
     state_dir.join("logs").join(environment_id.to_string())
+}
+
+fn core_phase(phase: BindingPhase) -> CoreBindingPhase {
+    match phase {
+        BindingPhase::Process => CoreBindingPhase::Process,
+        BindingPhase::Bundle => CoreBindingPhase::Bundle,
+        BindingPhase::NativeBuild => CoreBindingPhase::NativeBuild,
+        BindingPhase::Runtime => CoreBindingPhase::Runtime,
+    }
+}
+fn core_integration(integration: BindingIntegration) -> CoreBindingIntegration {
+    match integration {
+        BindingIntegration::ProcessEnvironment => CoreBindingIntegration::ProcessEnvironment,
+        BindingIntegration::BundleConfig => CoreBindingIntegration::BundleConfig,
+        BindingIntegration::NativeBuildSettings => CoreBindingIntegration::NativeBuildSettings,
+        BindingIntegration::RuntimeConfiguration => CoreBindingIntegration::RuntimeConfiguration,
+    }
+}
+fn phase_name(phase: CoreBindingPhase) -> &'static str {
+    match phase {
+        CoreBindingPhase::Process => "process",
+        CoreBindingPhase::Bundle => "bundle",
+        CoreBindingPhase::NativeBuild => "native_build",
+        CoreBindingPhase::Runtime => "runtime",
+    }
+}
+fn integration_name(value: CoreBindingIntegration) -> &'static str {
+    match value {
+        CoreBindingIntegration::ProcessEnvironment => "process_environment",
+        CoreBindingIntegration::BundleConfig => "bundle_config",
+        CoreBindingIntegration::NativeBuildSettings => "native_build_settings",
+        CoreBindingIntegration::RuntimeConfiguration => "runtime_configuration",
+    }
+}
+fn invalidation_name(value: Invalidation) -> &'static str {
+    match value {
+        Invalidation::Restart => "restart",
+        Invalidation::Reload => "reload",
+        Invalidation::Rebuild => "rebuild",
+        Invalidation::Reconnect => "reconnect",
+    }
+}
+fn binding_snapshot(binding: StoredBinding) -> BindingSnapshot {
+    let phase = match binding.phase.as_str() {
+        "process" => BindingPhase::Process,
+        "bundle" => BindingPhase::Bundle,
+        "native_build" => BindingPhase::NativeBuild,
+        _ => BindingPhase::Runtime,
+    };
+    let integration = match binding.integration.as_str() {
+        "process_environment" => BindingIntegration::ProcessEnvironment,
+        "bundle_config" => BindingIntegration::BundleConfig,
+        "native_build_settings" => BindingIntegration::NativeBuildSettings,
+        _ => BindingIntegration::RuntimeConfiguration,
+    };
+    let invalidation = match binding.invalidation.as_str() {
+        "restart" => BindingInvalidation::Restart,
+        "reload" => BindingInvalidation::Reload,
+        "rebuild" => BindingInvalidation::Rebuild,
+        _ => BindingInvalidation::Reconnect,
+    };
+    BindingSnapshot {
+        phase,
+        integration,
+        fingerprint: binding.fingerprint,
+        invalidation,
+        public_values: serde_json::from_str(&binding.public_values_json).unwrap_or_default(),
+    }
+}
+fn write_private_atomically(path: &Path, contents: &[u8]) -> Result<(), DaemonError> {
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::now_v7()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+        .map_err(|error| DaemonError::Operation(error.to_string()))?;
+    fs::rename(&temporary, path).map_err(|error| DaemonError::Operation(error.to_string()))
 }
 
 fn known_secret_values(environment: &BTreeMap<String, String>) -> Vec<String> {
