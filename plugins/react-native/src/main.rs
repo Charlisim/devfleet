@@ -1,7 +1,8 @@
 use clap::Parser;
 use devfleet_plugin_sdk::{PluginError, Provider, ProviderDescriptor, serve_once};
 use devfleet_protocol::{
-    HostSpawnRequest, PROTOCOL_VERSION, ReactNativeIdentityHook, ReactNativeIosRunRequest,
+    DoctorToolCheck, DoctorToolInspection, HostSpawnRequest, PROTOCOL_VERSION,
+    ReactNativeIdentityHook, ReactNativeIosRunRequest,
 };
 use semver::Version;
 use serde::Deserialize;
@@ -10,7 +11,13 @@ use std::{
     collections::BTreeMap,
     io::{self, BufReader},
     path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+const TOOL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const TOOL_INSPECTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct ReactNativeProvider;
 
@@ -35,6 +42,10 @@ impl Provider for ReactNativeProvider {
             ],
             plugin_state_version: 1,
         }
+    }
+
+    fn validate(&self, configuration: Value) -> Result<Value, PluginError> {
+        doctor_inspection(configuration)
     }
 
     fn action(&self, name: String, input: Value) -> Result<Value, PluginError> {
@@ -134,6 +145,81 @@ fn ios_run(request: ReactNativeIosRunRequest) -> Result<Value, PluginError> {
 struct PrepareRequest {
     worktree: String,
     timeout_seconds: u64,
+}
+
+#[derive(Deserialize)]
+struct DoctorInspectionRequest {
+    worktree: String,
+}
+
+fn doctor_inspection(configuration: Value) -> Result<Value, PluginError> {
+    let request: DoctorInspectionRequest = serde_json::from_value(configuration)
+        .map_err(|_| PluginError::InvalidCall("invalid doctor inspection input".into()))?;
+    let worktree = canonical_directory(Path::new(&request.worktree), "worktree")?;
+    let node = match node() {
+        Ok(path) => node_check(&path, &worktree),
+        Err(error) => DoctorToolCheck {
+            resource: "node".into(),
+            available: false,
+            cause: Some(error.to_string()),
+        },
+    };
+    let cli = worktree.join("node_modules/react-native/cli.js");
+    let react_native_available = cli.is_file()
+        && cli
+            .symlink_metadata()
+            .is_ok_and(|metadata| !metadata.file_type().is_symlink());
+    let react_native = DoctorToolCheck {
+        resource: "react_native".into(),
+        available: react_native_available,
+        cause: (!react_native_available).then(|| {
+            "the React Native CLI is not installed as a regular file in node_modules".into()
+        }),
+    };
+    serde_json::to_value(DoctorToolInspection {
+        checks: vec![node, react_native],
+    })
+    .map_err(|error| PluginError::RequestFailed(error.to_string()))
+}
+
+fn node_check(path: &str, worktree: &Path) -> DoctorToolCheck {
+    let mut command = Command::new(path);
+    command
+        .arg("--version")
+        .current_dir(worktree)
+        .env_clear()
+        .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = bounded_output(command);
+    let available = output.as_ref().is_ok_and(|output| {
+        output.status.success()
+            && std::str::from_utf8(&output.stdout)
+                .ok()
+                .and_then(|version| Version::parse(version.trim().trim_start_matches('v')).ok())
+                .is_some_and(|version| version.major >= 18)
+    });
+    DoctorToolCheck {
+        resource: "node".into(),
+        available,
+        cause: (!available).then(|| "Node.js 18 or newer is unavailable".into()),
+    }
+}
+
+fn bounded_output(mut command: Command) -> io::Result<Output> {
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= TOOL_INSPECTION_TIMEOUT {
+            let _ = child.kill();
+            return child.wait_with_output();
+        }
+        thread::sleep(TOOL_INSPECTION_POLL_INTERVAL);
+    }
 }
 
 fn require_file(path: &Path, name: &str) -> Result<(), PluginError> {
@@ -367,6 +453,25 @@ fn current_platform() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_reports_missing_react_native_cli() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let inspection: DoctorToolInspection = serde_json::from_value(
+            doctor_inspection(
+                serde_json::json!({ "worktree": worktree.path().display().to_string() }),
+            )
+            .expect("doctor inspection"),
+        )
+        .expect("typed inspection");
+        let react_native = inspection
+            .checks
+            .iter()
+            .find(|check| check.resource == "react_native")
+            .expect("React Native check");
+        assert!(!react_native.available);
+        assert!(react_native.cause.is_some());
+    }
 
     #[test]
     fn rejects_a_broken_symlink_for_mutable_dependencies() {

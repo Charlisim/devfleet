@@ -2,12 +2,12 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
-    DaemonResponse, DestroyAuthorization, DestroyRequest, DeviceCaptureRequest,
+    DaemonResponse, DestroyAuthorization, DestroyRequest, DeviceCaptureRequest, DoctorRequest,
     EnvironmentPlanRequest, EnvironmentUpRequest, IdentityVerificationStartRequest,
     InitializationRunRequest, InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest,
     IosSimulatorAction, IosSimulatorActionRequest, MetroUpRequest,
     PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec,
-    SchedulerConfig, SmokeResponse, SmokeStatus, VerificationMode,
+    ProjectInitRequest, SchedulerConfig, SmokeResponse, SmokeStatus, VerificationMode,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -35,6 +35,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    Init(InitArgs),
+    Doctor(DoctorArgs),
     Plan(PlanArgs),
     Up(UpArgs),
     Status { environment_id: Uuid },
@@ -54,6 +56,26 @@ enum Command {
     Ios(IosArgs),
     Identity(IdentityArgs),
     Plugin(PluginArgs),
+}
+
+#[derive(ClapArgs)]
+struct InitArgs {
+    #[arg(long)]
+    trust: bool,
+    #[arg(long)]
+    worktree: PathBuf,
+    #[arg(long)]
+    runtime: Option<String>,
+    #[arg(long = "device-type")]
+    device_type: Option<String>,
+}
+
+#[derive(ClapArgs)]
+struct DoctorArgs {
+    #[arg(long)]
+    worktree: PathBuf,
+    #[arg(long)]
+    environment_id: Option<Uuid>,
 }
 
 #[derive(ClapArgs)]
@@ -507,6 +529,16 @@ fn print_logs(socket: &Path, logs: &LogsArgs, json: bool) -> anyhow::Result<()> 
 #[allow(clippy::too_many_lines)]
 fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
     match command {
+        Command::Init(init) => Ok(DaemonRequest::ProjectInit(ProjectInitRequest {
+            worktree: init.worktree.canonicalize()?.display().to_string(),
+            trusted: init.trust,
+            runtime: init.runtime,
+            device_type: init.device_type,
+        })),
+        Command::Doctor(doctor) => Ok(DaemonRequest::Doctor(DoctorRequest {
+            worktree: absolute_path(&doctor.worktree)?.display().to_string(),
+            environment_id: doctor.environment_id,
+        })),
         Command::Plan(plan) => {
             let worktree = plan.worktree.canonicalize()?;
             let manifest = plan
@@ -856,6 +888,42 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     match response {
+        DaemonResponse::ProjectInit(project) => {
+            println!(
+                "initialized {} trusted={}{}",
+                project.worktree,
+                project.trusted,
+                project
+                    .runtime
+                    .as_deref()
+                    .map_or_else(String::new, |runtime| { format!(" runtime={runtime}") })
+            );
+            println!(
+                "proposed manifest {} (not written)",
+                project.proposed_manifest_path
+            );
+            print!("{}", project.proposed_manifest);
+            if !project.proposed_manifest.ends_with('\n') {
+                println!();
+            }
+            for integration in &project.proposed_integrations {
+                println!("proposed integration {integration}");
+            }
+        }
+        DaemonResponse::Doctor(doctor) => {
+            println!("doctor {} ready={}", doctor.worktree, doctor.ready);
+            for finding in &doctor.findings {
+                println!(
+                    "{:?} {} blocking={} retryable={} cause={} remediation={}",
+                    finding.phase,
+                    finding.resource,
+                    finding.blocking,
+                    finding.retryable,
+                    finding.cause,
+                    finding.remediation
+                );
+            }
+        }
         DaemonResponse::Plan(plan) => println!(
             "{} {} generation {}",
             plan.worktree, plan.profile, plan.generation
@@ -1047,6 +1115,14 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,6 +1131,58 @@ mod tests {
     fn rejects_duplicate_or_malformed_environment_entries() {
         assert!(parse_environment(vec!["A=1".into(), "A=2".into()]).is_err());
         assert!(parse_environment(vec!["missing".into()]).is_err());
+    }
+
+    #[test]
+    fn maps_init_and_doctor_commands_to_typed_requests() {
+        let worktree = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let init = request_from(Command::Init(InitArgs {
+            trust: true,
+            worktree: worktree.clone(),
+            runtime: Some("runtime-18".into()),
+            device_type: Some("phone-16".into()),
+        }))
+        .expect("init request builds");
+        assert!(matches!(
+            init,
+            DaemonRequest::ProjectInit(ProjectInitRequest {
+                trusted: true,
+                runtime: Some(_),
+                device_type: Some(_),
+                ..
+            })
+        ));
+        let environment_id = Uuid::nil();
+        let doctor = request_from(Command::Doctor(DoctorArgs {
+            worktree,
+            environment_id: Some(environment_id),
+        }))
+        .expect("doctor request builds");
+        assert!(matches!(
+            doctor,
+            DaemonRequest::Doctor(DoctorRequest {
+                environment_id: Some(id),
+                ..
+            }) if id == environment_id
+        ));
+    }
+
+    #[test]
+    fn doctor_preserves_a_missing_worktree_for_typed_diagnostics() {
+        let request = request_from(Command::Doctor(DoctorArgs {
+            worktree: PathBuf::from("missing-worktree"),
+            environment_id: None,
+        }))
+        .expect("doctor request builds");
+        let DaemonRequest::Doctor(DoctorRequest { worktree, .. }) = request else {
+            panic!("expected doctor request");
+        };
+        assert!(Path::new(&worktree).is_absolute());
+        assert!(worktree.ends_with("missing-worktree"));
     }
 
     #[test]

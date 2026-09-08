@@ -322,7 +322,11 @@ fn local_docker_context(worktree: &Path) -> Result<bool, ComposeError> {
         return Err(ComposeError::DockerFailed);
     }
     let host = String::from_utf8(inspected.stdout).map_err(|_| ComposeError::DockerFailed)?;
-    Ok(host.trim().starts_with("unix://"))
+    Ok(docker_host_is_local(&host))
+}
+
+fn docker_host_is_local(host: &str) -> bool {
+    host.trim().starts_with("unix://")
 }
 
 fn inspection_docker_output(worktree: &Path, args: Vec<OsString>) -> Result<Output, ComposeError> {
@@ -870,6 +874,15 @@ mod tests {
             compose_inspection_from_output(project, b"0123456789ab\tforeign\trunning\n"),
             (ComposeInspectionState::Uncertain, 0)
         );
+    }
+
+    #[test]
+    fn remote_docker_context_is_not_treated_as_local() {
+        assert!(docker_host_is_local(
+            "unix:///Users/test/.docker/run/docker.sock\n"
+        ));
+        assert!(!docker_host_is_local("tcp://docker.example.test:2376\n"));
+        assert!(!docker_host_is_local("ssh://docker.example.test\n"));
     }
 
     struct Fixture {

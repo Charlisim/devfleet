@@ -572,8 +572,76 @@ pub struct EnvironmentPlanRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectInitRequest {
+    pub worktree: String,
+    pub trusted: bool,
+    pub runtime: Option<String>,
+    pub device_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectInitSnapshot {
+    pub worktree: String,
+    pub project_fingerprint: String,
+    pub trusted: bool,
+    pub proposed_manifest_path: String,
+    pub proposed_manifest: String,
+    pub proposed_integrations: Vec<String>,
+    pub runtime: Option<String>,
+    pub device_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DoctorRequest {
+    pub worktree: String,
+    pub environment_id: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorPhase {
+    Project,
+    Plugin,
+    Toolchain,
+    Runtime,
+    Bindings,
+    Preparation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DoctorFinding {
+    pub phase: DoctorPhase,
+    pub resource: String,
+    pub cause: String,
+    pub retryable: bool,
+    pub remediation: String,
+    pub blocking: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DoctorToolCheck {
+    pub resource: String,
+    pub available: bool,
+    pub cause: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DoctorToolInspection {
+    pub checks: Vec<DoctorToolCheck>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DoctorSnapshot {
+    pub worktree: String,
+    pub ready: bool,
+    pub findings: Vec<DoctorFinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", content = "arguments", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    ProjectInit(ProjectInitRequest),
+    Doctor(DoctorRequest),
     Plan(EnvironmentPlanRequest),
     Up(EnvironmentUpRequest),
     ComposeUp(ComposeUpRequest),
@@ -639,6 +707,8 @@ pub enum DaemonRequest {
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum DaemonResponse {
+    ProjectInit(ProjectInitSnapshot),
+    Doctor(DoctorSnapshot),
     Plan(EnvironmentPlanSnapshot),
     Accepted(OperationAccepted),
     Environment(EnvironmentSnapshot),
@@ -1131,5 +1201,32 @@ mod tests {
         };
         let encoded = serde_json::to_value(request).expect("request serializes");
         assert_eq!(encoded["command"], "events.subscribe");
+    }
+
+    #[test]
+    fn serializes_project_initialization_and_typed_doctor_findings() {
+        let request = DaemonRequest::ProjectInit(ProjectInitRequest {
+            worktree: "/private/project".into(),
+            trusted: true,
+            runtime: Some("runtime-18".into()),
+            device_type: Some("phone-16".into()),
+        });
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(encoded["command"], "project_init");
+        let response = DaemonResponse::Doctor(DoctorSnapshot {
+            worktree: "/private/project".into(),
+            ready: false,
+            findings: vec![DoctorFinding {
+                phase: DoctorPhase::Runtime,
+                resource: "runtime-18".into(),
+                cause: "runtime is unavailable".into(),
+                retryable: true,
+                remediation: "Install the runtime.".into(),
+                blocking: true,
+            }],
+        });
+        let encoded = serde_json::to_value(response).expect("response serializes");
+        assert_eq!(encoded["status"], "doctor");
+        assert_eq!(encoded["value"]["findings"][0]["phase"], "runtime");
     }
 }

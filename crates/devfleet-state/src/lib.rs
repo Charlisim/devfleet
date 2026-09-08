@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 20;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -54,6 +54,15 @@ pub struct StoredEnvironment {
     pub reconciliation_diagnostic: Option<String>,
     pub process: Option<StoredProcess>,
     pub endpoints: Vec<StoredEndpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredProjectSetup {
+    pub project_fingerprint: String,
+    pub checkout: String,
+    pub trusted: bool,
+    pub runtime: Option<String>,
+    pub device_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -445,6 +454,57 @@ impl StateStore {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Records explicit project trust and an optional validated local simulator selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain project setup metadata.
+    pub fn record_project_setup(&mut self, setup: &StoredProjectSetup) -> Result<(), StateError> {
+        self.connection.execute(
+            "INSERT INTO project_setups (project_fingerprint, checkout, trusted, runtime, device_type)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_fingerprint) DO UPDATE SET
+                checkout = excluded.checkout, trusted = excluded.trusted,
+                runtime = excluded.runtime, device_type = excluded.device_type",
+            params![
+                setup.project_fingerprint,
+                setup.checkout,
+                setup.trusted,
+                setup.runtime,
+                setup.device_type,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Reads the explicit setup retained for one Git project identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read project setup metadata.
+    pub fn project_setup(
+        &self,
+        project_fingerprint: &str,
+    ) -> Result<Option<StoredProjectSetup>, StateError> {
+        self.connection
+            .query_row(
+                "SELECT project_fingerprint, checkout, trusted, runtime, device_type
+                 FROM project_setups WHERE project_fingerprint = ?1",
+                params![project_fingerprint],
+                |row| {
+                    Ok(StoredProjectSetup {
+                        project_fingerprint: row.get(0)?,
+                        checkout: row.get(1)?,
+                        trusted: row.get(2)?,
+                        runtime: row.get(3)?,
+                        device_type: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Persists a supervisor-confirmed process identity after launch.
@@ -1859,6 +1919,20 @@ impl StateStore {
         if version < 19 {
             self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS compose_resources (environment_id TEXT PRIMARY KEY REFERENCES environments(id), project_name TEXT NOT NULL UNIQUE, worktree TEXT NOT NULL, files_json TEXT NOT NULL, lifecycle TEXT NOT NULL DEFAULT 'active'); PRAGMA user_version = 19; COMMIT;")?;
         }
+        if version < 20 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS project_setups (
+                    project_fingerprint TEXT PRIMARY KEY,
+                    checkout TEXT NOT NULL,
+                    trusted INTEGER NOT NULL,
+                    runtime TEXT,
+                    device_type TEXT
+                 );
+                 PRAGMA user_version = 20;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 }
@@ -2271,6 +2345,34 @@ mod tests {
             StoredReadiness::ProcessStopped
         );
         assert_eq!(observed.endpoints[0].host_url, "http://127.0.0.1:20001");
+    }
+
+    #[test]
+    fn records_explicit_project_setup_and_replaces_the_pinned_selection() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let first = StoredProjectSetup {
+            project_fingerprint: "1:2".into(),
+            checkout: "/private/project".into(),
+            trusted: true,
+            runtime: Some("runtime-18".into()),
+            device_type: Some("phone-16".into()),
+        };
+        store
+            .record_project_setup(&first)
+            .expect("project setup persists");
+        let replacement = StoredProjectSetup {
+            checkout: "/private/moved-project".into(),
+            runtime: Some("runtime-19".into()),
+            device_type: Some("phone-17".into()),
+            ..first.clone()
+        };
+        store
+            .record_project_setup(&replacement)
+            .expect("project setup updates");
+        assert_eq!(
+            store.project_setup("1:2").expect("project setup reads"),
+            Some(replacement)
+        );
     }
 
     #[test]

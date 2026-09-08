@@ -1,6 +1,8 @@
 use clap::Parser;
 use devfleet_plugin_sdk::{PluginError, Provider, ProviderDescriptor, serve_once};
-use devfleet_protocol::{HostSpawnRequest, PROTOCOL_VERSION};
+use devfleet_protocol::{
+    DoctorToolCheck, DoctorToolInspection, HostSpawnRequest, PROTOCOL_VERSION,
+};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,14 +10,19 @@ use std::{
     collections::BTreeMap,
     io::{self, BufReader},
     path::Path,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 const XCRUN: &str = "/usr/bin/xcrun";
+const XCODEBUILD: &str = "/usr/bin/xcodebuild";
 const OPEN: &str = "/usr/bin/open";
 const PATH: &str = "/usr/bin:/bin";
+const TOOL_INSPECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const TOOL_INSPECTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct IosProvider;
 
@@ -46,6 +53,10 @@ impl Provider for IosProvider {
             ],
             plugin_state_version: 1,
         }
+    }
+
+    fn inspect(&self) -> Result<Value, PluginError> {
+        xcode_inspection()
     }
 
     fn action(&self, name: String, input: Value) -> Result<Value, PluginError> {
@@ -169,6 +180,41 @@ fn media_action(
     }
     argv.push(request.path);
     spawn(argv)
+}
+
+fn xcode_inspection() -> Result<Value, PluginError> {
+    let mut command = Command::new(XCODEBUILD);
+    command
+        .arg("-version")
+        .env_clear()
+        .env("PATH", PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let available = bounded_output(command).is_ok_and(|output| output.status.success());
+    serde_json::to_value(DoctorToolInspection {
+        checks: vec![DoctorToolCheck {
+            resource: "xcodebuild".into(),
+            available,
+            cause: (!available).then(|| "Xcode command-line tools are unavailable".into()),
+        }],
+    })
+    .map_err(|error| PluginError::RequestFailed(error.to_string()))
+}
+
+fn bounded_output(mut command: Command) -> std::io::Result<Output> {
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if started.elapsed() >= TOOL_INSPECTION_TIMEOUT {
+            let _ = child.kill();
+            return child.wait_with_output();
+        }
+        thread::sleep(TOOL_INSPECTION_POLL_INTERVAL);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

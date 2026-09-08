@@ -8,10 +8,11 @@ use devfleet_core::{
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
     ArtifactKind, ArtifactSnapshot, BindingApplyRequest, BindingIntegration, BindingInvalidation,
-    BindingPhase, BindingSnapshot, ComposeDestroyRequest, ComposeInspection,
+    BindingPhase, BindingSnapshot, ComposeDestroyRequest, ComposeInspectRequest, ComposeInspection,
     ComposeInspectionState, ComposeReconcileRequest, ComposeUpRequest, DaemonRequest,
     DaemonResponse, DestroyAuthorization, DestroyRequest, DestroySnapshot, DestroyTarget,
-    DestroyTargetStatus, DeviceCaptureRequest, EndpointSnapshot, EnvironmentPlanSnapshot,
+    DestroyTargetStatus, DeviceCaptureRequest, DoctorFinding, DoctorPhase, DoctorRequest,
+    DoctorSnapshot, DoctorToolInspection, EndpointSnapshot, EnvironmentPlanSnapshot,
     EnvironmentReadiness, EnvironmentSnapshot, ErrorCode, EventSnapshot,
     IdentityVerificationSnapshot, IdentityVerificationStartRequest, InitializationRunRequest,
     InitializationTask, InitializationTaskKind, InitializationTaskSnapshot,
@@ -20,19 +21,20 @@ use devfleet_protocol::{
     JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
     MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
     PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
-    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ReactNativeIdentityHook,
-    ReadinessState, RpcFailure, ScheduledResource, SchedulingPriority, SchedulingRequest,
-    SupervisorIdentityVerificationRequest, SupervisorRequest, SupervisorResponse,
-    SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, VerificationMode, read_json_line,
-    write_json_line,
+    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ProjectInitRequest,
+    ProjectInitSnapshot, ReactNativeIdentityHook, ReadinessState, RpcFailure, ScheduledResource,
+    SchedulingPriority, SchedulingRequest, SupervisorIdentityVerificationRequest,
+    SupervisorRequest, SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy,
+    TrustedTaskPlugin, VerificationMode, read_json_line, write_json_line,
 };
 use devfleet_state::{
     StateStore, StoredArtifact, StoredBinding, StoredComposeResource, StoredEndpoint,
     StoredEnvironment, StoredEvent, StoredIdentityVerification, StoredInitializationTask,
     StoredIosApp, StoredIosDevice, StoredLifecycle, StoredOperation, StoredPreparationTask,
-    StoredProcess, StoredReadiness, VerifiedGitContext,
+    StoredProcess, StoredProjectSetup, StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
+use nix::poll::{PollFd, PollFlags, poll};
 use nix::unistd::{getpeereid, getuid};
 use sha2::{Digest, Sha256};
 use std::{
@@ -42,10 +44,11 @@ use std::{
     net::{SocketAddr, TcpStream},
     os::unix::{
         fs::{MetadataExt, PermissionsExt},
+        io::AsFd,
         net::UnixListener,
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -61,6 +64,7 @@ const NATIVE_BUILD_MEMORY_ESTIMATE: u64 = 2 * 1024 * 1024 * 1024;
 const DEVICE_BOOT_MEMORY_ESTIMATE: u64 = 512 * 1024 * 1024;
 const PREPARATION_MEMORY_ESTIMATE: u64 = 1024 * 1024 * 1024;
 const METRO_WORKER_MEMORY_ESTIMATE: u64 = 128 * 1024 * 1024;
+const DOCTOR_PLUGIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -120,7 +124,15 @@ struct Daemon {
 
 #[derive(serde::Deserialize)]
 struct IosDiscovery {
+    runtimes: Vec<IosAvailableSelection>,
+    device_types: Vec<IosAvailableSelection>,
     devices: Vec<IosDiscoveredDevice>,
+}
+
+#[derive(serde::Deserialize)]
+struct IosAvailableSelection {
+    identifier: String,
+    available: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -197,6 +209,8 @@ impl Daemon {
 
     fn handle(&mut self, request: DaemonRequest) -> Result<DaemonResponse, DaemonError> {
         match request {
+            DaemonRequest::ProjectInit(request) => self.project_init(request),
+            DaemonRequest::Doctor(request) => self.doctor(&request),
             DaemonRequest::Plan(request) => self.plan(request),
             DaemonRequest::Up(request) => self.up(request),
             DaemonRequest::ComposeUp(request) => self.compose_up(request),
@@ -248,6 +262,435 @@ impl Daemon {
             DaemonRequest::PluginInstall { path } => self.plugin_install(Path::new(&path)),
             DaemonRequest::PluginTrust { id } => self.plugin_trust(&id),
         }
+    }
+
+    fn project_init(&mut self, request: ProjectInitRequest) -> Result<DaemonResponse, DaemonError> {
+        if !request.trusted {
+            return Err(DaemonError::TrustRequired);
+        }
+        let selection = match (request.runtime, request.device_type) {
+            (None, None) => None,
+            (Some(runtime), Some(device_type))
+                if !runtime.is_empty() && !device_type.is_empty() =>
+            {
+                Some((runtime, device_type))
+            }
+            _ => {
+                return Err(DaemonError::InvalidConfig(
+                    "runtime and device type must be selected together".into(),
+                ));
+            }
+        };
+        let identity = discover_git_worktree(Path::new(&request.worktree))
+            .map_err(|error| DaemonError::InvalidConfig(error.to_string()))?;
+        if let Some((runtime, device_type)) = &selection {
+            let plugin = self.trusted_plugin("official.ios", "device.discover")?;
+            let discovery = Self::ios_discovery(&plugin)?;
+            if !ios_selection_available(&discovery.runtimes, runtime) {
+                return Err(DaemonError::DeviceUnavailable(format!(
+                    "requested runtime '{runtime}' is not installed and available"
+                )));
+            }
+            if !ios_selection_available(&discovery.device_types, device_type) {
+                return Err(DaemonError::DeviceUnavailable(format!(
+                    "requested device type '{device_type}' is not installed and available"
+                )));
+            }
+        }
+        let (runtime, device_type) = selection.map_or((None, None), |(runtime, device_type)| {
+            (Some(runtime), Some(device_type))
+        });
+        self.state.record_project_setup(&StoredProjectSetup {
+            project_fingerprint: identity.project_fingerprint.clone(),
+            checkout: identity.checkout.display().to_string(),
+            trusted: true,
+            runtime: runtime.clone(),
+            device_type: device_type.clone(),
+        })?;
+        Ok(DaemonResponse::ProjectInit(ProjectInitSnapshot {
+            worktree: identity.checkout.display().to_string(),
+            project_fingerprint: identity.project_fingerprint,
+            trusted: true,
+            proposed_manifest_path: identity
+                .checkout
+                .join("devfleet.toml")
+                .display()
+                .to_string(),
+            proposed_manifest: proposed_manifest(),
+            proposed_integrations: proposed_integrations(),
+            runtime,
+            device_type,
+        }))
+    }
+
+    fn doctor(&self, request: &DoctorRequest) -> Result<DaemonResponse, DaemonError> {
+        let requested_worktree = request.worktree.clone();
+        let identity = match discover_git_worktree(Path::new(&request.worktree)) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return Ok(DaemonResponse::Doctor(DoctorSnapshot {
+                    worktree: requested_worktree,
+                    ready: false,
+                    findings: vec![doctor_finding(
+                        DoctorPhase::Project,
+                        "worktree",
+                        format!("Git worktree discovery failed: {error}"),
+                        false,
+                        "Run doctor from an existing Git worktree.",
+                    )],
+                }));
+            }
+        };
+        let worktree = identity.checkout.display().to_string();
+        let mut findings = Vec::new();
+        let setup = self.state.project_setup(&identity.project_fingerprint)?;
+        match setup.as_ref() {
+            None => findings.push(doctor_finding(
+                DoctorPhase::Project,
+                "project_setup",
+                "project trust has not been recorded",
+                false,
+                "Run `devfleet init --trust --worktree <path>` and review its proposal.",
+            )),
+            Some(setup) if !setup.trusted => findings.push(doctor_finding(
+                DoctorPhase::Project,
+                "project_setup",
+                "project setup is not explicitly trusted",
+                false,
+                "Run `devfleet init --trust --worktree <path>` after reviewing the project.",
+            )),
+            Some(_) => {}
+        }
+        if !identity.checkout.join("devfleet.toml").is_file() {
+            findings.push(doctor_finding(
+                DoctorPhase::Project,
+                "devfleet.toml",
+                "the proposed project manifest has not been added",
+                false,
+                "Review `devfleet init` output and add devfleet.toml explicitly.",
+            ));
+        }
+
+        self.doctor_plugin(&mut findings, "official.process", "process.reconcile")?;
+        let compose_plugin =
+            self.doctor_plugin(&mut findings, "official.compose", "compose.inspect")?;
+        let react_native_plugin = self.doctor_plugin(
+            &mut findings,
+            "official.react-native",
+            "preparation.dependencies",
+        )?;
+        let ios_plugin = self.doctor_plugin(&mut findings, "official.ios", "device.discover")?;
+
+        Self::doctor_toolchain(
+            &identity.checkout,
+            react_native_plugin.as_deref(),
+            ios_plugin.as_deref(),
+            &mut findings,
+        );
+        Self::doctor_docker(&identity.checkout, compose_plugin.as_deref(), &mut findings);
+        Self::doctor_runtime(setup.as_ref(), ios_plugin.as_deref(), &mut findings);
+        self.doctor_environment(request.environment_id, &identity, &mut findings)?;
+
+        let ready = findings.iter().all(|finding| !finding.blocking);
+        Ok(DaemonResponse::Doctor(DoctorSnapshot {
+            worktree,
+            ready,
+            findings,
+        }))
+    }
+
+    fn doctor_plugin(
+        &self,
+        findings: &mut Vec<DoctorFinding>,
+        id: &str,
+        capability: &str,
+    ) -> Result<Option<PathBuf>, DaemonError> {
+        let Some(plugin) = self.state.plugin(id)? else {
+            findings.push(doctor_finding(
+                DoctorPhase::Plugin,
+                id,
+                "plugin is not installed",
+                true,
+                format!("Install and explicitly trust {id} with capability {capability}."),
+            ));
+            return Ok(None);
+        };
+        if !plugin.trusted {
+            findings.push(doctor_finding(
+                DoctorPhase::Plugin,
+                id,
+                "plugin is installed but not explicitly trusted",
+                false,
+                format!("Review and run `devfleet plugin trust {id}`."),
+            ));
+            return Ok(None);
+        }
+        match self.trusted_plugin(id, capability) {
+            Ok(path) => Ok(Some(path)),
+            Err(error) => {
+                findings.push(doctor_finding(
+                    DoctorPhase::Plugin,
+                    id,
+                    format!(
+                        "plugin descriptor, lockfile, or capability validation failed: {error}"
+                    ),
+                    true,
+                    format!(
+                        "Reinstall a compatible {id} and explicitly trust its reviewed lockfile."
+                    ),
+                ));
+                Ok(None)
+            }
+        }
+    }
+
+    fn doctor_toolchain(
+        worktree: &Path,
+        react_native_plugin: Option<&Path>,
+        ios_plugin: Option<&Path>,
+        findings: &mut Vec<DoctorFinding>,
+    ) {
+        Self::doctor_provider_tools(
+            react_native_plugin,
+            PluginAction::Validate {
+                configuration: serde_json::json!({ "worktree": worktree.display().to_string() }),
+            },
+            "official.react-native",
+            findings,
+        );
+        Self::doctor_provider_tools(ios_plugin, PluginAction::Inspect, "official.ios", findings);
+    }
+
+    fn doctor_provider_tools(
+        plugin: Option<&Path>,
+        action: PluginAction,
+        provider: &str,
+        findings: &mut Vec<DoctorFinding>,
+    ) {
+        let Some(plugin) = plugin else {
+            return;
+        };
+        let inspection = Self::doctor_plugin_call(plugin, action).and_then(|value| {
+            serde_json::from_value::<DoctorToolInspection>(value).map_err(|_| {
+                DaemonError::Operation(format!(
+                    "{provider} toolchain inspection returned malformed data"
+                ))
+            })
+        });
+        match inspection {
+            Ok(inspection) => {
+                for check in inspection
+                    .checks
+                    .into_iter()
+                    .filter(|check| !check.available)
+                {
+                    findings.push(doctor_finding(
+                        DoctorPhase::Toolchain,
+                        check.resource.as_str(),
+                        check
+                            .cause
+                            .unwrap_or_else(|| format!("{} is unavailable", check.resource)),
+                        true,
+                        tool_remediation(&check.resource),
+                    ));
+                }
+            }
+            Err(error) => findings.push(doctor_finding(
+                DoctorPhase::Toolchain,
+                provider,
+                format!("toolchain inspection failed: {error}"),
+                true,
+                format!("Repair or reinstall the trusted {provider} plugin, then retry doctor."),
+            )),
+        }
+    }
+
+    fn doctor_docker(
+        worktree: &Path,
+        compose_plugin: Option<&Path>,
+        findings: &mut Vec<DoctorFinding>,
+    ) {
+        let Some(plugin) = compose_plugin else {
+            return;
+        };
+        let input = serde_json::to_value(ComposeInspectRequest {
+            project_name: "df_00000000_00000000".into(),
+            worktree: worktree.display().to_string(),
+        });
+        let inspection = input
+            .map_err(|error| DaemonError::Operation(error.to_string()))
+            .and_then(|input| Self::doctor_plugin_action(plugin, "compose.inspect", input))
+            .and_then(|value| {
+                serde_json::from_value::<ComposeInspection>(value).map_err(|_| {
+                    DaemonError::Operation("Compose inspection returned malformed data".into())
+                })
+            });
+        match inspection {
+            Ok(ComposeInspection {
+                state: ComposeInspectionState::Missing | ComposeInspectionState::Present,
+                ..
+            }) => {}
+            Ok(ComposeInspection {
+                state: ComposeInspectionState::Unavailable,
+                ..
+            }) => findings.push(doctor_finding(
+                DoctorPhase::Toolchain,
+                "docker",
+                "Docker is unavailable",
+                true,
+                "Start local Docker Desktop and select a local Unix-socket context.",
+            )),
+            Ok(ComposeInspection {
+                state: ComposeInspectionState::Uncertain,
+                ..
+            }) => findings.push(doctor_finding(
+                DoctorPhase::Toolchain,
+                "docker",
+                "Docker context is remote or cannot be verified as local",
+                false,
+                "Select a local Unix-socket Docker context; v0.1 does not support remote Docker.",
+            )),
+            Err(error) => findings.push(doctor_finding(
+                DoctorPhase::Toolchain,
+                "docker",
+                format!("Docker inspection failed: {error}"),
+                true,
+                "Repair the local Docker installation and retry doctor.",
+            )),
+        }
+    }
+
+    fn doctor_runtime(
+        setup: Option<&StoredProjectSetup>,
+        ios_plugin: Option<&Path>,
+        findings: &mut Vec<DoctorFinding>,
+    ) {
+        let Some(setup) = setup else {
+            return;
+        };
+        let (Some(runtime), Some(device_type)) = (&setup.runtime, &setup.device_type) else {
+            findings.push(doctor_finding(
+                DoctorPhase::Runtime,
+                "simulator_selection",
+                "no local iOS runtime and device type have been pinned",
+                false,
+                "Run `devfleet init --trust --runtime <id> --device-type <id> --worktree <path>`.",
+            ));
+            return;
+        };
+        let Some(plugin) = ios_plugin else {
+            return;
+        };
+        match Self::doctor_ios_discovery(plugin) {
+            Ok(discovery) => {
+                if !ios_selection_available(&discovery.runtimes, runtime) {
+                    findings.push(doctor_finding(
+                        DoctorPhase::Runtime,
+                        runtime,
+                        "the pinned runtime is not installed and available",
+                        true,
+                        "Install the selected iOS runtime, then rerun init to confirm it.",
+                    ));
+                }
+                if !ios_selection_available(&discovery.device_types, device_type) {
+                    findings.push(doctor_finding(
+                        DoctorPhase::Runtime,
+                        device_type,
+                        "the pinned device type is not installed and available",
+                        true,
+                        "Install the selected simulator device type, then rerun init to confirm it.",
+                    ));
+                }
+            }
+            Err(error) => findings.push(doctor_finding(
+                DoctorPhase::Runtime,
+                "ios_simulator",
+                format!("iOS runtime discovery failed: {error}"),
+                true,
+                "Install or select Xcode CoreSimulator, then rerun doctor.",
+            )),
+        }
+    }
+
+    fn doctor_environment(
+        &self,
+        environment_id: Option<Uuid>,
+        identity: &devfleet_core::GitWorktreeIdentity,
+        findings: &mut Vec<DoctorFinding>,
+    ) -> Result<(), DaemonError> {
+        let Some(environment_id) = environment_id else {
+            findings.push(doctor_finding(
+                DoctorPhase::Bindings,
+                "environment",
+                "bindings cannot be verified without an environment ID",
+                false,
+                "Run plan or up, then pass --environment-id to doctor.",
+            ));
+            findings.push(doctor_finding(
+                DoctorPhase::Preparation,
+                "environment",
+                "preparation cannot be verified without an environment ID",
+                false,
+                "Run plan or up, then pass --environment-id to doctor.",
+            ));
+            return Ok(());
+        };
+        let Some(environment) = self.state.environment(environment_id)? else {
+            findings.push(doctor_finding(
+                DoctorPhase::Project,
+                "environment",
+                "requested environment does not exist",
+                false,
+                "Pass an environment ID returned by plan or up for this worktree.",
+            ));
+            return Ok(());
+        };
+        if environment.project_fingerprint != identity.project_fingerprint
+            || environment.worktree_fingerprint != identity.worktree_fingerprint
+        {
+            findings.push(doctor_finding(
+                DoctorPhase::Project,
+                "environment",
+                "requested environment does not belong to this worktree",
+                false,
+                "Run doctor against the environment's own worktree.",
+            ));
+            return Ok(());
+        }
+        let bindings = self.state.bindings(environment_id)?;
+        if !bindings
+            .iter()
+            .any(|binding| binding.phase == "bundle" && binding.integration == "bundle_config")
+        {
+            findings.push(doctor_finding(
+                DoctorPhase::Bindings,
+                "bundle_integration",
+                "a bundle_config binding has not been applied",
+                true,
+                "Apply an explicit bundle binding before launching a React Native app.",
+            ));
+        }
+        let preparation = self.state.preparation_tasks(environment_id)?;
+        for kind in ["dependencies", "pods"] {
+            match preparation.iter().find(|task| task.kind == kind) {
+                Some(task) if task.status == "completed" => {}
+                Some(task) => findings.push(doctor_finding(
+                    DoctorPhase::Preparation,
+                    kind,
+                    format!("preparation is {}", task.status),
+                    true,
+                    "Run `devfleet prepare run <environment-id>` and inspect its logs.",
+                )),
+                None => findings.push(doctor_finding(
+                    DoctorPhase::Preparation,
+                    kind,
+                    "preparation has not run",
+                    true,
+                    "Run `devfleet prepare run <environment-id>` before native build.",
+                )),
+            }
+        }
+        Ok(())
     }
 
     fn plan(
@@ -1828,6 +2271,13 @@ impl Daemon {
         })
     }
 
+    fn doctor_ios_discovery(plugin: &Path) -> Result<IosDiscovery, DaemonError> {
+        let value = Self::doctor_plugin_action(plugin, "device.discover", serde_json::json!({}))?;
+        serde_json::from_value(value).map_err(|_| {
+            DaemonError::DeviceUnavailable("iOS discovery returned malformed data".into())
+        })
+    }
+
     fn run_ios_task(
         process: &StoredProcess,
         capability: &str,
@@ -1872,6 +2322,46 @@ impl Daemon {
         name: &str,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, DaemonError> {
+        Self::plugin_call(
+            plugin,
+            PluginAction::Action {
+                name: name.into(),
+                input,
+            },
+        )
+    }
+
+    fn doctor_plugin_action(
+        plugin: &Path,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, DaemonError> {
+        Self::doctor_plugin_call(
+            plugin,
+            PluginAction::Action {
+                name: name.into(),
+                input,
+            },
+        )
+    }
+
+    fn doctor_plugin_call(
+        plugin: &Path,
+        action: PluginAction,
+    ) -> Result<serde_json::Value, DaemonError> {
+        Self::plugin_call_with_timeout(plugin, action, Some(DOCTOR_PLUGIN_TIMEOUT))
+    }
+
+    fn plugin_call(plugin: &Path, action: PluginAction) -> Result<serde_json::Value, DaemonError> {
+        Self::plugin_call_with_timeout(plugin, action, None)
+    }
+
+    fn plugin_call_with_timeout(
+        plugin: &Path,
+        action: PluginAction,
+        timeout: Option<Duration>,
+    ) -> Result<serde_json::Value, DaemonError> {
+        let action_name = plugin_action_name(&action).to_owned();
         let request = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Uuid::now_v7(),
@@ -1880,10 +2370,7 @@ impl Daemon {
                 protocol: PROTOCOL_VERSION,
                 plugin_state_version: 1,
                 operation_id: Uuid::now_v7(),
-                action: PluginAction::Action {
-                    name: name.into(),
-                    input,
-                },
+                action,
             })
             .map_err(|error| DaemonError::Operation(error.to_string()))?,
         };
@@ -1904,15 +2391,16 @@ impl Daemon {
             .write_all(&write_json_line(&request).map_err(|error| protocol_error(&error))?)
             .map_err(|error| DaemonError::Operation(error.to_string()))?;
         drop(stdin);
-        let output = child
-            .wait_with_output()
-            .map_err(|error| DaemonError::Operation(error.to_string()))?;
-        if !output.status.success() || output.stdout.len() > devfleet_protocol::MAX_FRAME_BYTES {
-            return Err(DaemonError::CapabilityUnsupported(name.into()));
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| DaemonError::Operation("plugin stdout unavailable".into()))?;
+        let (status, stdout) = wait_for_plugin_response(child, stdout, timeout)?;
+        if !status.success() || stdout.len() > devfleet_protocol::MAX_FRAME_BYTES {
+            return Err(DaemonError::CapabilityUnsupported(action_name));
         }
-        let response =
-            read_json_line::<JsonRpcResponse>(&mut BufReader::new(output.stdout.as_slice()))
-                .map_err(|error| protocol_error(&error))?;
+        let response = read_json_line::<JsonRpcResponse>(&mut BufReader::new(stdout.as_slice()))
+            .map_err(|error| protocol_error(&error))?;
         if response.id != request.id {
             return Err(DaemonError::Operation(
                 "plugin response identity does not match request".into(),
@@ -4462,11 +4950,205 @@ fn protocol_error(error: &devfleet_protocol::ProtocolError) -> DaemonError {
     DaemonError::Operation(error.to_string())
 }
 
+fn proposed_manifest() -> String {
+    r#"schema_version = 1
+
+[profiles.process]
+resources = ["app"]
+
+[resources.app]
+provider = "official.process"
+"#
+    .into()
+}
+
+fn proposed_integrations() -> Vec<String> {
+    vec![
+        "Add the proposed devfleet.toml only after review; init never writes tracked configuration."
+            .into(),
+        "Declare project-owned resources and explicit trusted provider IDs in the reviewed manifest."
+            .into(),
+        "Add a ReactNativeIdentityHook module only when app-handshake verification is selected."
+            .into(),
+        "Choose explicitly whether generated .devfleet integration artifacts belong in .gitignore."
+            .into(),
+    ]
+}
+
+fn doctor_finding(
+    phase: DoctorPhase,
+    resource: impl Into<String>,
+    cause: impl Into<String>,
+    retryable: bool,
+    remediation: impl Into<String>,
+) -> DoctorFinding {
+    DoctorFinding {
+        phase,
+        resource: resource.into(),
+        cause: cause.into(),
+        retryable,
+        remediation: remediation.into(),
+        blocking: true,
+    }
+}
+
+fn ios_selection_available(selections: &[IosAvailableSelection], selected: &str) -> bool {
+    selections
+        .iter()
+        .any(|candidate| candidate.identifier == selected && candidate.available)
+}
+
+fn tool_remediation(resource: &str) -> &'static str {
+    match resource {
+        "node" => "Install a supported Node.js runtime and retry doctor.",
+        "react_native" => "Install the project's dependencies, then rerun doctor.",
+        "xcodebuild" => "Install or select the supported Xcode toolchain and retry doctor.",
+        _ => "Repair the required tool and retry doctor.",
+    }
+}
+
+fn plugin_action_name(action: &PluginAction) -> &str {
+    match action {
+        PluginAction::Initialize => "lifecycle.initialize",
+        PluginAction::Validate { .. } => "lifecycle.validate",
+        PluginAction::Plan { .. } => "lifecycle.plan",
+        PluginAction::Inspect => "lifecycle.inspect",
+        PluginAction::Reconcile(_) => "lifecycle.reconcile",
+        PluginAction::ComposeReconcile(_) => "compose.reconcile",
+        PluginAction::Stop => "lifecycle.stop",
+        PluginAction::Destroy => "lifecycle.destroy",
+        PluginAction::Action { name, .. } => name,
+        PluginAction::Cancel => "lifecycle.cancel",
+    }
+}
+
+fn wait_for_plugin_response(
+    mut child: Child,
+    mut stdout: std::process::ChildStdout,
+    timeout: Option<Duration>,
+) -> Result<(std::process::ExitStatus, Vec<u8>), DaemonError> {
+    let started = Instant::now();
+    let mut output = Vec::new();
+    let mut child_status = None;
+    let mut stdout_closed = false;
+    loop {
+        if let Some(timeout) = timeout
+            && started.elapsed() >= timeout
+        {
+            terminate_plugin_child(&mut child);
+            return Err(DaemonError::Operation(format!(
+                "plugin call exceeded the {} second doctor deadline",
+                timeout.as_secs()
+            )));
+        }
+
+        if stdout_closed {
+            thread::sleep(Duration::from_millis(1));
+        } else {
+            let remaining = timeout.map_or(Duration::from_millis(10), |timeout| {
+                timeout.saturating_sub(started.elapsed())
+            });
+            let poll_timeout = u16::try_from(remaining.as_millis().min(10)).unwrap_or(10);
+            let mut fds = [PollFd::new(
+                stdout.as_fd(),
+                PollFlags::POLLIN | PollFlags::POLLHUP,
+            )];
+            if let Err(error) = poll(&mut fds, poll_timeout) {
+                terminate_plugin_child(&mut child);
+                return Err(DaemonError::Operation(error.to_string()));
+            }
+            let events = fds[0].revents().unwrap_or_else(PollFlags::empty);
+            if events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+                let mut buffer = [0_u8; 8192];
+                match stdout.read(&mut buffer) {
+                    Ok(0) => stdout_closed = true,
+                    Ok(read) => {
+                        output.extend_from_slice(&buffer[..read]);
+                        if output.len() > devfleet_protocol::MAX_FRAME_BYTES {
+                            terminate_plugin_child(&mut child);
+                            return Err(DaemonError::Operation(
+                                "plugin response exceeded the protocol frame limit".into(),
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        terminate_plugin_child(&mut child);
+                        return Err(DaemonError::Operation(error.to_string()));
+                    }
+                }
+            } else if events.contains(PollFlags::POLLERR) {
+                terminate_plugin_child(&mut child);
+                return Err(DaemonError::Operation("plugin stdout poll failed".into()));
+            }
+        }
+
+        if child_status.is_none() {
+            child_status = child
+                .try_wait()
+                .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        }
+        if let Some(status) = child_status
+            && stdout_closed
+        {
+            return Ok((status, output));
+        }
+    }
+}
+
+fn terminate_plugin_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, net::TcpListener, os::unix::net::UnixListener};
     use tempfile::TempDir;
+
+    #[test]
+    fn bounded_plugin_wait_kills_an_unresponsive_provider() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sleep starts");
+        let stdout = child.stdout.take().expect("sleep stdout");
+        let error = wait_for_plugin_response(child, stdout, Some(Duration::from_millis(10)))
+            .expect_err("unresponsive provider times out");
+        assert!(error.to_string().contains("doctor deadline"));
+    }
+
+    #[test]
+    fn plugin_stdout_reader_drains_a_response_larger_than_a_pipe() {
+        let mut child = Command::new("/bin/dd")
+            .args(["if=/dev/zero", "bs=131072", "count=1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("large provider response starts");
+        let stdout = child.stdout.take().expect("provider stdout");
+        let (status, stdout) =
+            wait_for_plugin_response(child, stdout, Some(Duration::from_secs(1)))
+                .expect("provider completes while stdout is drained");
+        assert!(status.success());
+        assert_eq!(stdout.len(), 131_072);
+    }
+
+    #[test]
+    fn descendant_stdout_cannot_extend_the_doctor_deadline() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 1 & exit 0"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("provider starts descendant");
+        let stdout = child.stdout.take().expect("provider stdout");
+        let error = wait_for_plugin_response(child, stdout, Some(Duration::from_millis(10)))
+            .expect_err("inherited stdout times out");
+        assert!(error.to_string().contains("doctor deadline"));
+    }
 
     #[test]
     fn compose_destroy_rejects_project_or_symlink_boundary_changes() {
@@ -4611,6 +5293,23 @@ mod tests {
             ..transport
         };
         assert!(identity_launch_config(&missing_hook).is_err());
+    }
+
+    #[test]
+    fn validates_only_an_installed_available_pinned_ios_selection() {
+        let selections = vec![
+            IosAvailableSelection {
+                identifier: "runtime-18".into(),
+                available: true,
+            },
+            IosAvailableSelection {
+                identifier: "runtime-19".into(),
+                available: false,
+            },
+        ];
+        assert!(ios_selection_available(&selections, "runtime-18"));
+        assert!(!ios_selection_available(&selections, "runtime-19"));
+        assert!(!ios_selection_available(&selections, "runtime-missing"));
     }
 
     #[test]

@@ -59,6 +59,34 @@ devfleet --socket /tmp/df-$(id -u)/daemon.sock compose up \
   --endpoint api=api:3000:20001:/health
 ```
 
+## Project setup and diagnosis
+
+`init` discovers an existing Git worktree, records the explicit project trust
+decision in private state, and prints a proposed `devfleet.toml` plus required
+integrations. It never writes tracked configuration or converts a monorepo.
+Pass `--runtime` and `--device-type` together to pin an installed local iOS
+selection after the trusted iOS plugin has validated it.
+
+```sh
+devfleet --socket /tmp/df-$(id -u)/daemon.sock init \
+  --trust --worktree "$PWD" \
+  --runtime com.apple.CoreSimulator.SimRuntime.iOS-18-0 \
+  --device-type com.apple.CoreSimulator.SimDeviceType.iPhone-16
+```
+
+Copy the proposed manifest only after review. `doctor` performs read-only
+checks for project trust, manifest presence, plugin trust/compatibility, local
+Docker context, Node/React Native/Xcode tooling, pinned iOS selections, and
+optional environment bindings/preparation. Its human and `--json` output
+contains phase, resource, cause, retryability, and remediation for every
+blocking finding.
+
+```sh
+devfleet --socket /tmp/df-$(id -u)/daemon.sock doctor --worktree "$PWD"
+devfleet --socket /tmp/df-$(id -u)/daemon.sock --json doctor \
+  --worktree "$PWD" --environment-id <environment-id>
+```
+
 ## Ordered initialization
 
 Run declared backend migrations and seeds through the environment's trusted
