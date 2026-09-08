@@ -41,6 +41,7 @@ enum Command {
     List,
     Stop { environment_id: Uuid },
     Destroy(DestroyArgs),
+    Reconcile { environment_id: Uuid },
     Scheduler(SchedulerArgs),
     Operation(OperationArgs),
     Events(EventsArgs),
@@ -706,6 +707,7 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 purge_artifacts: destroy.purge_artifacts,
             }))
         }
+        Command::Reconcile { environment_id } => Ok(DaemonRequest::Reconcile { environment_id }),
         Command::Scheduler(scheduler) => match scheduler.command {
             SchedulerCommand::Status => Ok(DaemonRequest::SchedulerStatus),
             SchedulerCommand::Focus { environment_id } => {
@@ -870,6 +872,12 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                 environment.worktree_id,
                 environment.lifecycle
             );
+            if let Some(diagnostic) = &environment.reconciliation_diagnostic {
+                println!("reconciliation diagnostic={diagnostic}");
+            }
+            if let Some(action) = &environment.reconciliation_action {
+                println!("reconciliation action={action}");
+            }
             for endpoint in &environment.endpoints {
                 println!(
                     "endpoint {} internal={} host={} device={} healthy={}",

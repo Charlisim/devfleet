@@ -156,6 +156,28 @@ pub struct ComposeDestroyRequest {
     pub purge_data: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComposeInspectRequest {
+    pub project_name: String,
+    pub worktree: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposeInspectionState {
+    Present,
+    Missing,
+    Unavailable,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ComposeInspection {
+    pub project_name: String,
+    pub state: ComposeInspectionState,
+    pub container_count: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulingPriority {
@@ -568,6 +590,9 @@ pub enum DaemonRequest {
     },
     DeviceCapture(DeviceCaptureRequest),
     Destroy(DestroyRequest),
+    Reconcile {
+        environment_id: Uuid,
+    },
     SchedulerConfigure(SchedulerConfig),
     SchedulerStatus,
     SchedulerFocus {
@@ -700,6 +725,7 @@ pub enum OperationStatus {
     Cancelled,
     Completed,
     Failed,
+    Uncertain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -741,6 +767,7 @@ pub struct EnvironmentSnapshot {
     pub generation: u64,
     pub lifecycle: LifecycleState,
     pub reconciliation_diagnostic: Option<String>,
+    pub reconciliation_action: Option<String>,
     pub process: Option<ProcessSnapshot>,
     pub endpoints: Vec<EndpointSnapshot>,
     pub readiness: EnvironmentReadiness,

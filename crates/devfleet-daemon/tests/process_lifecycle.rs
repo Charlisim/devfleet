@@ -90,6 +90,85 @@ fn scheduler_configures_host_budgets_and_exposes_focus_in_events() {
 }
 
 #[test]
+fn reconcile_reuses_the_exact_supervised_process_without_disturbing_other_environments() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let fixture = start_daemon(temporary.path());
+    let recovered = up_environment(&fixture.socket, temporary.path(), "recover");
+    let independent = up_environment(&fixture.socket, temporary.path(), "independent");
+    let DaemonResponse::Environment(before) = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: recovered,
+        },
+    )
+    .expect("status before reconciliation") else {
+        panic!("expected environment");
+    };
+    let DaemonResponse::Environment(after) = request(
+        &fixture.socket,
+        DaemonRequest::Reconcile {
+            environment_id: recovered,
+        },
+    )
+    .expect("reconciliation completes") else {
+        panic!("expected environment");
+    };
+    assert_eq!(after.lifecycle, LifecycleState::Running);
+    assert_eq!(
+        after.process.expect("recovered process").pid,
+        before.process.expect("original process").pid
+    );
+    let DaemonResponse::Environment(other) = request(
+        &fixture.socket,
+        DaemonRequest::Status {
+            environment_id: independent,
+        },
+    )
+    .expect("independent status") else {
+        panic!("expected environment");
+    };
+    assert_eq!(other.lifecycle, LifecycleState::Running);
+    stop(&fixture.socket, recovered);
+    stop(&fixture.socket, independent);
+}
+
+#[test]
+fn daemon_restart_recovers_only_the_exact_retained_supervisor_identity() {
+    let temporary = TempDir::new().expect("temporary directory");
+    initialize_git_repository(temporary.path());
+    let mut first = start_daemon(temporary.path());
+    let environment = up_environment(&first.socket, temporary.path(), "daemon-restart");
+    let DaemonResponse::Environment(before) = request(
+        &first.socket,
+        DaemonRequest::Status {
+            environment_id: environment,
+        },
+    )
+    .expect("status before restart") else {
+        panic!("expected environment");
+    };
+    first.child.kill().expect("daemon terminates");
+    first.child.wait().expect("daemon reaps");
+    let second = start_daemon(temporary.path());
+    let DaemonResponse::Environment(after) = request(
+        &second.socket,
+        DaemonRequest::Status {
+            environment_id: environment,
+        },
+    )
+    .expect("status after restart") else {
+        panic!("expected environment");
+    };
+    assert_eq!(after.lifecycle, LifecycleState::Running);
+    assert_eq!(
+        after.process.expect("recovered process").pid,
+        before.process.expect("retained process").pid
+    );
+    stop(&second.socket, environment);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn bindings_write_private_phase_artifacts_and_expose_only_public_metadata() {
     let temporary = TempDir::new().expect("temporary directory");
@@ -941,7 +1020,7 @@ fn start_daemon_with_plugin_trust(root: &Path, trust_plugin: bool) -> DaemonFixt
         .stderr(Stdio::inherit())
         .spawn()
         .expect("daemon starts");
-    wait_for_path(&socket);
+    wait_for_daemon(&socket);
     if trust_plugin {
         request(
             &socket,
@@ -966,9 +1045,9 @@ fn start_daemon_with_plugin_trust(root: &Path, trust_plugin: bool) -> DaemonFixt
     }
 }
 
-fn wait_for_path(path: &Path) {
+fn wait_for_daemon(socket: &Path) {
     let started = Instant::now();
-    while !path.exists() {
+    while request(socket, DaemonRequest::PluginList).is_err() {
         assert!(
             started.elapsed() < TIMEOUT,
             "daemon socket startup timed out"

@@ -8,10 +8,11 @@ use devfleet_core::{
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
     ArtifactKind, ArtifactSnapshot, BindingApplyRequest, BindingIntegration, BindingInvalidation,
-    BindingPhase, BindingSnapshot, ComposeDestroyRequest, ComposeReconcileRequest,
-    ComposeUpRequest, DaemonRequest, DaemonResponse, DestroyAuthorization, DestroyRequest,
-    DestroySnapshot, DestroyTarget, DestroyTargetStatus, DeviceCaptureRequest, EndpointSnapshot,
-    EnvironmentPlanSnapshot, EnvironmentReadiness, EnvironmentSnapshot, ErrorCode, EventSnapshot,
+    BindingPhase, BindingSnapshot, ComposeDestroyRequest, ComposeInspection,
+    ComposeInspectionState, ComposeReconcileRequest, ComposeUpRequest, DaemonRequest,
+    DaemonResponse, DestroyAuthorization, DestroyRequest, DestroySnapshot, DestroyTarget,
+    DestroyTargetStatus, DeviceCaptureRequest, EndpointSnapshot, EnvironmentPlanSnapshot,
+    EnvironmentReadiness, EnvironmentSnapshot, ErrorCode, EventSnapshot,
     IdentityVerificationSnapshot, IdentityVerificationStartRequest, InitializationRunRequest,
     InitializationTask, InitializationTaskKind, InitializationTaskSnapshot,
     InitializationTaskStatus, IosAppRunRequest, IosAppSnapshot, IosSimulatorAcquireRequest,
@@ -94,13 +95,13 @@ pub fn run(config: DaemonConfig) -> anyhow::Result<()> {
     let listener = UnixListener::bind(&config.socket)?;
     let _socket_cleanup = DaemonSocketCleanup(config.socket.clone());
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
-    let mut state = StateStore::open(&config.state_dir.join("state.sqlite3"))?;
-    reconcile_supervisors(&mut state)?;
+    let state = StateStore::open(&config.state_dir.join("state.sqlite3"))?;
     let mut daemon = Daemon {
         config,
         state,
         scheduler: HostScheduler::default(),
     };
+    daemon.reconcile_startup()?;
 
     loop {
         let (stream, _) = listener.accept()?;
@@ -214,6 +215,9 @@ impl Daemon {
             }
             DaemonRequest::DeviceCapture(request) => self.device_capture(&request),
             DaemonRequest::Destroy(request) => self.destroy(&request),
+            DaemonRequest::Reconcile { environment_id } => {
+                self.reconcile_environment(environment_id)
+            }
             DaemonRequest::SchedulerConfigure(config) => self.scheduler_configure(config),
             DaemonRequest::SchedulerStatus => {
                 Ok(DaemonResponse::Scheduler(self.scheduler.snapshot()))
@@ -422,6 +426,11 @@ impl Daemon {
                 && environment.profile == request.profile
                 && environment.instance == request.instance
         });
+        if matching_environment
+            .is_some_and(|environment| environment.lifecycle == StoredLifecycle::Degraded)
+        {
+            return Err(DaemonError::OwnershipUncertain);
+        }
         if let Some(environment) = matching_environment.filter(|environment| {
             matches!(
                 environment.lifecycle,
@@ -686,6 +695,11 @@ impl Daemon {
                 && environment.profile == request.profile
                 && environment.instance == request.instance
         });
+        if matching_environment
+            .is_some_and(|environment| environment.lifecycle == StoredLifecycle::Degraded)
+        {
+            return Err(DaemonError::OwnershipUncertain);
+        }
         if let Some(environment) = matching_environment.filter(|environment| {
             matches!(
                 environment.lifecycle,
@@ -1974,6 +1988,264 @@ impl Daemon {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(DaemonResponse::Environments(snapshots))
+    }
+
+    fn reconcile_startup(&mut self) -> Result<(), DaemonError> {
+        let environment_ids = self
+            .state
+            .environments()?
+            .into_iter()
+            .map(|environment| environment.id)
+            .collect::<Vec<_>>();
+        for environment_id in environment_ids {
+            self.reconcile_environment_state(environment_id)?;
+        }
+        Ok(())
+    }
+
+    fn reconcile_environment(
+        &mut self,
+        environment_id: Uuid,
+    ) -> Result<DaemonResponse, DaemonError> {
+        self.reconcile_environment_state(environment_id)?;
+        self.status(environment_id)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_environment_state(&mut self, environment_id: Uuid) -> Result<(), DaemonError> {
+        let environment = self
+            .state
+            .environment(environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        if !matches!(
+            environment.lifecycle,
+            StoredLifecycle::Starting | StoredLifecycle::Running | StoredLifecycle::Degraded
+        ) {
+            return Ok(());
+        }
+        let was_degraded = environment.lifecycle == StoredLifecycle::Degraded;
+        let operation = self.state.latest_operation(environment.id)?;
+        if let Some(process) = environment.process.clone() {
+            match request_supervisor(
+                Path::new(&process.supervisor_socket),
+                SupervisorRequest::Inspect,
+            ) {
+                Ok(SupervisorResponse::Process(observed))
+                    if observed.pid == process.pid
+                        && observed.process_group == process.process_group
+                        && observed.readiness == ReadinessState::ProcessAlive =>
+                {
+                    self.state
+                        .record_running_process(environment.id, &stored_process(&observed))?;
+                }
+                Ok(_) => {
+                    return self.quarantine_reconciliation(
+                        &environment,
+                        "supervisor identity differs from the retained journal; no process was adopted or terminated",
+                    );
+                }
+                Err(_) => {
+                    return self.quarantine_reconciliation(
+                        &environment,
+                        "supervisor is unavailable; external resources and leases remain retained",
+                    );
+                }
+            }
+        } else {
+            if operation
+                .as_ref()
+                .and_then(|operation| operation.resource_id.as_deref())
+                != Some("process")
+            {
+                return self.quarantine_reconciliation(
+                        &environment,
+                        "an external effect may have completed before its process identity was persisted",
+                    );
+            }
+            let socket = supervisor_socket_path(environment.id)?;
+            match request_supervisor(&socket, SupervisorRequest::Inspect) {
+                Ok(SupervisorResponse::Process(observed))
+                    if observed.readiness == ReadinessState::ProcessAlive =>
+                {
+                    self.state
+                        .record_running_process(environment.id, &stored_process(&observed))?;
+                }
+                _ => {
+                    return self.quarantine_reconciliation(
+                        &environment,
+                        "an accepted operation has no persisted process identity",
+                    );
+                }
+            }
+        }
+
+        if operation
+            .as_ref()
+            .and_then(|operation| operation.resource_id.as_deref())
+            == Some("compose")
+            && self.state.compose_resource(environment.id)?.is_none()
+        {
+            return self.quarantine_reconciliation(
+                &environment,
+                "Compose may exist but its exact ownership record was not persisted",
+            );
+        }
+        if let Some(compose) = self
+            .state
+            .compose_resource(environment.id)?
+            .filter(|resource| resource.lifecycle == "active")
+        {
+            let Ok(plugin) = self.trusted_plugin("official.compose", "compose.inspect") else {
+                return self.quarantine_reconciliation(
+                    &environment,
+                    "the Compose label inspector is unavailable; retained project ownership was not assumed",
+                );
+            };
+            let inspection = Self::plugin_action(
+                &plugin,
+                "compose.inspect",
+                serde_json::json!({
+                    "project_name": compose.project_name,
+                    "worktree": compose.worktree,
+                }),
+            )
+            .and_then(|value| {
+                serde_json::from_value::<ComposeInspection>(value)
+                    .map_err(|error| DaemonError::Operation(error.to_string()))
+            });
+            match inspection {
+                Ok(inspection)
+                    if inspection.project_name == compose.project_name
+                        && inspection.state == ComposeInspectionState::Present => {}
+                Ok(ComposeInspection {
+                    state: ComposeInspectionState::Missing,
+                    ..
+                }) => {
+                    return self.quarantine_reconciliation(
+                        &environment,
+                        "the retained Compose labels are absent after inspection",
+                    );
+                }
+                Ok(ComposeInspection {
+                    state: ComposeInspectionState::Unavailable,
+                    ..
+                }) => {
+                    return self.quarantine_reconciliation(
+                        &environment,
+                        "Docker is unavailable after inspection; no Compose resource was recreated",
+                    );
+                }
+                Ok(_) | Err(_) => {
+                    self.state.mark_compose_uncertain(environment.id)?;
+                    return self.quarantine_reconciliation(
+                        &environment,
+                        "the retained Compose labels do not prove the exact project identity",
+                    );
+                }
+            }
+        }
+        if self
+            .state
+            .initialization_tasks(environment.id)?
+            .iter()
+            .any(|task| task.status == "running")
+            || self
+                .state
+                .preparation_tasks(environment.id)?
+                .iter()
+                .any(|task| task.status == "running")
+        {
+            return self.quarantine_reconciliation(
+                &environment,
+                "a mutable task was interrupted before its result was persisted",
+            );
+        }
+        if let Some(app) = self.state.ios_app(environment.id)?
+            && !Path::new(&app.derived_data).is_dir()
+        {
+            return self.quarantine_reconciliation(
+                &environment,
+                "the retained native build identity no longer has its derived-data directory",
+            );
+        }
+        if let Some(device) = self.state.ios_device(environment.id)? {
+            let Some(udid) = device.udid else {
+                return self.quarantine_reconciliation(
+                    &environment,
+                    "simulator creation was interrupted before a UDID was persisted",
+                );
+            };
+            let Ok(plugin) = self.trusted_plugin("official.ios", "device.discover") else {
+                return self.quarantine_reconciliation(
+                    &environment,
+                    "the iOS inspector is unavailable; retained UDID ownership was not assumed",
+                );
+            };
+            let Ok(discovery) = Self::ios_discovery(&plugin) else {
+                return self.quarantine_reconciliation(
+                    &environment,
+                    "CoreSimulator inspection failed; retained UDID ownership was not assumed",
+                );
+            };
+            let exact_device = discovery.devices.iter().any(|candidate| {
+                candidate.udid.eq_ignore_ascii_case(&udid)
+                    && candidate.name == device.expected_name
+                    && candidate.runtime == device.runtime
+                    && candidate.available
+            });
+            if !exact_device {
+                self.state.set_ios_lifecycle(environment.id, "uncertain")?;
+                return self.quarantine_reconciliation(
+                    &environment,
+                    "the retained UDID no longer matches its exact simulator identity",
+                );
+            }
+        }
+        if environment
+            .endpoints
+            .iter()
+            .any(|endpoint| !endpoint_is_healthy(endpoint))
+        {
+            return self.quarantine_reconciliation(
+                &environment,
+                "an external endpoint is unavailable after recovery inspection",
+            );
+        }
+
+        if was_degraded {
+            self.state.require_app_reverification(environment.id)?;
+        }
+        self.state.mark_recovered(environment.id)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            if was_degraded {
+                "reconciliation_recovered_reverify_app"
+            } else {
+                "reconciliation_recovered"
+            },
+        )?;
+        Ok(())
+    }
+
+    fn quarantine_reconciliation(
+        &mut self,
+        environment: &StoredEnvironment,
+        detail: &str,
+    ) -> Result<(), DaemonError> {
+        let diagnostic = format!(
+            "{detail}. Run `devfleet reconcile {}` after restoring the required tool or inspecting the retained resource.",
+            environment.id
+        );
+        self.state
+            .mark_reconciliation_uncertain(environment.id, &diagnostic)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            "reconciliation_quarantined",
+        )
     }
 
     fn scheduler_configure(
@@ -3581,6 +3853,7 @@ fn ios_app_snapshot(app: StoredIosApp) -> IosAppSnapshot {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn snapshot(environment: StoredEnvironment, inputs: SnapshotInputs) -> EnvironmentSnapshot {
     let SnapshotInputs {
         tasks,
@@ -3636,6 +3909,8 @@ fn snapshot(environment: StoredEnvironment, inputs: SnapshotInputs) -> Environme
     let identity_verified = identity.as_ref().is_some_and(|identity| {
         identity.generation == environment.generation && identity.status == "verified"
     });
+    let reconciliation_action = (lifecycle == LifecycleState::Degraded)
+        .then(|| format!("devfleet reconcile {}", environment.id));
     let operational = backend_healthy && metro_ready && device_booted && app_launched;
     EnvironmentSnapshot {
         environment_id: environment.id,
@@ -3647,6 +3922,7 @@ fn snapshot(environment: StoredEnvironment, inputs: SnapshotInputs) -> Environme
         generation: environment.generation,
         lifecycle,
         reconciliation_diagnostic: environment.reconciliation_diagnostic,
+        reconciliation_action,
         process: environment.process.map(|process| ProcessSnapshot {
             pid: process.pid,
             process_group: process.process_group,
@@ -3710,26 +3986,6 @@ fn ios_snapshot(device: StoredIosDevice) -> Result<IosSimulatorSnapshot, DaemonE
     })
 }
 
-fn reconcile_supervisors(state: &mut StateStore) -> Result<(), anyhow::Error> {
-    for environment in state.environments()? {
-        let Some(process) = environment.process else {
-            continue;
-        };
-        if !matches!(
-            environment.lifecycle,
-            StoredLifecycle::Running | StoredLifecycle::Starting | StoredLifecycle::Degraded
-        ) {
-            continue;
-        }
-        match request_supervisor(Path::new(&process.supervisor_socket), SupervisorRequest::Inspect) {
-            Ok(SupervisorResponse::Process(observed)) if observed.pid == process.pid && observed.process_group == process.process_group => state.mark_recovered(environment.id)?,
-            Ok(_) => state.mark_degraded(environment.id, "Supervisor identity differs from the retained journal; ownership uncertain and no process was terminated.")?,
-            Err(_) => state.mark_degraded(environment.id, "Supervisor is unavailable after daemon restart; ownership uncertain and no process was terminated.")?,
-        }
-    }
-    Ok(())
-}
-
 fn environment_key(
     project_fingerprint: &str,
     worktree_fingerprint: &str,
@@ -3782,6 +4038,9 @@ fn operation_snapshot(operation: StoredOperation) -> OperationSnapshot {
                 devfleet_protocol::OperationStatus::Completed
             }
             devfleet_state::OperationStatus::Failed => devfleet_protocol::OperationStatus::Failed,
+            devfleet_state::OperationStatus::Uncertain => {
+                devfleet_protocol::OperationStatus::Uncertain
+            }
         },
         deadline_unix_ms: operation.deadline_unix_ms,
         phase: operation.phase,

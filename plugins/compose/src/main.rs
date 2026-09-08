@@ -1,8 +1,8 @@
 use clap::Parser;
 use devfleet_plugin_sdk::{PluginError, Provider, ProviderDescriptor, serve_once};
 use devfleet_protocol::{
-    ComposeAuthorizations, ComposeDestroyRequest, ComposeReconcileRequest, HostSpawnRequest,
-    PROTOCOL_VERSION,
+    ComposeAuthorizations, ComposeDestroyRequest, ComposeInspectRequest, ComposeInspection,
+    ComposeInspectionState, ComposeReconcileRequest, HostSpawnRequest, PROTOCOL_VERSION,
 };
 use semver::Version;
 use serde_json::Value;
@@ -33,6 +33,7 @@ impl Provider for ComposeProvider {
                 "lifecycle.inspect".into(),
                 "compose.reconcile".into(),
                 "compose.destroy".into(),
+                "compose.inspect".into(),
                 "lifecycle.stop".into(),
                 "lifecycle.destroy".into(),
                 "lifecycle.action".into(),
@@ -59,18 +60,32 @@ impl Provider for ComposeProvider {
     }
 
     fn action(&self, name: String, input: Value) -> Result<Value, PluginError> {
-        if name != "compose.destroy" {
-            return Err(PluginError::UnsupportedMethod(name));
+        match name.as_str() {
+            "compose.destroy" => {
+                let request: ComposeDestroyRequest =
+                    serde_json::from_value(input).map_err(|_| {
+                        PluginError::InvalidCall("invalid compose.destroy input".into())
+                    })?;
+                validate_destroy_request(&request).map_err(|error| plugin_error(&error))?;
+                serde_json::to_value(HostSpawnRequest {
+                    argv: compose_destroy_args(&request).map_err(|error| plugin_error(&error))?,
+                    cwd: request.worktree,
+                    environment: compose_environment(BTreeMap::new()),
+                })
+                .map_err(|error| PluginError::RequestFailed(error.to_string()))
+            }
+            "compose.inspect" => {
+                let request: ComposeInspectRequest =
+                    serde_json::from_value(input).map_err(|_| {
+                        PluginError::InvalidCall("invalid compose.inspect input".into())
+                    })?;
+                serde_json::to_value(
+                    inspect_compose(&request).map_err(|error| plugin_error(&error))?,
+                )
+                .map_err(|error| PluginError::RequestFailed(error.to_string()))
+            }
+            _ => Err(PluginError::UnsupportedMethod(name)),
         }
-        let request: ComposeDestroyRequest = serde_json::from_value(input)
-            .map_err(|_| PluginError::InvalidCall("invalid compose.destroy input".into()))?;
-        validate_destroy_request(&request).map_err(|error| plugin_error(&error))?;
-        serde_json::to_value(HostSpawnRequest {
-            argv: compose_destroy_args(&request).map_err(|error| plugin_error(&error))?,
-            cwd: request.worktree,
-            environment: compose_environment(BTreeMap::new()),
-        })
-        .map_err(|error| PluginError::RequestFailed(error.to_string()))
     }
 }
 
@@ -238,6 +253,121 @@ fn compose_environment(mut environment: BTreeMap<String, String>) -> BTreeMap<St
     environment
 }
 
+fn inspect_compose(request: &ComposeInspectRequest) -> Result<ComposeInspection, ComposeError> {
+    if !valid_devfleet_project_name(&request.project_name) {
+        return Err(ComposeError::Invalid(
+            "invalid DevFleet Compose project name".into(),
+        ));
+    }
+    let worktree = Path::new(&request.worktree)
+        .canonicalize()
+        .map_err(|_| ComposeError::Invalid("worktree must exist".into()))?;
+    if !worktree.is_dir() {
+        return Err(ComposeError::Invalid("worktree must be a directory".into()));
+    }
+    let (state, container_count) = match local_docker_context(&worktree) {
+        Ok(true) => match inspection_docker_output(
+            &worktree,
+            vec![
+                OsString::from("ps"),
+                OsString::from("--all"),
+                OsString::from("--filter"),
+                OsString::from(format!(
+                    "label=com.docker.compose.project={}",
+                    request.project_name
+                )),
+                OsString::from("--format"),
+                OsString::from("{{.ID}}\t{{.Label \"com.docker.compose.project\"}}\t{{.State}}"),
+            ],
+        ) {
+            Ok(output) if output.status.success() => {
+                compose_inspection_from_output(&request.project_name, &output.stdout)
+            }
+            Ok(_) | Err(_) => (ComposeInspectionState::Unavailable, 0),
+        },
+        Ok(false) => (ComposeInspectionState::Uncertain, 0),
+        Err(_) => (ComposeInspectionState::Unavailable, 0),
+    };
+    Ok(ComposeInspection {
+        project_name: request.project_name.clone(),
+        state,
+        container_count,
+    })
+}
+
+fn local_docker_context(worktree: &Path) -> Result<bool, ComposeError> {
+    let context = inspection_docker_output(
+        worktree,
+        vec![OsString::from("context"), OsString::from("show")],
+    )?;
+    if !context.status.success() {
+        return Err(ComposeError::DockerFailed);
+    }
+    let context = String::from_utf8(context.stdout).map_err(|_| ComposeError::DockerFailed)?;
+    let name = context.trim();
+    if name.is_empty() {
+        return Err(ComposeError::DockerFailed);
+    }
+    let inspected = inspection_docker_output(
+        worktree,
+        vec![
+            OsString::from("context"),
+            OsString::from("inspect"),
+            OsString::from(name),
+            OsString::from("--format"),
+            OsString::from("{{.Endpoints.docker.Host}}"),
+        ],
+    )?;
+    if !inspected.status.success() {
+        return Err(ComposeError::DockerFailed);
+    }
+    let host = String::from_utf8(inspected.stdout).map_err(|_| ComposeError::DockerFailed)?;
+    Ok(host.trim().starts_with("unix://"))
+}
+
+fn inspection_docker_output(worktree: &Path, args: Vec<OsString>) -> Result<Output, ComposeError> {
+    let mut command = Command::new("docker");
+    command
+        .args(args)
+        .current_dir(worktree)
+        .env_clear()
+        .env("PATH", DOCKER_PATH);
+    if let Some(home) = std::env::var_os("HOME") {
+        command.env("HOME", home);
+    }
+    command.output().map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => ComposeError::DockerUnavailable,
+        _ => ComposeError::DockerFailed,
+    })
+}
+
+fn compose_inspection_from_output(
+    project_name: &str,
+    output: &[u8],
+) -> (ComposeInspectionState, u32) {
+    let Ok(output) = std::str::from_utf8(output) else {
+        return (ComposeInspectionState::Uncertain, 0);
+    };
+    let mut count = 0_u32;
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 3
+            || fields[0].len() < 12
+            || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+            || fields[1] != project_name
+            || fields[2].is_empty()
+        {
+            return (ComposeInspectionState::Uncertain, 0);
+        }
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        (ComposeInspectionState::Missing, 0)
+    } else {
+        (ComposeInspectionState::Present, count)
+    }
+}
+
 fn compose_args(request: &ComposeReconcileRequest, command: &str) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("compose"),
@@ -298,13 +428,7 @@ fn compose_destroy_command_args(request: &ComposeDestroyRequest) -> Vec<OsString
 }
 
 fn validate_destroy_request(request: &ComposeDestroyRequest) -> Result<(), ComposeError> {
-    let name = request.project_name.split('_').collect::<Vec<_>>();
-    if !matches!(name.as_slice(), ["df", project, environment]
-        if project.len() == 8
-            && environment.len() == 8
-            && project.bytes().all(|byte| byte.is_ascii_hexdigit())
-            && environment.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    {
+    if !valid_devfleet_project_name(&request.project_name) {
         return Err(ComposeError::Invalid(
             "invalid DevFleet Compose project name".into(),
         ));
@@ -328,6 +452,14 @@ fn validate_destroy_request(request: &ComposeDestroyRequest) -> Result<(), Compo
         }
     }
     Ok(())
+}
+
+fn valid_devfleet_project_name(name: &str) -> bool {
+    matches!(name.split('_').collect::<Vec<_>>().as_slice(), ["df", project, environment]
+        if project.len() == 8
+            && environment.len() == 8
+            && project.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && environment.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn docker_executable() -> Result<OsString, ComposeError> {
@@ -717,6 +849,26 @@ mod tests {
                 ..request
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn compose_label_inspection_requires_exact_owned_labels() {
+        let project = "df_0123abcd_4567efab";
+        assert_eq!(
+            compose_inspection_from_output(
+                project,
+                b"0123456789ab\tdf_0123abcd_4567efab\trunning\nabcdef012345\tdf_0123abcd_4567efab\texited\n",
+            ),
+            (ComposeInspectionState::Present, 2)
+        );
+        assert_eq!(
+            compose_inspection_from_output(project, b""),
+            (ComposeInspectionState::Missing, 0)
+        );
+        assert_eq!(
+            compose_inspection_from_output(project, b"0123456789ab\tforeign\trunning\n"),
+            (ComposeInspectionState::Uncertain, 0)
         );
     }
 

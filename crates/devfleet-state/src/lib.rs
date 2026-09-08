@@ -337,6 +337,7 @@ pub enum OperationStatus {
     Cancelled,
     Completed,
     Failed,
+    Uncertain,
 }
 
 pub struct StateStore {
@@ -1043,6 +1044,40 @@ impl StateStore {
         Ok(())
     }
 
+    /// Quarantines interrupted effects until a caller explicitly reconciles their identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the uncertain journal state.
+    pub fn mark_reconciliation_uncertain(
+        &mut self,
+        environment_id: Uuid,
+        diagnostic: &str,
+    ) -> Result<(), StateError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE environments SET lifecycle = 'degraded', reconciliation_diagnostic = ?1 WHERE id = ?2",
+            params![diagnostic, environment_id.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE initialization_tasks SET status = 'uncertain', diagnostic = ?2
+             WHERE environment_id = ?1 AND status = 'running'",
+            params![environment_id.to_string(), diagnostic],
+        )?;
+        transaction.execute(
+            "UPDATE preparation_tasks SET status = 'uncertain', diagnostic = ?2
+             WHERE environment_id = ?1 AND status = 'running'",
+            params![environment_id.to_string(), diagnostic],
+        )?;
+        transaction.execute(
+            "UPDATE operations SET status = 'uncertain', phase = 'reconcile_required'
+             WHERE environment_id = ?1 AND status IN ('accepted', 'cancellation_requested')",
+            params![environment_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Records a supervisor-backed recovery after identity matching, without claiming pipe recovery.
     ///
     /// # Errors
@@ -1053,6 +1088,26 @@ impl StateStore {
             "UPDATE environments SET lifecycle = 'running', reconciliation_diagnostic = 'Recovered supervisor observation; prior pipes and handles were not adopted.' WHERE id = ?1",
             params![environment_id.to_string()],
         )?;
+        Ok(())
+    }
+
+    /// Invalidates app-level readiness after a recovered external connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the required re-verification.
+    pub fn require_app_reverification(&mut self, environment_id: Uuid) -> Result<(), StateError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE ios_apps SET launched = 0 WHERE environment_id = ?1",
+            params![environment_id.to_string()],
+        )?;
+        transaction.execute(
+            "UPDATE identity_verifications SET status = 'mismatch'
+             WHERE environment_id = ?1 AND mode = 'app_handshake'",
+            params![environment_id.to_string()],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1083,6 +1138,28 @@ impl StateStore {
         let row = self.connection.query_row(
             "SELECT id, environment_id, kind, status, deadline_unix_ms, cancellation_requested, phase, resource_id
              FROM operations WHERE id = ?1", params![id.to_string()], stored_operation_from_row,
+        );
+        match row {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(StateError::Sqlite(error)),
+        }
+    }
+
+    /// Returns the most recent retained operation journal entry for an environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read or decode the operation.
+    pub fn latest_operation(
+        &self,
+        environment_id: Uuid,
+    ) -> Result<Option<StoredOperation>, StateError> {
+        let row = self.connection.query_row(
+            "SELECT id, environment_id, kind, status, deadline_unix_ms, cancellation_requested, phase, resource_id
+             FROM operations WHERE environment_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![environment_id.to_string()],
+            stored_operation_from_row,
         );
         match row {
             Ok(value) => Ok(Some(value)),
@@ -1955,6 +2032,7 @@ fn stored_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Stored
         "cancelled" => OperationStatus::Cancelled,
         "completed" => OperationStatus::Completed,
         "failed" => OperationStatus::Failed,
+        "uncertain" => OperationStatus::Uncertain,
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
     let deadline = row
@@ -2193,6 +2271,50 @@ mod tests {
             StoredReadiness::ProcessStopped
         );
         assert_eq!(observed.endpoints[0].host_url, "http://127.0.0.1:20001");
+    }
+
+    #[test]
+    fn quarantines_interrupted_effects_without_releasing_retained_identity() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let environment = environment();
+        let operation_id = Uuid::now_v7();
+        store
+            .record_start_intent(&environment, operation_id)
+            .expect("intent persists");
+        store
+            .set_operation_context(operation_id, 100, "process")
+            .expect("context persists");
+        store
+            .record_preparation_intent(&StoredPreparationTask {
+                environment_id: environment.id,
+                kind: "pods".into(),
+                fingerprint: "owned-fingerprint".into(),
+                attempts: 0,
+                status: "running".into(),
+                diagnostic: None,
+            })
+            .expect("task intent persists");
+        store
+            .mark_reconciliation_uncertain(environment.id, "supervisor unavailable")
+            .expect("uncertainty persists");
+        let retained = store
+            .environment(environment.id)
+            .expect("environment reads")
+            .expect("environment exists");
+        assert_eq!(retained.lifecycle, StoredLifecycle::Degraded);
+        assert!(retained.process.is_none());
+        assert_eq!(
+            store
+                .operation(operation_id)
+                .expect("operation reads")
+                .expect("operation exists")
+                .status,
+            OperationStatus::Uncertain
+        );
+        assert_eq!(
+            store.preparation_tasks(environment.id).expect("tasks read")[0].status,
+            "uncertain"
+        );
     }
 
     #[test]
