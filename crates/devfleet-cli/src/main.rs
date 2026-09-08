@@ -27,10 +27,19 @@ struct Args {
 enum Command {
     Plan(PlanArgs),
     Up(UpArgs),
-    Status { environment_id: Uuid },
+    Status {
+        environment_id: Uuid,
+    },
     List,
-    Stop { environment_id: Uuid },
+    Stop {
+        environment_id: Uuid,
+    },
     Operation(OperationArgs),
+    Events {
+        environment_id: Uuid,
+        #[arg(long)]
+        after: Option<u64>,
+    },
     Plugin(PluginArgs),
 }
 
@@ -174,6 +183,13 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
                 Ok(DaemonRequest::OperationCancel { operation_id })
             }
         },
+        Command::Events {
+            environment_id,
+            after,
+        } => Ok(DaemonRequest::Events {
+            environment_id,
+            after,
+        }),
         Command::Plugin(plugin) => match plugin.command {
             PluginCommand::List => Ok(DaemonRequest::PluginList),
             PluginCommand::Install { path } => Ok(DaemonRequest::PluginInstall {
@@ -270,6 +286,11 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
             operation.phase,
             operation.resource_id.as_deref().unwrap_or("environment")
         ),
+        DaemonResponse::Events(events) => {
+            for event in events {
+                println!("{} {} {}", event.sequence, event.id, event.kind);
+            }
+        }
         DaemonResponse::Plugin(plugin) => println!(
             "{} {} {} trusted={}",
             plugin.id, plugin.version, plugin.checksum, plugin.trusted

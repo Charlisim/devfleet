@@ -77,6 +77,20 @@ fn client_reconnects_to_the_same_owned_process_and_stop_preserves_data() {
         running.process.expect("running process").readiness,
         ReadinessState::ProcessAlive
     );
+    let events = request(
+        &fixture.socket,
+        DaemonRequest::Events {
+            environment_id: accepted.environment_id,
+            after: Some(0),
+        },
+    )
+    .expect("events resume");
+    let DaemonResponse::Events(events) = events else {
+        panic!("expected events");
+    };
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].kind, "up_accepted");
+    assert_eq!(events[1].kind, "process_running");
 
     let stopped = request(
         &fixture.socket,

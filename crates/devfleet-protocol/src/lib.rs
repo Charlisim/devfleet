@@ -93,6 +93,7 @@ pub enum ErrorCode {
     ResourceNotFound,
     OperationFailed,
     OperationCancelled,
+    CursorExpired,
     OwnershipUncertain,
 }
 
@@ -131,14 +132,30 @@ pub struct EnvironmentPlanRequest {
 pub enum DaemonRequest {
     Plan(EnvironmentPlanRequest),
     Up(EnvironmentUpRequest),
-    Status { environment_id: Uuid },
+    Status {
+        environment_id: Uuid,
+    },
     List,
-    Stop { environment_id: Uuid },
-    OperationGet { operation_id: Uuid },
-    OperationCancel { operation_id: Uuid },
+    Stop {
+        environment_id: Uuid,
+    },
+    OperationGet {
+        operation_id: Uuid,
+    },
+    OperationCancel {
+        operation_id: Uuid,
+    },
+    Events {
+        environment_id: Uuid,
+        after: Option<u64>,
+    },
     PluginList,
-    PluginInstall { path: String },
-    PluginTrust { id: String },
+    PluginInstall {
+        path: String,
+    },
+    PluginTrust {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,8 +166,22 @@ pub enum DaemonResponse {
     Environment(EnvironmentSnapshot),
     Environments(Vec<EnvironmentSnapshot>),
     Operation(OperationSnapshot),
+    Events(Vec<EventSnapshot>),
     Plugin(PluginSnapshot),
     Plugins(Vec<PluginSnapshot>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventSnapshot {
+    pub sequence: u64,
+    pub id: Uuid,
+    pub timestamp_unix_ms: u128,
+    pub environment_id: Uuid,
+    pub resource_id: Option<String>,
+    pub generation: u64,
+    pub operation_id: Option<Uuid>,
+    pub kind: String,
+    pub payload: Value,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

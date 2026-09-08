@@ -3,12 +3,13 @@
 use devfleet_core::{PlanOptions, compile_manifest, discover_git_worktree};
 use devfleet_protocol::{
     DaemonRequest, DaemonResponse, EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode,
-    JsonRpcRequest, JsonRpcResponse, LifecycleState, OperationAccepted, OperationSnapshot,
-    PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot, ReadinessState, RpcFailure,
-    SupervisorRequest, SupervisorResponse, SupervisorStartRequest, read_json_line, write_json_line,
+    EventSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState, OperationAccepted,
+    OperationSnapshot, PROTOCOL_VERSION, PluginSnapshot, ProcessSnapshot, ReadinessState,
+    RpcFailure, SupervisorRequest, SupervisorResponse, SupervisorStartRequest, read_json_line,
+    write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredEnvironment, StoredLifecycle, StoredOperation, StoredProcess,
+    StateStore, StoredEnvironment, StoredEvent, StoredLifecycle, StoredOperation, StoredProcess,
     StoredReadiness, VerifiedGitContext,
 };
 use fs2::FileExt;
@@ -131,6 +132,10 @@ impl Daemon {
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
             DaemonRequest::OperationGet { operation_id } => self.operation_get(operation_id),
             DaemonRequest::OperationCancel { operation_id } => self.operation_cancel(operation_id),
+            DaemonRequest::Events {
+                environment_id,
+                after,
+            } => self.events(environment_id, after),
             DaemonRequest::PluginList => self.plugin_list(),
             DaemonRequest::PluginInstall { path } => self.plugin_install(Path::new(&path)),
             DaemonRequest::PluginTrust { id } => self.plugin_trust(&id),
@@ -208,6 +213,7 @@ impl Daemon {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn up(
         &mut self,
         request: devfleet_protocol::EnvironmentUpRequest,
@@ -282,6 +288,12 @@ impl Daemon {
         };
         let operation_id = Uuid::now_v7();
         self.state.record_start_intent(&environment, operation_id)?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            Some(operation_id),
+            "up_accepted",
+        )?;
         self.state.set_operation_context(
             operation_id,
             SystemTime::now()
@@ -305,6 +317,12 @@ impl Daemon {
         let SupervisorResponse::Process(process) = response;
         self.state
             .record_running_process(environment.id, &stored_process(&process))?;
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            Some(operation_id),
+            "process_running",
+        )?;
         if process.readiness != ReadinessState::ProcessAlive {
             self.state.mark_failed(environment.id)?;
             return Err(DaemonError::Operation(
@@ -352,6 +370,7 @@ impl Daemon {
             ));
         }
         self.state.mark_stopped(environment_id)?;
+        self.emit_event(environment_id, environment.generation, None, "stopped")?;
         self.status(environment_id)
     }
 
@@ -385,7 +404,51 @@ impl Daemon {
         }
         self.state
             .mark_operation_cancelled(operation_id, "reaped")?;
+        self.emit_event(
+            operation.environment_id,
+            0,
+            Some(operation_id),
+            "operation_cancelled",
+        )?;
         self.operation_get(operation_id)
+    }
+
+    fn events(
+        &self,
+        environment_id: Uuid,
+        after: Option<u64>,
+    ) -> Result<DaemonResponse, DaemonError> {
+        Ok(DaemonResponse::Events(
+            self.state
+                .events_after(environment_id, after)?
+                .into_iter()
+                .map(event_snapshot)
+                .collect(),
+        ))
+    }
+
+    fn emit_event(
+        &mut self,
+        environment_id: Uuid,
+        generation: u64,
+        operation_id: Option<Uuid>,
+        kind: &str,
+    ) -> Result<(), DaemonError> {
+        self.state.append_event(&StoredEvent {
+            sequence: 0,
+            id: Uuid::now_v7(),
+            timestamp_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| DaemonError::Operation(error.to_string()))?
+                .as_millis(),
+            environment_id,
+            resource_id: None,
+            generation,
+            operation_id,
+            kind: kind.into(),
+            payload: serde_json::json!({}),
+        })?;
+        Ok(())
     }
 
     fn start_supervisor(
@@ -548,6 +611,9 @@ impl From<DaemonError> for RpcFailure {
             DaemonError::InvalidConfig(_) => ErrorCode::ConfigInvalid,
             DaemonError::NotFound => ErrorCode::ResourceNotFound,
             DaemonError::OwnershipUncertain => ErrorCode::OwnershipUncertain,
+            DaemonError::State(devfleet_state::StateError::CursorExpired) => {
+                ErrorCode::CursorExpired
+            }
             DaemonError::Operation(_) | DaemonError::State(_) => ErrorCode::OperationFailed,
         };
         Self {
@@ -802,6 +868,20 @@ fn operation_snapshot(operation: StoredOperation) -> OperationSnapshot {
         phase: operation.phase,
         resource_id: operation.resource_id,
         retryable: false,
+    }
+}
+
+fn event_snapshot(event: StoredEvent) -> EventSnapshot {
+    EventSnapshot {
+        sequence: event.sequence,
+        id: event.id,
+        timestamp_unix_ms: event.timestamp_unix_ms,
+        environment_id: event.environment_id,
+        resource_id: event.resource_id,
+        generation: event.generation,
+        operation_id: event.operation_id,
+        kind: event.kind,
+        payload: event.payload,
     }
 }
 
