@@ -286,6 +286,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "devfleet-plugin-react-native"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "devfleet-plugin-sdk",
+ "devfleet-protocol",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "devfleet-plugin-sdk"
 version = "0.1.0"
 dependencies = [

@@ -13,6 +13,7 @@ members = [
     "plugins/compose",
     "plugins/ios",
     "plugins/metro",
+    "plugins/react-native",
 ]
 exclude = ["validation/ios-isolation"]
 resolver = "3"
