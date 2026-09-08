@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     io::{self, BufReader},
+    path::Path,
     process::{Command, Output},
 };
 use thiserror::Error;
@@ -39,6 +40,8 @@ impl Provider for IosProvider {
                 "device.open".into(),
                 "device.stop".into(),
                 "app.launch".into(),
+                "device.capture".into(),
+                "device.record".into(),
             ],
             plugin_state_version: 1,
         }
@@ -119,6 +122,8 @@ impl Provider for IosProvider {
                     request.bundle_id,
                 ])
             }
+            "device.capture" => media_action(input, "device.capture", "png", false),
+            "device.record" => media_action(input, "device.record", "mp4", true),
             _ => Err(PluginError::UnsupportedMethod(name)),
         }
     }
@@ -131,6 +136,27 @@ fn spawn(argv: Vec<String>) -> Result<Value, PluginError> {
         environment: command_environment(),
     })
     .map_err(|error| PluginError::RequestFailed(error.to_string()))
+}
+
+fn media_action(
+    input: Value,
+    action: &str,
+    extension: &str,
+    recording: bool,
+) -> Result<Value, PluginError> {
+    let request: MediaRequest = serde_json::from_value(input)
+        .map_err(|_| PluginError::InvalidCall(format!("invalid {action} input")))?;
+    validate_udid(&request.udid).map_err(|error| plugin_error(&error))?;
+    validate_artifact_path(&request.path, &request.artifact_root, extension)
+        .map_err(|error| plugin_error(&error))?;
+    let mut argv = vec![XCRUN.into(), "simctl".into(), "io".into(), request.udid];
+    if recording {
+        argv.extend(["recordVideo".into(), "--codec".into(), "h264".into()]);
+    } else {
+        argv.push("screenshot".into());
+    }
+    argv.push(request.path);
+    spawn(argv)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -155,6 +181,13 @@ struct BootRequest {
 struct LaunchRequest {
     udid: String,
     bundle_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct MediaRequest {
+    udid: String,
+    artifact_root: String,
+    path: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -204,6 +237,8 @@ enum IosError {
     InvalidUdid,
     #[error("DEVICE_UNAVAILABLE: malformed bundle identifier")]
     InvalidBundleId,
+    #[error("DEVICE_UNAVAILABLE: artifact path is not scoped to an existing private directory")]
+    InvalidArtifactPath,
     #[error("DEVICE_UNAVAILABLE: simulator discovery returned malformed JSON")]
     InvalidDiscovery,
 }
@@ -350,6 +385,32 @@ fn validate_bundle_id(bundle_id: &str) -> Result<(), IosError> {
     .ok_or(IosError::InvalidBundleId)
 }
 
+fn validate_artifact_path(
+    path: &str,
+    artifact_root: &str,
+    extension: &str,
+) -> Result<(), IosError> {
+    let path = Path::new(path);
+    let parent = path.parent().ok_or(IosError::InvalidArtifactPath)?;
+    let artifact_root = Path::new(artifact_root)
+        .canonicalize()
+        .map_err(|_| IosError::InvalidArtifactPath)?;
+    let parent = parent
+        .canonicalize()
+        .map_err(|_| IosError::InvalidArtifactPath)?;
+    if !parent.starts_with(artifact_root)
+        || path.extension().and_then(|value| value.to_str()) != Some(extension)
+        || path.file_name().is_none()
+        || path.exists()
+        || path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(IosError::InvalidArtifactPath);
+    }
+    Ok(())
+}
+
 fn command_environment() -> BTreeMap<String, String> {
     let mut environment = BTreeMap::from([("PATH".into(), PATH.into())]);
     if let Some(home) = std::env::var_os("HOME") {
@@ -441,5 +502,71 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn capture_action_targets_only_the_requested_udid_and_artifact_path() {
+        let temporary = tempfile::tempdir().expect("artifact directory");
+        let path = temporary.path().join("capture.png");
+        let value = IosProvider
+            .action(
+                "device.capture".into(),
+                json!({
+                    "udid": "0186D916-7A5C-4E31-8590-C2F502FA2288",
+                    "artifact_root": temporary.path(),
+                    "path": path,
+                }),
+            )
+            .expect("capture command");
+        let command: HostSpawnRequest = serde_json::from_value(value).expect("capture spawn");
+        assert!(command.argv.contains(&"screenshot".into()));
+        assert!(
+            command
+                .argv
+                .contains(&"0186D916-7A5C-4E31-8590-C2F502FA2288".into())
+        );
+        assert!(command.argv.contains(&path.display().to_string()));
+    }
+
+    #[test]
+    fn capture_commands_keep_two_devices_and_artifacts_separate() {
+        let temporary = tempfile::tempdir().expect("artifact directory");
+        let first_path = temporary.path().join("first.png");
+        let second_path = temporary.path().join("second.png");
+        let first = IosProvider
+            .action(
+                "device.capture".into(),
+                json!({
+                    "udid": "0186D916-7A5C-4E31-8590-C2F502FA2288",
+                    "artifact_root": temporary.path(),
+                    "path": first_path,
+                }),
+            )
+            .expect("first capture");
+        let second = IosProvider
+            .action(
+                "device.capture".into(),
+                json!({
+                    "udid": "06A9C97E-D6BE-4492-AD9B-857CB949C50E",
+                    "artifact_root": temporary.path(),
+                    "path": second_path,
+                }),
+            )
+            .expect("second capture");
+        let first: HostSpawnRequest = serde_json::from_value(first).expect("first command");
+        let second: HostSpawnRequest = serde_json::from_value(second).expect("second command");
+        assert_ne!(first.argv, second.argv);
+        assert!(
+            first
+                .argv
+                .contains(&"0186D916-7A5C-4E31-8590-C2F502FA2288".into())
+        );
+        assert!(
+            second
+                .argv
+                .contains(&"06A9C97E-D6BE-4492-AD9B-857CB949C50E".into())
+        );
+        assert!(first.argv.contains(&first_path.display().to_string()));
+        assert!(second.argv.contains(&second_path.display().to_string()));
     }
 }

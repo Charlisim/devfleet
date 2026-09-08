@@ -225,6 +225,41 @@ pub struct IdentityVerificationStartRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceCaptureRequest {
+    pub environment_id: Uuid,
+    pub recording_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactSnapshot {
+    pub artifact_id: Uuid,
+    pub timestamp_unix_ms: u64,
+    pub environment_id: Uuid,
+    pub generation: u64,
+    pub worktree: String,
+    pub head: String,
+    pub code_fingerprint: String,
+    pub build_identity: String,
+    pub udid: String,
+    pub kind: ArtifactKind,
+    pub command: String,
+    pub flow: String,
+    pub result: String,
+    pub app_running: bool,
+    pub functional_result: String,
+    pub human_review: String,
+    pub path: String,
+    pub obsolete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Screenshot,
+    Recording,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IdentityVerificationSnapshot {
     pub environment_id: Uuid,
     pub generation: u64,
@@ -376,6 +411,7 @@ pub enum DaemonRequest {
     IdentityVerificationStatus {
         environment_id: Uuid,
     },
+    DeviceCapture(DeviceCaptureRequest),
     Status {
         environment_id: Uuid,
     },
@@ -432,6 +468,7 @@ pub enum DaemonResponse {
     IosSimulator(IosSimulatorSnapshot),
     IosApp(IosAppSnapshot),
     IdentityVerification(IdentityVerificationSnapshot),
+    Artifact(ArtifactSnapshot),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

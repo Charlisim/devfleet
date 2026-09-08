@@ -27,6 +27,7 @@ use std::{
 use uuid::Uuid;
 
 const SIGNAL_WAIT: Duration = Duration::from_secs(2);
+const TASK_SIGNAL_WAIT: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const INITIAL_READINESS_WINDOW: Duration = Duration::from_millis(50);
 const LOG_QUEUE_CAPACITY: usize = 128;
@@ -388,9 +389,14 @@ fn run_task_with_deadline(
         }
         if started.elapsed()? >= Duration::from_secs(timeout_seconds) {
             if let Ok(process_group) = i32::try_from(child.id()) {
-                let _ = signal_group(process_group, Signal::SIGKILL);
+                let _ = signal_group(process_group, Signal::SIGINT);
             }
-            let _ = child.kill();
+            if !wait_for_exit(&mut child, TASK_SIGNAL_WAIT)? {
+                if let Ok(process_group) = i32::try_from(child.id()) {
+                    let _ = signal_group(process_group, Signal::SIGKILL);
+                }
+                let _ = child.kill();
+            }
             let _ = child.wait();
             return Ok(None);
         }

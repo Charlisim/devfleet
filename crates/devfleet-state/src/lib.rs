@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub const CURRENT_SCHEMA_VERSION: i64 = 17;
 const MAX_RETAINED_EVENTS_PER_ENVIRONMENT: i64 = 2_048;
 
 #[derive(Debug, Error)]
@@ -191,6 +191,28 @@ pub struct StoredIosApp {
     pub derived_data: String,
     pub native_fingerprint: String,
     pub launched: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredArtifact {
+    pub id: Uuid,
+    pub timestamp_unix_ms: u64,
+    pub environment_id: Uuid,
+    pub generation: u64,
+    pub worktree: String,
+    pub head: String,
+    pub code_fingerprint: String,
+    pub build_identity: String,
+    pub udid: String,
+    pub kind: String,
+    pub command: String,
+    pub flow: String,
+    pub result: String,
+    pub app_running: bool,
+    pub functional_result: String,
+    pub human_review: String,
+    pub path: String,
+    pub obsolete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -678,6 +700,38 @@ impl StateStore {
             params![app.environment_id.to_string(), app.bundle_id, app.udid, i64::from(app.metro_port), app.derived_data, app.native_fingerprint, app.launched],
         )?;
         Ok(())
+    }
+
+    /// Persists metadata for a media artifact stored outside SQLite event rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot retain the metadata.
+    pub fn record_artifact(&mut self, artifact: &StoredArtifact) -> Result<(), StateError> {
+        let generation =
+            i64::try_from(artifact.generation).map_err(|_| StateError::NumericOutOfRange)?;
+        let timestamp =
+            i64::try_from(artifact.timestamp_unix_ms).map_err(|_| StateError::NumericOutOfRange)?;
+        self.connection.execute(
+            "INSERT INTO artifacts (id, timestamp_unix_ms, environment_id, generation, worktree, head, code_fingerprint, build_identity, udid, kind, command, flow, result, app_running, functional_result, human_review, path, obsolete) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            params![artifact.id.to_string(), timestamp, artifact.environment_id.to_string(), generation, artifact.worktree, artifact.head, artifact.code_fingerprint, artifact.build_identity, artifact.udid, artifact.kind, artifact.command, artifact.flow, artifact.result, artifact.app_running, artifact.functional_result, artifact.human_review, artifact.path, artifact.obsolete],
+        )?;
+        Ok(())
+    }
+
+    /// Returns retained media metadata for an environment without loading media bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when SQLite cannot read or decode artifact metadata.
+    pub fn artifacts(&self, environment_id: Uuid) -> Result<Vec<StoredArtifact>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, timestamp_unix_ms, environment_id, generation, worktree, head, code_fingerprint, build_identity, udid, kind, command, flow, result, app_running, functional_result, human_review, path, obsolete FROM artifacts WHERE environment_id = ?1 ORDER BY timestamp_unix_ms ASC",
+        )?;
+        let artifacts = statement
+            .query_map(params![environment_id.to_string()], stored_artifact)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(artifacts)
     }
 
     /// Returns phase-specific bindings without reading private values.
@@ -1537,6 +1591,12 @@ impl StateStore {
         if version < 15 {
             self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS ios_apps (environment_id TEXT PRIMARY KEY REFERENCES environments(id), bundle_id TEXT NOT NULL, udid TEXT NOT NULL UNIQUE, metro_port INTEGER NOT NULL, derived_data TEXT NOT NULL, native_fingerprint TEXT NOT NULL, launched INTEGER NOT NULL); PRAGMA user_version = 15; COMMIT;")?;
         }
+        if version < 16 {
+            self.connection.execute_batch("BEGIN; CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, timestamp_unix_ms INTEGER NOT NULL, environment_id TEXT NOT NULL REFERENCES environments(id), generation INTEGER NOT NULL, worktree TEXT NOT NULL, head TEXT NOT NULL, code_fingerprint TEXT NOT NULL, build_identity TEXT NOT NULL, udid TEXT NOT NULL, kind TEXT NOT NULL, command TEXT NOT NULL, flow TEXT NOT NULL, result TEXT NOT NULL, path TEXT NOT NULL, obsolete INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS artifacts_environment ON artifacts(environment_id); PRAGMA user_version = 16; COMMIT;")?;
+        }
+        if version < 17 {
+            self.connection.execute_batch("BEGIN; ALTER TABLE artifacts ADD COLUMN app_running INTEGER NOT NULL DEFAULT 0; ALTER TABLE artifacts ADD COLUMN functional_result TEXT NOT NULL DEFAULT 'unverified'; ALTER TABLE artifacts ADD COLUMN human_review TEXT NOT NULL DEFAULT 'unreviewed'; PRAGMA user_version = 17; COMMIT;")?;
+        }
         Ok(())
     }
 }
@@ -1594,6 +1654,33 @@ fn stored_ios_app(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredIosApp> {
         derived_data: row.get(4)?,
         native_fingerprint: row.get(5)?,
         launched: row.get(6)?,
+    })
+}
+
+fn stored_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredArtifact> {
+    Ok(StoredArtifact {
+        id: Uuid::parse_str(&row.get::<_, String>(0)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        timestamp_unix_ms: u64::try_from(row.get::<_, i64>(1)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, 0))?,
+        environment_id: Uuid::parse_str(&row.get::<_, String>(2)?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        generation: u64::try_from(row.get::<_, i64>(3)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, 0))?,
+        worktree: row.get(4)?,
+        head: row.get(5)?,
+        code_fingerprint: row.get(6)?,
+        build_identity: row.get(7)?,
+        udid: row.get(8)?,
+        kind: row.get(9)?,
+        command: row.get(10)?,
+        flow: row.get(11)?,
+        result: row.get(12)?,
+        app_running: row.get(13)?,
+        functional_result: row.get(14)?,
+        human_review: row.get(15)?,
+        path: row.get(16)?,
+        obsolete: row.get(17)?,
     })
 }
 
@@ -1987,6 +2074,40 @@ mod tests {
         assert_eq!(app.bundle_id, "com.example.app");
         assert_eq!(app.metro_port, 21_001);
         assert!(app.launched);
+    }
+
+    #[test]
+    fn retains_artifact_metadata_without_media_bytes() {
+        let mut store = StateStore::open_in_memory().expect("state store opens");
+        let environment = environment();
+        store
+            .record_start_intent(&environment, Uuid::now_v7())
+            .expect("environment persists");
+        let artifact = StoredArtifact {
+            id: Uuid::now_v7(),
+            timestamp_unix_ms: 1_725_000_000_000,
+            environment_id: environment.id,
+            generation: environment.generation,
+            worktree: "/private/worktree".into(),
+            head: "abc123".into(),
+            code_fingerprint: "local-js".into(),
+            build_identity: "native-a".into(),
+            udid: "0186D916-7A5C-4E31-8590-C2F502FA2288".into(),
+            kind: "screenshot".into(),
+            command: "xcrun simctl io <udid> screenshot".into(),
+            flow: "device.capture".into(),
+            result: "captured".into(),
+            app_running: true,
+            functional_result: "unverified".into(),
+            human_review: "unreviewed".into(),
+            path: "/private/artifacts/capture.png".into(),
+            obsolete: false,
+        };
+        store.record_artifact(&artifact).expect("artifact persists");
+        assert_eq!(
+            store.artifacts(environment.id).expect("artifacts read"),
+            vec![artifact]
+        );
     }
 
     #[test]

@@ -2,11 +2,11 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use devfleet_cli::request;
 use devfleet_protocol::{
     BindingApplyRequest, ComposeAuthorizations, ComposeEndpoint, ComposeUpRequest, DaemonRequest,
-    DaemonResponse, EnvironmentPlanRequest, EnvironmentUpRequest, IdentityVerificationStartRequest,
-    InitializationRunRequest, InitializationTask, IosAppRunRequest, IosSimulatorAcquireRequest,
-    IosSimulatorAction, IosSimulatorActionRequest, MetroUpRequest,
-    PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest, ProcessSpec,
-    SmokeResponse, SmokeStatus,
+    DaemonResponse, DeviceCaptureRequest, EnvironmentPlanRequest, EnvironmentUpRequest,
+    IdentityVerificationStartRequest, InitializationRunRequest, InitializationTask,
+    IosAppRunRequest, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
+    MetroUpRequest, PREPARATION_DEFAULT_TIMEOUT_SECONDS, PROTOCOL_VERSION, PreparationRunRequest,
+    ProcessSpec, SmokeResponse, SmokeStatus,
 };
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -91,6 +91,14 @@ enum IdentityCommand {
 
 #[derive(Subcommand)]
 enum IosCommand {
+    Capture {
+        environment_id: Uuid,
+    },
+    Record {
+        environment_id: Uuid,
+        #[arg(long, default_value_t = 15)]
+        seconds: u64,
+    },
     Run {
         environment_id: Uuid,
         #[arg(long)]
@@ -531,6 +539,19 @@ fn request_from(command: Command) -> anyhow::Result<DaemonRequest> {
             }
         },
         Command::Ios(ios) => match ios.command {
+            IosCommand::Capture { environment_id } => {
+                Ok(DaemonRequest::DeviceCapture(DeviceCaptureRequest {
+                    environment_id,
+                    recording_seconds: None,
+                }))
+            }
+            IosCommand::Record {
+                environment_id,
+                seconds,
+            } => Ok(DaemonRequest::DeviceCapture(DeviceCaptureRequest {
+                environment_id,
+                recording_seconds: Some(seconds),
+            })),
             IosCommand::Run {
                 environment_id,
                 bundle_id,
@@ -838,6 +859,10 @@ fn print_response(response: &DaemonResponse, json: bool) -> anyhow::Result<()> {
                 .map_or_else(String::new, |diagnostic| format!(
                     " diagnostic={diagnostic}"
                 ))
+        ),
+        DaemonResponse::Artifact(artifact) => println!(
+            "{:?} {} obsolete={}",
+            artifact.kind, artifact.path, artifact.obsolete
         ),
     }
     Ok(())

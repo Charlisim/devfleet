@@ -7,22 +7,23 @@ use devfleet_core::{
 };
 use devfleet_logging::LogStore;
 use devfleet_protocol::{
-    BindingApplyRequest, BindingIntegration, BindingInvalidation, BindingPhase, BindingSnapshot,
-    ComposeReconcileRequest, ComposeUpRequest, DaemonRequest, DaemonResponse, EndpointSnapshot,
-    EnvironmentPlanSnapshot, EnvironmentSnapshot, ErrorCode, EventSnapshot,
-    IdentityVerificationSnapshot, IdentityVerificationStartRequest, InitializationRunRequest,
-    InitializationTask, InitializationTaskKind, InitializationTaskSnapshot,
-    InitializationTaskStatus, IosAppRunRequest, IosAppSnapshot, IosSimulatorAcquireRequest,
-    IosSimulatorAction, IosSimulatorActionRequest, IosSimulatorLifecycle, IosSimulatorSnapshot,
-    JsonRpcRequest, JsonRpcResponse, LifecycleState, LogSnapshot, MetroReconcileRequest,
-    MetroUpRequest, OperationAccepted, OperationSnapshot, PROTOCOL_VERSION, PluginAction,
-    PluginReconcileRequest, PluginSnapshot, PreparationRunRequest, PreparationTaskKind,
-    PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot, ReadinessState, RpcFailure,
-    SupervisorIdentityVerificationRequest, SupervisorRequest, SupervisorResponse,
-    SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, read_json_line, write_json_line,
+    ArtifactKind, ArtifactSnapshot, BindingApplyRequest, BindingIntegration, BindingInvalidation,
+    BindingPhase, BindingSnapshot, ComposeReconcileRequest, ComposeUpRequest, DaemonRequest,
+    DaemonResponse, DeviceCaptureRequest, EndpointSnapshot, EnvironmentPlanSnapshot,
+    EnvironmentSnapshot, ErrorCode, EventSnapshot, IdentityVerificationSnapshot,
+    IdentityVerificationStartRequest, InitializationRunRequest, InitializationTask,
+    InitializationTaskKind, InitializationTaskSnapshot, InitializationTaskStatus, IosAppRunRequest,
+    IosAppSnapshot, IosSimulatorAcquireRequest, IosSimulatorAction, IosSimulatorActionRequest,
+    IosSimulatorLifecycle, IosSimulatorSnapshot, JsonRpcRequest, JsonRpcResponse, LifecycleState,
+    LogSnapshot, MetroReconcileRequest, MetroUpRequest, OperationAccepted, OperationSnapshot,
+    PROTOCOL_VERSION, PluginAction, PluginReconcileRequest, PluginSnapshot, PreparationRunRequest,
+    PreparationTaskKind, PreparationTaskSnapshot, PreparationTaskStatus, ProcessSnapshot,
+    ReadinessState, RpcFailure, SupervisorIdentityVerificationRequest, SupervisorRequest,
+    SupervisorResponse, SupervisorStartRequest, TaskRerunPolicy, TrustedTaskPlugin, read_json_line,
+    write_json_line,
 };
 use devfleet_state::{
-    StateStore, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
+    StateStore, StoredArtifact, StoredBinding, StoredEndpoint, StoredEnvironment, StoredEvent,
     StoredInitializationTask, StoredIosApp, StoredIosDevice, StoredLifecycle, StoredOperation,
     StoredPreparationTask, StoredProcess, StoredReadiness, VerifiedGitContext,
 };
@@ -116,6 +117,16 @@ struct IosDiscoveredDevice {
     state: String,
 }
 
+struct CaptureTask {
+    environment_id: Uuid,
+    process: StoredProcess,
+    kind: ArtifactKind,
+    udid: String,
+    artifact_root: PathBuf,
+    path: PathBuf,
+    timeout_seconds: u64,
+}
+
 impl Daemon {
     fn handle_connection(
         &mut self,
@@ -170,6 +181,7 @@ impl Daemon {
             DaemonRequest::IdentityVerificationStatus { environment_id } => {
                 self.identity_verification_status(environment_id)
             }
+            DaemonRequest::DeviceCapture(request) => self.device_capture(&request),
             DaemonRequest::Status { environment_id } => self.status(environment_id),
             DaemonRequest::List => self.list(),
             DaemonRequest::Stop { environment_id } => self.stop(environment_id),
@@ -1376,6 +1388,184 @@ impl Daemon {
         Ok(DaemonResponse::IdentityVerification(snapshot))
     }
 
+    fn device_capture(
+        &mut self,
+        request: &DeviceCaptureRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        let recording_seconds = request.recording_seconds;
+        if recording_seconds.is_some_and(|seconds| !(1..=300).contains(&seconds)) {
+            return Err(DaemonError::InvalidConfig(
+                "recording duration must be between one second and five minutes".into(),
+            ));
+        }
+        let (environment, process, udid, app) = self.capture_resources(request.environment_id)?;
+        let kind = recording_seconds.map_or(ArtifactKind::Screenshot, |_| ArtifactKind::Recording);
+        let extension = match kind {
+            ArtifactKind::Screenshot => "png",
+            ArtifactKind::Recording => "mp4",
+        };
+        let directory = self
+            .config
+            .state_dir
+            .join("artifacts")
+            .join(environment.id.to_string());
+        prepare_private_dir(&directory)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let artifact_id = Uuid::now_v7();
+        let path = directory.join(format!("{artifact_id}.{extension}"));
+        let timestamp_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| DaemonError::Operation(error.to_string()))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| DaemonError::Operation("artifact timestamp exceeded u64".into()))?;
+        let start_code = code_fingerprint(Path::new(&environment.worktree))?;
+        self.run_capture_task(&CaptureTask {
+            environment_id: environment.id,
+            process,
+            kind,
+            udid: udid.clone(),
+            artifact_root: directory.clone(),
+            path: path.clone(),
+            timeout_seconds: recording_seconds.unwrap_or(30),
+        })?;
+        if !path.is_file()
+            || path
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(DaemonError::Operation(
+                "capture did not produce an owned regular artifact".into(),
+            ));
+        }
+        let current = self
+            .state
+            .environment(environment.id)?
+            .ok_or(DaemonError::NotFound)?;
+        let obsolete = current.generation != environment.generation
+            || code_fingerprint(Path::new(&environment.worktree))? != start_code;
+        let command = artifact_command(kind, &udid, &path);
+        let artifact = StoredArtifact {
+            id: artifact_id,
+            timestamp_unix_ms,
+            environment_id: environment.id,
+            generation: environment.generation,
+            worktree: environment.worktree,
+            head: environment.head,
+            code_fingerprint: start_code,
+            build_identity: app.native_fingerprint,
+            udid,
+            kind: artifact_kind_name(kind).into(),
+            command,
+            flow: artifact_flow(kind).into(),
+            result: if obsolete { "obsolete" } else { "captured" }.into(),
+            app_running: app.launched,
+            functional_result: "unverified".into(),
+            human_review: "unreviewed".into(),
+            path: path.display().to_string(),
+            obsolete,
+        };
+        if let Err(error) = self.state.record_artifact(&artifact) {
+            remove_generated_artifact(&path);
+            return Err(error.into());
+        }
+        self.emit_event(
+            environment.id,
+            environment.generation,
+            None,
+            if obsolete {
+                "artifact_obsolete"
+            } else {
+                "artifact_captured"
+            },
+        )?;
+        Ok(DaemonResponse::Artifact(artifact_snapshot(artifact)))
+    }
+
+    fn capture_resources(
+        &self,
+        environment_id: Uuid,
+    ) -> Result<(StoredEnvironment, StoredProcess, String, StoredIosApp), DaemonError> {
+        let environment = self
+            .state
+            .environment(environment_id)?
+            .ok_or(DaemonError::NotFound)?;
+        let process = environment
+            .process
+            .clone()
+            .ok_or(DaemonError::OwnershipUncertain)?;
+        let device = self
+            .state
+            .ios_device(environment.id)?
+            .filter(|device| device.lifecycle == "booted")
+            .ok_or_else(|| {
+                DaemonError::DeviceUnavailable("capture requires a booted owned simulator".into())
+            })?;
+        let udid = device.udid.ok_or(DaemonError::OwnershipUncertain)?;
+        let app = self.state.ios_app(environment.id)?.ok_or_else(|| {
+            DaemonError::Operation("capture requires a built app identity".into())
+        })?;
+        if !app.launched {
+            return Err(DaemonError::Operation(
+                "capture requires an app launched on the owned simulator".into(),
+            ));
+        }
+        Ok((environment, process, udid, app))
+    }
+
+    fn run_capture_task(&self, task: &CaptureTask) -> Result<(), DaemonError> {
+        let response = request_supervisor(
+            Path::new(&task.process.supervisor_socket),
+            SupervisorRequest::RunPluginTask {
+                operation_id: Uuid::now_v7(),
+                plugin_id: "official.ios".into(),
+                action: PluginAction::Action {
+                    name: artifact_flow(task.kind).into(),
+                    input: serde_json::json!({
+                        "udid": task.udid,
+                        "artifact_root": task.artifact_root,
+                        "path": task.path,
+                    }),
+                },
+                timeout_seconds: Some(task.timeout_seconds),
+            },
+        );
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                remove_generated_artifact(&task.path);
+                return Err(error);
+            }
+        };
+        match response {
+            SupervisorResponse::TaskOutput { stdout, stderr } => {
+                self.append_preparation_log(task.environment_id, "capture", &stdout, &stderr)
+            }
+            SupervisorResponse::TaskFailed { stdout, stderr } => {
+                self.append_preparation_log(task.environment_id, "capture", &stdout, &stderr)?;
+                remove_generated_artifact(&task.path);
+                Err(DaemonError::Operation(
+                    "device capture failed; inspect preparation-capture logs".into(),
+                ))
+            }
+            SupervisorResponse::TaskTimedOut if task.kind == ArtifactKind::Recording => Ok(()),
+            SupervisorResponse::TaskTimedOut => {
+                remove_generated_artifact(&task.path);
+                Err(DaemonError::Operation(
+                    "screenshot capture deadline exceeded".into(),
+                ))
+            }
+            SupervisorResponse::TaskCompleted
+            | SupervisorResponse::Process(_)
+            | SupervisorResponse::IdentityVerification(_) => {
+                remove_generated_artifact(&task.path);
+                Err(DaemonError::Operation(
+                    "supervisor returned an invalid capture response".into(),
+                ))
+            }
+        }
+    }
+
     fn ios_discovery(plugin: &Path) -> Result<IosDiscovery, DaemonError> {
         let value = Self::plugin_action(plugin, "device.discover", serde_json::json!({}))?;
         serde_json::from_value(value).map_err(|_| {
@@ -2371,6 +2561,125 @@ fn native_build_fingerprint(
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn code_fingerprint(worktree: &Path) -> Result<String, DaemonError> {
+    let mut entries = Vec::new();
+    collect_code_inputs(worktree, worktree, &mut entries)?;
+    let mut digest = Sha256::new();
+    for (path, content) in entries {
+        let relative = path.strip_prefix(worktree).map_err(|_| {
+            DaemonError::InvalidConfig("code input escaped its selected worktree".into())
+        })?;
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update(content);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn collect_code_inputs(
+    directory: &Path,
+    worktree: &Path,
+    entries: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result<(), DaemonError> {
+    for entry in
+        fs::read_dir(directory).map_err(|error| DaemonError::Operation(error.to_string()))?
+    {
+        let entry = entry.map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let path = entry.path();
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|error| DaemonError::Operation(error.to_string()))?;
+        let relative = path.strip_prefix(worktree).map_err(|_| {
+            DaemonError::InvalidConfig("code input escaped its selected worktree".into())
+        })?;
+        if relative.starts_with(".git")
+            || relative.starts_with("node_modules")
+            || relative.starts_with("ios/Pods")
+            || relative.starts_with("ios/build")
+        {
+            continue;
+        }
+        if metadata.file_type().is_symlink() {
+            entries.push((
+                path.clone(),
+                std::fs::read_link(path)
+                    .map_err(|error| DaemonError::Operation(error.to_string()))?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+            ));
+        } else if metadata.is_dir() {
+            collect_code_inputs(&path, worktree, entries)?;
+        } else if metadata.is_file() {
+            entries.push((
+                path.clone(),
+                fs::read(path).map_err(|error| DaemonError::Operation(error.to_string()))?,
+            ));
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(())
+}
+
+fn artifact_kind_name(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Screenshot => "screenshot",
+        ArtifactKind::Recording => "recording",
+    }
+}
+
+fn artifact_flow(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::Screenshot => "device.capture",
+        ArtifactKind::Recording => "device.record",
+    }
+}
+
+fn artifact_command(kind: ArtifactKind, udid: &str, path: &Path) -> String {
+    match kind {
+        ArtifactKind::Screenshot => format!("xcrun simctl io {udid} screenshot {}", path.display()),
+        ArtifactKind::Recording => format!(
+            "xcrun simctl io {udid} recordVideo --codec h264 {}",
+            path.display()
+        ),
+    }
+}
+
+fn remove_generated_artifact(path: &Path) {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn artifact_snapshot(artifact: StoredArtifact) -> ArtifactSnapshot {
+    let kind = match artifact.kind.as_str() {
+        "recording" => ArtifactKind::Recording,
+        _ => ArtifactKind::Screenshot,
+    };
+    ArtifactSnapshot {
+        artifact_id: artifact.id,
+        timestamp_unix_ms: artifact.timestamp_unix_ms,
+        environment_id: artifact.environment_id,
+        generation: artifact.generation,
+        worktree: artifact.worktree,
+        head: artifact.head,
+        code_fingerprint: artifact.code_fingerprint,
+        build_identity: artifact.build_identity,
+        udid: artifact.udid,
+        kind,
+        command: artifact.command,
+        flow: artifact.flow,
+        result: artifact.result,
+        app_running: artifact.app_running,
+        functional_result: artifact.functional_result,
+        human_review: artifact.human_review,
+        path: artifact.path,
+        obsolete: artifact.obsolete,
+    }
+}
+
 fn collect_native_inputs(
     directory: &Path,
     worktree: &Path,
@@ -3000,6 +3309,18 @@ mod tests {
             first,
             native_build_fingerprint(temporary.path(), 21_001, None, &["config-a".into()])
                 .expect("native change rebuilds")
+        );
+    }
+
+    #[test]
+    fn code_fingerprint_marks_javascript_edits_as_new_evidence() {
+        let temporary = TempDir::new().expect("temporary directory");
+        fs::write(temporary.path().join("index.js"), "first").expect("JS fixture");
+        let first = code_fingerprint(temporary.path()).expect("first fingerprint");
+        fs::write(temporary.path().join("index.js"), "second").expect("JS fixture");
+        assert_ne!(
+            first,
+            code_fingerprint(temporary.path()).expect("changed fingerprint")
         );
     }
 
