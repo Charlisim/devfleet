@@ -17,7 +17,41 @@ binary, descriptor and packaged document. The clean-install smoke verifies those
 checksums and descriptors, creates two detached worktrees, starts two separate
 process environments, reads each status and stops both.
 
-## Installation and trust
+## Installer, dependencies and trust
+
+The archive includes `install-macos-arm64.sh`. It verifies every packaged file
+before copying it to a versioned user prefix, installs Git, Node, CocoaPods and
+Docker Desktop with Homebrew, registers a private per-user launch agent, then
+installs and trusts all five checksum-verified official providers. The default
+paths are `~/.local/share/devfleet/v0.1.0`,
+`~/Library/Application Support/DevFleet`, and
+`/tmp/df-$(id -u)/devfleet.sock`.
+
+```sh
+tar -xzf devfleet-v0.1.0-macos-arm64.tar.gz
+cd devfleet-v0.1.0-macos-arm64
+./install-macos-arm64.sh --doctor /absolute/path/to/git-worktree
+```
+
+The installer will not replace an unrelated binary, link, package prefix or
+launch-agent configuration. Official providers are trusted by default only
+through this checksum-verified package path. Third-party providers remain
+untrusted and must be approved before execution; the current v0.1 client is
+noninteractive, so that approval is the explicit `devfleet plugin trust <id>`
+command. A future TUI confirmation must present the plugin ID, checksum,
+descriptor and requested capabilities before sending that trust command. Use
+`--no-start` or `--no-trust` to install files without starting the daemon or
+authorizing official plugin execution. When Homebrew is absent, install it from
+[brew.sh](https://brew.sh/) first, or pass `--install-homebrew` to run
+Homebrew's official installer.
+
+Homebrew cannot install the complete Xcode Simulator runtime. Install Xcode
+from Apple, open it once, run `xcodebuild -runFirstLaunch`, and download the
+required simulator runtime before creating iOS environments. Docker Desktop
+also needs to be opened once after its cask installation. Run `pod --version`
+and `devfleet doctor` in each worktree before using iOS.
+
+## Manual installation and trust
 
 Unpack the archive, add `bin` to PATH, and start a private daemon state
 directory. Install every provider path you intend to use, then trust each one

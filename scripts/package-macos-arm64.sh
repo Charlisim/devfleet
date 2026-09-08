@@ -29,6 +29,7 @@ stage=$(mktemp -d "${TMPDIR:-/tmp}/df-package.XXXXXX")
 package="$stage/$name"
 trap 'rm -rf "$stage"' EXIT INT TERM
 mkdir -p "$package/bin" "$package/plugins" "$package/share/devfleet"
+install -m 755 scripts/install-macos-arm64.sh "$package/install-macos-arm64.sh"
 
 for binary in \
   devfleet \
@@ -81,7 +82,7 @@ install -m 644 rust-toolchain.toml "$package/share/devfleet/rust-toolchain.toml"
 
 (
   cd "$package"
-  find bin plugins share manifest.json plugins.lock.json -type f -print | LC_ALL=C sort | xargs /usr/bin/shasum -a 256
+  find bin plugins share manifest.json plugins.lock.json install-macos-arm64.sh -type f -print | LC_ALL=C sort | xargs /usr/bin/shasum -a 256
 ) >"$package/SHA256SUMS"
 
 mkdir -p "$output"

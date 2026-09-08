@@ -46,6 +46,7 @@ fi
   cd "$package"
   /usr/bin/shasum -a 256 -c SHA256SUMS
 )
+"$package/install-macos-arm64.sh" --help >/dev/null
 
 for component in devfleet devfleetd devfleet-supervisor; do
   "$package/bin/$component" --smoke >/dev/null

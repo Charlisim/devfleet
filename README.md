@@ -33,10 +33,11 @@ devfleetd --serve \
   --process-plugin "$(dirname "$(command -v devfleetd)")/devfleet-plugin-process"
 ```
 
-Register the native provider and make a separate, explicit trust decision
-before `up`. Installation records its descriptor and checksum in a private
-lockfile; it does not authorize execution. Native plugins run with user
-permissions and are trusted code, not an OS sandbox.
+The checksum-verified release installer trusts bundled official providers by
+default. For a manual provider installation, register it and make a separate,
+explicit trust decision before `up`. Installation records its descriptor and
+checksum in a private lockfile; it does not authorize execution. Native plugins
+run with user permissions and are trusted code, not an OS sandbox.
 
 ```sh
 devfleet --socket /tmp/df-$(id -u)/daemon.sock plugin install \
